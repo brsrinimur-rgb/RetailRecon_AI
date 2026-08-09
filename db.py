@@ -60,7 +60,12 @@ def init_db():
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS adjustments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT, store TEXT, provider TEXT, amount REAL, reason TEXT, status TEXT, user TEXT
+        date TEXT, store TEXT, provider TEXT, amount REAL, reason TEXT, status TEXT, user TEXT,
+        jv_batch TEXT DEFAULT '', accounting_date TEXT DEFAULT ''
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS refund_reconciliation (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT, user TEXT, row_json TEXT
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS close_calendar (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +105,37 @@ def init_db():
         notes TEXT,
         updated_at TEXT
     )""")
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS accounting_period_control (
+        legal_entity TEXT PRIMARY KEY,
+        closed_through_date TEXT,
+        next_open_date TEXT,
+        status TEXT,
+        updated_by TEXT,
+        updated_at TEXT,
+        notes TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS accounting_period_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT,
+        user TEXT,
+        legal_entity TEXT,
+        action TEXT,
+        old_closed_through_date TEXT,
+        new_closed_through_date TEXT,
+        old_next_open_date TEXT,
+        new_next_open_date TEXT,
+        reason TEXT
+    )""")
+    for stmt in (
+        "ALTER TABLE adjustments ADD COLUMN jv_batch TEXT DEFAULT ''",
+        "ALTER TABLE adjustments ADD COLUMN accounting_date TEXT DEFAULT ''",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists on a DB created before this change
+
     conn.commit()
     conn.close()
 
@@ -109,30 +145,28 @@ init_db()
 # ---------------------------------------------------------------- JV batches
 def replace_jv(df: pd.DataFrame):
     """
-    Save JV rows. The full row is kept as JSON so persistence never again
-    silently drops columns when core.create_jv()'s output shape changes -
-    this previously wrote to a table ("jv_batches") that init_db() never
-    created, meaning every JV Creation click crashed. Fields used for
-    filtering/updates elsewhere (approval, posting, validation) are also
-    stored in real columns so those operations stay fast and simple.
+    Upsert newly-created JV batches without destroying unrelated JV history.
+
+    Safety rules:
+    - Empty input does nothing.
+    - Only incoming Journal Batches are replaced.
+    - APPROVED or POSTED batches cannot be silently regenerated/overwritten.
+    - Unrelated historical batches remain untouched.
+    - Full D365 row shape is preserved as JSON.
     """
     import json
     import numpy as np
 
-    conn = get_conn()
-    conn.execute("DELETE FROM jv_batches")
-
+    init_db()
     if df is None or df.empty:
-        conn.commit()
-        conn.close()
         return
 
     def _clean(v):
         if v is None:
             return None
-        if isinstance(v, (pd.Timestamp,)):
+        if isinstance(v, pd.Timestamp):
             return "" if pd.isna(v) else v.isoformat()
-        if isinstance(v, (np.generic,)):
+        if isinstance(v, np.generic):
             v = v.item()
         try:
             if pd.isna(v):
@@ -145,41 +179,94 @@ def replace_jv(df: pd.DataFrame):
         for name in names:
             if name in row.index:
                 v = row.get(name)
-                if pd.isna(v) if not isinstance(v, str) else False:
-                    return default
+                try:
+                    if pd.isna(v):
+                        return default
+                except (TypeError, ValueError):
+                    pass
                 return v
         return default
 
-    now = datetime.now().isoformat(timespec="seconds")
-    rows = []
-    for _, r in df.iterrows():
-        journal_batch = str(value(r, "Journal Batch", "Journal batch number", default=""))
-        line_number = value(r, "Line number", default=None)
-        try:
-            line_number = int(line_number) if line_number not in (None, "") else None
-        except (TypeError, ValueError):
-            line_number = None
-        approval_status = str(value(r, "Approval Status", default="PENDING"))
-        d365_status = str(value(r, "D365 Status", default="NOT POSTED"))
-        voucher = str(value(r, "Voucher", default=""))
-        balanced = bool(value(r, "Balanced", default=False))
-        validation_passed = bool(value(r, "Validation Passed", default=True))
-        row_json = json.dumps({k: _clean(v) for k, v in r.to_dict().items()}, default=str)
+    d=df.copy()
+    incoming_batches=sorted({
+        str(value(r,"Journal Batch","Journal batch number",default="")).strip()
+        for _,r in d.iterrows()
+        if str(value(r,"Journal Batch","Journal batch number",default="")).strip()
+    })
+    if not incoming_batches:
+        raise ValueError("JV save failed: no Journal Batch / Journal batch number found.")
 
-        rows.append((
-            journal_batch, line_number, approval_status, d365_status, voucher,
-            1 if balanced else 0, 1 if validation_passed else 0, row_json, now
-        ))
+    conn=get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
 
-    conn.executemany(
-        """INSERT INTO jv_batches
-           (journal_batch,line_number,approval_status,d365_status,voucher,
-            balanced,validation_passed,row_json,created_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        rows
-    )
-    conn.commit()
-    conn.close()
+        marks=",".join("?" for _ in incoming_batches)
+        existing=conn.execute(
+            f"""SELECT journal_batch,
+                       MAX(CASE WHEN approval_status='APPROVED' THEN 1 ELSE 0 END),
+                       MAX(CASE WHEN d365_status='POSTED' THEN 1 ELSE 0 END)
+                FROM jv_batches
+                WHERE journal_batch IN ({marks})
+                GROUP BY journal_batch""",
+            incoming_batches
+        ).fetchall()
+
+        locked=[]
+        for batch, approved, posted in existing:
+            if posted:
+                locked.append(f"{batch} (POSTED)")
+            elif approved:
+                locked.append(f"{batch} (APPROVED)")
+        if locked:
+            raise ValueError(
+                "JV regeneration blocked. These batches are already approved/posted: "
+                + ", ".join(locked)
+            )
+
+        # Replace only the incoming pending batch(es), never the whole table.
+        conn.execute(
+            f"DELETE FROM jv_batches WHERE journal_batch IN ({marks})",
+            incoming_batches
+        )
+
+        now=datetime.now().isoformat(timespec="seconds")
+        rows=[]
+        for _,r in d.iterrows():
+            journal_batch=str(value(r,"Journal Batch","Journal batch number",default="")).strip()
+            line_number=value(r,"Line number",default=None)
+            try:
+                line_number=int(line_number) if line_number not in (None,"") else None
+            except (TypeError,ValueError):
+                line_number=None
+
+            approval_status=str(value(r,"Approval Status",default="PENDING"))
+            d365_status=str(value(r,"D365 Status",default="NOT POSTED"))
+            voucher=str(value(r,"Voucher",default=""))
+            balanced=bool(value(r,"Balanced",default=False))
+            validation_passed=bool(value(r,"Validation Passed",default=True))
+            row_json=json.dumps(
+                {k:_clean(v) for k,v in r.to_dict().items()},
+                default=str
+            )
+
+            rows.append((
+                journal_batch,line_number,approval_status,d365_status,voucher,
+                1 if balanced else 0,1 if validation_passed else 0,row_json,now
+            ))
+
+        conn.executemany(
+            """INSERT INTO jv_batches
+               (journal_batch,line_number,approval_status,d365_status,voucher,
+                balanced,validation_passed,row_json,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            rows
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def load_jv() -> pd.DataFrame:
@@ -287,6 +374,8 @@ def load_correction_log() -> pd.DataFrame:
 
 # ------------------------------------------------------------- adjustments
 def append_adjustment(store, provider, amount, reason, user):
+    """Legacy request-only log entry, kept for callers that only want a
+    tracked request without generating a JV yet."""
     conn = get_conn()
     conn.execute(
         """INSERT INTO adjustments (date,store,provider,amount,reason,status,user)
@@ -297,16 +386,95 @@ def append_adjustment(store, provider, amount, reason, user):
     conn.close()
 
 
+def record_adjustment_jv(store, provider, amount, reason, user, jv_df, accounting_date=""):
+    """
+    Log the adjustment request AND persist the JV batch that was generated
+    for it in the same shared jv_batches table used by the normal weekly
+    JV flow, so it goes through the identical Approval Center / D365
+    Posting Center / posting-verification pipeline. The adjustments row
+    keeps the jv_batch link so this page can show its own status without
+    re-deriving it.
+    """
+    if jv_df is None or jv_df.empty:
+        raise ValueError("No JV batch to record (validation likely failed upstream).")
+    batch = str(jv_df["Journal Batch"].iloc[0])
+
+    replace_jv(jv_df)
+
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO adjustments (date,store,provider,amount,reason,status,user,jv_batch,accounting_date)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (datetime.now().date().isoformat(), store, provider, float(amount), reason,
+         "JV CREATED", user, batch, str(accounting_date or "")),
+    )
+    conn.commit()
+    conn.close()
+    return batch
+
+
 def load_adjustments() -> pd.DataFrame:
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT date AS "Date", store AS "Store", provider AS "Provider",
-                  amount AS "Amount", reason AS "Reason", status AS "Status", user AS "User"
+                  amount AS "Amount", reason AS "Reason", status AS "Status", user AS "User",
+                  jv_batch AS "JV Batch", accounting_date AS "Accounting Date"
            FROM adjustments ORDER BY id DESC""",
         conn,
     )
     conn.close()
     return df
+
+
+# --------------------------------------------------------- refund reconciliation
+def save_refund_reconciliation(df: pd.DataFrame, user=None):
+    """
+    Persist the latest refund-reconciliation run so Finance Checker can see
+    it from a different login, consistent with how JV/approval data is
+    shared. Each save appends a snapshot (not a destructive replace) so a
+    prior run's exception list is not lost if someone re-runs with a
+    partial file - load_refund_reconciliation() returns the most recent
+    snapshot by default.
+    """
+    import json as _json
+    if df is None or df.empty:
+        return
+    conn = get_conn()
+    now = datetime.now().isoformat(timespec="seconds")
+    row_json = df.to_json(orient="records", date_format="iso")
+    conn.execute(
+        "INSERT INTO refund_reconciliation (time,user,row_json) VALUES (?,?,?)",
+        (now, user or "unknown", row_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_refund_reconciliation(latest_only=True) -> pd.DataFrame:
+    import io as _io
+    conn = get_conn()
+    if latest_only:
+        row = conn.execute(
+            "SELECT row_json FROM refund_reconciliation ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return pd.DataFrame()
+        return pd.read_json(_io.StringIO(row[0]), orient="records")
+    else:
+        rows = conn.execute(
+            "SELECT time, user, row_json FROM refund_reconciliation ORDER BY id DESC"
+        ).fetchall()
+        conn.close()
+        frames = []
+        for time_, user_, row_json in rows:
+            if not row_json:
+                continue
+            d = pd.read_json(_io.StringIO(row_json), orient="records")
+            d["Snapshot Time"] = time_
+            d["Snapshot User"] = user_
+            frames.append(d)
+        return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
 
 # ----------------------------------------------------------- close calendar
@@ -787,3 +955,141 @@ def save_commission_rate_master(df, mode="replace"):
         )
     conn.commit()
     conn.close()
+
+
+# --------------------------------------------------- accounting period control
+def _period_date_text(v):
+    d = pd.to_datetime(v, errors="coerce")
+    return "" if pd.isna(d) else d.date().isoformat()
+
+def load_accounting_period_control(legal_entity="ULC"):
+    init_db()
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT legal_entity, closed_through_date, next_open_date, status, "
+        "updated_by, updated_at, notes "
+        "FROM accounting_period_control WHERE legal_entity=?",
+        (legal_entity,)
+    ).fetchone()
+    if row is None:
+        now = datetime.now().isoformat(timespec="seconds")
+        row = (legal_entity, "", "", "OPEN", "system", now, "")
+        conn.execute(
+            "INSERT INTO accounting_period_control "
+            "(legal_entity,closed_through_date,next_open_date,status,updated_by,updated_at,notes) "
+            "VALUES (?,?,?,?,?,?,?)",
+            row
+        )
+        conn.commit()
+    conn.close()
+    return {
+        "Legal Entity": row[0],
+        "Closed Through Date": row[1],
+        "Next Open Date": row[2],
+        "Status": row[3],
+        "Updated By": row[4],
+        "Updated At": row[5],
+        "Notes": row[6],
+    }
+
+def save_accounting_period_control(
+    legal_entity, closed_through_date, next_open_date, status, user, reason
+):
+    init_db()
+    if not str(reason or "").strip():
+        raise ValueError("Reason is mandatory for accounting-period changes.")
+
+    old = load_accounting_period_control(legal_entity)
+    closed_txt = _period_date_text(closed_through_date)
+    open_txt = _period_date_text(next_open_date)
+
+    if closed_txt and open_txt and pd.Timestamp(open_txt) <= pd.Timestamp(closed_txt):
+        raise ValueError("Next Open Date must be after Closed Through Date.")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO accounting_period_control "
+        "(legal_entity,closed_through_date,next_open_date,status,updated_by,updated_at,notes) "
+        "VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(legal_entity) DO UPDATE SET "
+        "closed_through_date=excluded.closed_through_date, "
+        "next_open_date=excluded.next_open_date, "
+        "status=excluded.status, updated_by=excluded.updated_by, "
+        "updated_at=excluded.updated_at, notes=excluded.notes",
+        (legal_entity, closed_txt, open_txt, status, user, now, str(reason).strip())
+    )
+    conn.execute(
+        "INSERT INTO accounting_period_audit "
+        "(time,user,legal_entity,action,old_closed_through_date,new_closed_through_date,"
+        "old_next_open_date,new_next_open_date,reason) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            now, user, legal_entity, "PERIOD_CONTROL_CHANGE",
+            old.get("Closed Through Date",""), closed_txt,
+            old.get("Next Open Date",""), open_txt,
+            str(reason).strip()
+        )
+    )
+    conn.commit()
+    conn.close()
+
+def load_accounting_period_audit(legal_entity=None):
+    init_db()
+    conn = get_conn()
+    sql = (
+        'SELECT time AS "Time", user AS "User", legal_entity AS "Legal Entity", '
+        'action AS "Action", old_closed_through_date AS "Old Closed Through", '
+        'new_closed_through_date AS "New Closed Through", '
+        'old_next_open_date AS "Old Next Open", '
+        'new_next_open_date AS "New Next Open", reason AS "Reason" '
+        'FROM accounting_period_audit'
+    )
+    params = ()
+    if legal_entity:
+        sql += " WHERE legal_entity=?"
+        params = (legal_entity,)
+    sql += " ORDER BY id DESC"
+    df = pd.read_sql_query(sql, conn, params=params)
+    conn.close()
+    return df
+
+def is_accounting_date_open(accounting_date, legal_entity="ULC"):
+    ctrl = load_accounting_period_control(legal_entity)
+    d = pd.to_datetime(accounting_date, errors="coerce")
+    if pd.isna(d):
+        return False, "Accounting Date is missing or invalid."
+
+    closed = pd.to_datetime(ctrl.get("Closed Through Date",""), errors="coerce")
+    next_open = pd.to_datetime(ctrl.get("Next Open Date",""), errors="coerce")
+
+    if pd.notna(closed) and d.normalize() <= closed.normalize():
+        return False, f"Accounting period is closed through {closed:%d-%b-%Y}."
+    if pd.notna(next_open) and d.normalize() < next_open.normalize():
+        return False, f"Accounting Date must be on or after {next_open:%d-%b-%Y}."
+    return True, "OPEN"
+
+def resolve_accounting_date(source_date, requested_accounting_date=None, legal_entity="ULC"):
+    if requested_accounting_date is not None:
+        d = pd.to_datetime(requested_accounting_date, errors="coerce")
+        ok, msg = is_accounting_date_open(d, legal_entity)
+        if not ok:
+            raise ValueError(msg)
+        return d.normalize()
+
+    ctrl = load_accounting_period_control(legal_entity)
+    src = pd.to_datetime(source_date, errors="coerce")
+    closed = pd.to_datetime(ctrl.get("Closed Through Date",""), errors="coerce")
+    next_open = pd.to_datetime(ctrl.get("Next Open Date",""), errors="coerce")
+
+    if pd.notna(src) and pd.notna(closed) and src.normalize() <= closed.normalize() and pd.notna(next_open):
+        return next_open.normalize()
+
+    if pd.notna(src):
+        ok, _ = is_accounting_date_open(src, legal_entity)
+        if ok:
+            return src.normalize()
+
+    if pd.notna(next_open):
+        return next_open.normalize()
+    return pd.Timestamp.today().normalize()

@@ -9,6 +9,7 @@ st.markdown(theme.global_css(), unsafe_allow_html=True)
 st.markdown(theme.top_banner("RETAIL CONTROL TOWER", "JV Creation"), unsafe_allow_html=True)
 
 st.title("JV Creation")
+st.warning("Bank Settlement Verification must be completed. Unsettled ANB/TAP/TABBY/TAMARA items are not eligible for the normal JV.")
 
 st.info(
     "Confirmed D365 mapping: Bank 1015 | Commission 7231 | VAT Vendor P0672 | "
@@ -28,12 +29,40 @@ st.caption(
     "Commission is calculated transaction-by-transaction before weekly store aggregation."
 )
 
+period_ctrl = db.load_accounting_period_control("ULC")
+st.markdown("### D365 Accounting Period")
+p1,p2,p3 = st.columns(3)
+p1.metric("Closed Through", period_ctrl.get("Closed Through Date") or "Not set")
+p2.metric("Next Open Date", period_ctrl.get("Next Open Date") or "Not set")
+p3.metric("Status", period_ctrl.get("Status") or "OPEN")
+
+default_acc = pd.to_datetime(period_ctrl.get("Next Open Date",""), errors="coerce")
+if pd.isna(default_acc):
+    default_acc = pd.Timestamp.today().normalize()
+
+accounting_date = st.date_input(
+    "JV Accounting Date",
+    value=default_acc.date(),
+    help="This is the D365 posting date. Original transaction dates and Source Period remain unchanged."
+)
+acc_open, acc_msg = db.is_accounting_date_open(accounting_date, "ULC")
+if acc_open:
+    st.success(f"Accounting Date {pd.Timestamp(accounting_date):%d-%b-%Y} is OPEN.")
+else:
+    st.error("Posting period blocked: " + acc_msg)
+
 if st.button("CREATE WEEKLY STORE JVs", type="primary"):
     gl_config = db.load_gl_config()
+    if not acc_open:
+        st.error("JV creation blocked because the selected D365 Accounting Date is closed.")
+        st.stop()
+
     j = core.create_jv(
         r["matched"],
         gl_config,
-        db.load_commission_rate_master()
+        db.load_commission_rate_master(),
+        accounting_date=accounting_date,
+        period_control=period_ctrl
     )
     # Hard control gate: every batch is validated against the Finance-confirmed
     # chart of accounts and dimension format BEFORE it is saved. Approval and
@@ -56,6 +85,7 @@ if not j.empty:
     preferred = [
         "Valid","Company accounts","Journal batch number","RecId","Line number","Date",
         "Account type","Main Account","Ledger Dimension","Default Dimension","Location",
+        "Source Date","Source Period","JV Accounting Date","Accounting Period","Carry Forward From Closed Period",
         "Brand Dimension","Department","Currency","Exchange rate",
         "Debit","Credit","Description","Difference","Balanced",
         "Validation Passed","Validation Date","Mapping Version","Validated By/System","Validation Errors",

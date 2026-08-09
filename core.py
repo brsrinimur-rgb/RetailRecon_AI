@@ -92,7 +92,46 @@ def auth(v):
     return s
 
 def dt(v):
-    return pd.to_datetime(v,errors="coerce",dayfirst=True)
+    """
+    Finance-safe date parser.
+
+    Important:
+    pandas dayfirst=True can misread ISO dates:
+      2026-07-03 -> 2026-03-07
+    Therefore ISO YYYY-MM-DD is parsed explicitly as year-first, while
+    DD/MM/YYYY and DD-MM-YYYY remain day-first.
+    Excel serial dates are also supported.
+    """
+    if v is None or (isinstance(v,float) and pd.isna(v)):
+        return pd.NaT
+
+    # Already a real date/timestamp.
+    if isinstance(v,(pd.Timestamp,datetime,np.datetime64)):
+        return pd.to_datetime(v,errors="coerce")
+
+    # Excel serial date.
+    if isinstance(v,(int,float,np.integer,np.floating)) and not isinstance(v,bool):
+        fv=float(v)
+        if 20000 <= fv <= 80000:
+            try:
+                return pd.Timestamp("1899-12-30") + pd.to_timedelta(fv,unit="D")
+            except Exception:
+                pass
+
+    s=str(v).strip()
+    if not s or s.upper() in {"NAN","NAT","NONE","NULL"}:
+        return pd.NaT
+
+    # ISO YYYY-MM-DD / YYYY-MM-DD HH:MM:SS
+    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}(?:\s|T|$)",s):
+        return pd.to_datetime(s,errors="coerce",yearfirst=True,dayfirst=False)
+
+    # Compact YYYYMMDD
+    if re.fullmatch(r"\d{8}",s) and s.startswith(("19","20")):
+        return pd.to_datetime(s,format="%Y%m%d",errors="coerce")
+
+    # D365 / European-style dates: 06-Jul-2026, 04/07/2026, 04-07-2026
+    return pd.to_datetime(s,errors="coerce",dayfirst=True)
 
 def find(df,names):
     for n in names:
@@ -328,15 +367,46 @@ def is_pos_summary_or_nontransaction(row, terminal_col=None, auth_col=None, date
 
 def normalize_pos(df,source="POS",forced_payment=None):
     d=norm_cols(df)
-    ac=find(d,[
-        "auth code","authorization code","auth","rrn","reference","payment id",
-        "order_reference_id","trans approval cd","authorization_id","tr arf","tr_arf"
+    is_bnpl = str(forced_payment or "").upper() in {"TABBY","TAMARA","TAP"}
+
+    # Card Auth and provider business references are not the same thing.
+    # For BNPL/provider files, keep Payment ID / Order Reference / Charge ID
+    # as Provider Reference instead of pretending it is a D365 Auth Code.
+    if is_bnpl:
+        ac=find(d,[
+            "auth code","authorization code","auth","authorization_id","rrn",
+            "trans approval cd","tr arf","tr_arf"
+        ])
+        provider_ref=find(d,[
+            "payment id","order_reference_id","order reference id","charge_id",
+            "charge id","reference_transaction","reference transaction",
+            "reference_order","reference order","id_order","order number"
+        ])
+        identity_col = ac or provider_ref
+    else:
+        ac=find(d,[
+            "auth code","authorization code","auth","rrn","reference","payment id",
+            "order_reference_id","trans approval cd","authorization_id","tr arf","tr_arf"
+        ])
+        provider_ref=find(d,[
+            "payment id","order_reference_id","charge_id","reference_transaction",
+            "reference_order"
+        ])
+        identity_col = ac
+
+    provider_order_ref=find(d,[
+        "order number","merchant order number","merchant order id",
+        "reference_order","reference order","order_reference_id","order reference id"
     ])
+    payout_id_col=find(d,["payout_id","payout id"])
+    settlement_id_col=find(d,["settlement_id","settlement id"])
+
     amt=find(d,[
         "pos amount","amount","transaction amount","gross amount","captured amount",
         "settlement amount","value of sales","total amount","transaction_amount"
     ])
-    if not ac or not amt:raise ValueError(f"{source}: Auth/Reference and Amount are required.")
+    if not identity_col or not amt:
+        raise ValueError(f"{source}: Transaction Reference/Auth and Amount are required.")
     store_col=find(d,["store","store code","store name"])
     branch_col=find(d,["branch name","branch_name","outlet"])
     merchant_col=find(d,["merchant name","merchant_name","retailer name"])
@@ -354,6 +424,8 @@ def normalize_pos(df,source="POS",forced_payment=None):
         return ""
     date=find(d,[
         "pos date","transaction date","date","captured date","created at",
+        "creation date","created_at","created_at gmt+03:00","created at gmt+03:00",
+        "charge date","charge_date","capture date","capture_date",
         "localdate","local date","transaction_date"
     ])
     posting=find(d,[
@@ -379,7 +451,7 @@ def normalize_pos(df,source="POS",forced_payment=None):
         if is_pos_summary_or_nontransaction(
             r,
             terminal_col=terminal,
-            auth_col=ac,
+            auth_col=identity_col,
             date_col=date,
             payment_col=ptype
         ):
@@ -410,8 +482,34 @@ def normalize_pos(df,source="POS",forced_payment=None):
         n=amount(r.get(net)) if net else a
         c=amount(r.get(comm)) if comm else 0.0
         v=amount(r.get(vat)) if vat else 0.0
+        true_auth = auth(r.get(ac)) if ac else ""
+        pref = ""
+        if provider_ref:
+            rv=r.get(provider_ref)
+            pref="" if pd.isna(rv) else str(rv).strip()
+
+        order_ref=""
+        if provider_order_ref:
+            ov=r.get(provider_order_ref)
+            order_ref="" if pd.isna(ov) else str(ov).strip()
+
+        payout_ref=""
+        if payout_id_col:
+            pv=r.get(payout_id_col)
+            payout_ref="" if pd.isna(pv) else str(pv).strip()
+
+        settlement_ref=""
+        if settlement_id_col:
+            sv=r.get(settlement_id_col)
+            settlement_ref="" if pd.isna(sv) else str(sv).strip()
+
         rows.append({"POS Row":i+1,"Source File":source,"POS Store":sc,"POS Date":dt(r.get(date)) if date else pd.NaT,
-                     "Posting Date":dt(r.get(posting)) if posting else pd.NaT,"Auth Code":auth(r.get(ac)),
+                     "Posting Date":dt(r.get(posting)) if posting else pd.NaT,
+                     "Auth Code":true_auth,
+                     "Provider Reference":pref,
+                     "Provider Order Reference":order_ref,
+                     "Payout ID":payout_ref,
+                     "Settlement ID":settlement_ref,
                      "POS Payment":pt,"POS Amount":a,"Net Amount":n if pd.notna(n) else a,
                      "Commission":c if pd.notna(c) else 0.0,"VAT":v if pd.notna(v) else 0.0,
                      "Terminal ID":str(r.get(terminal,"")).strip() if terminal else "",
@@ -630,8 +728,12 @@ def _norm_payment(v):
 
 def _collapse_exact_pos_duplicates(pos):
     """
-    Collapse exact repeated POS records caused by overlapping/daily statement uploads.
-    The transaction remains matchable, while we retain duplicate-source information.
+    Collapse only provably-identical repeated POS/provider rows.
+
+    Safety:
+    - Never collapse rows that have no stable transaction identity.
+    - Stable identity = Auth Code OR Provider Reference OR Provider Order Reference.
+    - Same Store/Date/Amount alone is NOT enough because two genuine sales can be identical.
     """
     if pos is None or pos.empty:
         return pos
@@ -640,39 +742,79 @@ def _collapse_exact_pos_duplicates(pos):
     d["POS Payment"]=d["POS Payment"].apply(_norm_payment)
     d["_DATE_KEY"]=pd.to_datetime(d["POS Date"],errors="coerce").dt.normalize()
     d["_STORE_KEY"]=d["POS Store"].astype(str).str.strip()
-    d["_AUTH_KEY"]=d["Auth Code"].astype(str).str.strip()
+    d["_AUTH_KEY"]=d.get("Auth Code",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
+    d["_PROVIDER_REF_KEY"]=d.get("Provider Reference",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
+    d["_ORDER_REF_KEY"]=d.get("Provider Order Reference",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
+    d["_TERMINAL_KEY"]=d.get("Terminal ID",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
     d["_AMT_KEY"]=pd.to_numeric(d["POS Amount"],errors="coerce").round(2)
 
-    key=["_STORE_KEY","_DATE_KEY","_AUTH_KEY","POS Payment","_AMT_KEY"]
-    grp=d.groupby(key,dropna=False,sort=False)
+    identity_present=(
+        d["_AUTH_KEY"].ne("") |
+        d["_PROVIDER_REF_KEY"].ne("") |
+        d["_ORDER_REF_KEY"].ne("")
+    )
+
+    identifiable=d[identity_present].copy()
+    anonymous=d[~identity_present].copy()
 
     rows=[]
-    for _,g in grp:
-        r=g.iloc[0].copy()
-        r["Exact POS Repeat Count"]=len(g)
-        r["Exact POS Repeat Collapsed"]=len(g)>1
-        if "Source File" in g.columns:
-            r["Source File"]=" | ".join(sorted(set(g["Source File"].astype(str))))
-        # This is no longer treated as an ambiguous duplicate when every key field is identical.
-        r["POS Duplicate"]=False
+
+    if not identifiable.empty:
+        key=[
+            "_STORE_KEY","_DATE_KEY","_AUTH_KEY","_PROVIDER_REF_KEY",
+            "_ORDER_REF_KEY","_TERMINAL_KEY","POS Payment","_AMT_KEY"
+        ]
+        for _,g in identifiable.groupby(key,dropna=False,sort=False):
+            r=g.iloc[0].copy()
+            r["Exact POS Repeat Count"]=len(g)
+            r["Exact POS Repeat Collapsed"]=len(g)>1
+            if "Source File" in g.columns:
+                r["Source File"]=" | ".join(sorted(set(g["Source File"].astype(str))))
+            r["POS Duplicate"]=False
+            rows.append(r)
+
+    # Anonymous rows are never silently merged.
+    for _,r0 in anonymous.iterrows():
+        r=r0.copy()
+        r["Exact POS Repeat Count"]=1
+        r["Exact POS Repeat Collapsed"]=False
         rows.append(r)
 
-    out=pd.DataFrame(rows).drop(columns=["_DATE_KEY","_STORE_KEY","_AUTH_KEY","_AMT_KEY"],errors="ignore")
+    helper=[
+        "_DATE_KEY","_STORE_KEY","_AUTH_KEY","_PROVIDER_REF_KEY",
+        "_ORDER_REF_KEY","_TERMINAL_KEY","_AMT_KEY"
+    ]
+    out=pd.DataFrame(rows).drop(columns=helper,errors="ignore")
     return out.reset_index(drop=True)
+
 
 def _date_plausible_for_source(pos_date, source_file):
     """
-    Lightweight source-period sanity check.
-    If filename contains YYMMDD / YYYYMMDD-like range markers, flag clearly
-    impossible dates rather than declaring Missing D365.
+    Source-period sanity check without false positives from account numbers.
+
+    Example that must NOT be treated as year 2037:
+        traf 09582037.xlsx
+
+    Only standalone YYYY years or explicit YYYYMMDD date tokens are considered.
     """
     d=pd.to_datetime(pos_date,errors="coerce")
     if pd.isna(d):
         return False
 
     s=str(source_file or "")
-    years=[int(x) for x in re.findall(r"(20\d{2})",s)]
-    if years and d.year not in set(years):
+
+    explicit_years=set()
+    explicit_years.update(
+        int(x) for x in re.findall(r"(?<!\d)(20\d{2})(?!\d)",s)
+    )
+    for token in re.findall(r"(?<!\d)(20\d{6})(?!\d)",s):
+        try:
+            parsed=pd.to_datetime(token,format="%Y%m%d",errors="raise")
+            explicit_years.add(parsed.year)
+        except Exception:
+            pass
+
+    if explicit_years and d.year not in explicit_years:
         return False
     return True
 
@@ -735,7 +877,10 @@ def reconcile(tender,pos,tolerance=1.0):
 
         payment=_norm_payment(s["D365 Payment"])
         amount_d365=float(s["D365 Amount"])
-        auth_d365=str(s["Auth Code"]).strip()
+        auth_raw=s.get("Auth Code","")
+        auth_d365="" if pd.isna(auth_raw) else str(auth_raw).strip()
+        if auth_d365.upper() in {"NAN","NONE","NULL"}:
+            auth_d365=""
         store_d365=str(s["Store Code"]).strip()
         date_d365=pd.to_datetime(s["Date"],errors="coerce")
 
@@ -818,30 +963,148 @@ def reconcile(tender,pos,tolerance=1.0):
                         status="Review"
 
         # ------------------------------------------------------
-        # Rule 2: Same Date + Payment + Amount fallback
+        # Rule 2: Auth Code missing on either side - controlled fallback
         # ------------------------------------------------------
-        if sel is None and pd.notna(date_d365):
-            x=store_pool.copy()
-            x=x[pd.to_datetime(x["POS Date"],errors="coerce").dt.normalize()==date_d365.normalize()]
+        # Auto-match only when strong non-auth evidence proves one unique candidate:
+        #   Store Code + mapped Terminal + same Date + same Tender + Amount
+        #   exact / within approved tolerance.
+        #
+        # Present-but-different Auth Codes never use this fallback.
+        if sel is None and pd.notna(date_d365) and not same_store.empty:
+            payment_known = str(payment).strip().upper() not in {"","UNKNOWN","NAN","NONE","NULL"}
+            d365_auth_missing = auth_d365 == ""
+
+            x = same_store.copy()
+
+            # Strong mapping evidence:
+            # - Card POS fallback requires a mapped Terminal ID.
+            # - TABBY/TAMARA/TAP may legitimately have no terminal, so a resolved
+            #   numeric provider store / Merchant mapping is accepted.
+            terminal_ok = (
+                x["Terminal Store Mapped"].fillna(False).astype(bool)
+                if "Terminal Store Mapped" in x.columns
+                else pd.Series(False,index=x.index)
+            )
+            merchant_ok = (
+                x["Merchant Store Mapped"].fillna(False).astype(bool)
+                if "Merchant Store Mapped" in x.columns
+                else pd.Series(False,index=x.index)
+            )
+            store_name_ok = (
+                x["Store Name Mapped"].fillna(False).astype(bool)
+                if "Store Name Mapped" in x.columns
+                else pd.Series(False,index=x.index)
+            )
+            provider_payment = x["POS Payment"].apply(_norm_payment).isin({"TABBY","TAMARA","TAP"})
+            numeric_store = x["POS Store"].astype(str).str.fullmatch(r"\d+")
+
+            strong = terminal_ok | (
+                provider_payment & (merchant_ok | store_name_ok | numeric_store)
+            )
+            x = x[strong].copy()
+
+            # Same POS transaction date.
+            x = x[
+                pd.to_datetime(x["POS Date"],errors="coerce").dt.normalize()
+                == date_d365.normalize()
+            ].copy()
+
+            # If D365 tender is known, same payment type is mandatory.
+            if payment_known:
+                x = x[x["POS Payment"].apply(_norm_payment) == payment].copy()
 
             if not x.empty:
-                x["ABS"]=(pd.to_numeric(x["POS Amount"],errors="coerce")-amount_d365).abs()
-                exact=x[x["ABS"]<=0.005]
+                pos_auth = x["Auth Code"].fillna("").astype(str).str.strip().str.upper()
+                pos_auth_missing = pos_auth.isin(["","NAN","NONE","NULL"])
 
-                if len(exact)==1:
-                    sel=exact.iloc[0]
-                    rule="Store + Date + Tender + Exact Amount" if not same_store.empty else "Date + Tender + Exact Amount"
-                    status="Matched"
-                elif len(exact)>1:
-                    reason=f"Multiple {payment} candidates: same Date + Amount"
+                # At least one side must genuinely lack Auth.
+                # If D365 Auth exists, only POS rows with missing Auth are eligible.
+                if d365_auth_missing:
+                    auth_pool = x.copy()
                 else:
-                    within=x[x["ABS"]<=tolerance]
-                    if len(within)==1:
-                        sel=within.iloc[0]
-                        rule="Date + Tender + Approved Tolerance"
-                        status="Matched"
-                    elif len(within)>1:
-                        reason=f"Multiple {payment} candidates within SAR {tolerance:.2f} tolerance"
+                    auth_pool = x[pos_auth_missing].copy()
+
+                if not auth_pool.empty:
+                    auth_pool["ABS"] = (
+                        pd.to_numeric(auth_pool["POS Amount"],errors="coerce") - amount_d365
+                    ).abs()
+
+                    exact = auth_pool[auth_pool["ABS"] <= 0.005]
+                    within = auth_pool[auth_pool["ABS"] <= tolerance]
+
+                    if len(exact) == 1:
+                        sel = exact.iloc[0]
+                        status = "Matched"
+                        if payment_known:
+                            rule = "AUTH MISSING - Store + Terminal + Date + Tender + Exact Amount"
+                        else:
+                            rule = "AUTH/TENDER MISSING - Store + Terminal + Date + Exact Amount"
+                    elif len(exact) > 1:
+                        reason = (
+                            "Auth Code missing - multiple exact candidates; "
+                            "Finance review required"
+                        )
+                    elif len(within) == 1:
+                        sel = within.iloc[0]
+                        status = "Matched"
+                        if payment_known:
+                            rule = "AUTH MISSING - Store + Terminal + Date + Tender + Approved Tolerance"
+                        else:
+                            rule = "AUTH/TENDER MISSING - Store + Terminal + Date + Approved Tolerance"
+                    elif len(within) > 1:
+                        reason = (
+                            f"Auth Code missing - multiple candidates within SAR "
+                            f"{tolerance:.2f}; Finance review required"
+                        )
+
+        # ------------------------------------------------------
+        # Rule 3: D365 Auth missing + D365 Tender UNKNOWN
+        # ------------------------------------------------------
+        # When both D365 Auth and Tender are unavailable, one unique POS row may
+        # still prove the transaction using Store + mapped Terminal + Date + Amount.
+        # POS payment type is retained and disclosed in Remarks.
+        if sel is None and pd.notna(date_d365) and not same_store.empty:
+            payment_unknown = str(payment).strip().upper() in {"","UNKNOWN","NAN","NONE","NULL"}
+
+            if auth_d365 == "" and payment_unknown:
+                x = same_store.copy()
+
+                if "Terminal Store Mapped" in x.columns:
+                    x = x[x["Terminal Store Mapped"].fillna(False).astype(bool)].copy()
+                else:
+                    x = x.iloc[0:0].copy()
+
+                x = x[
+                    pd.to_datetime(x["POS Date"],errors="coerce").dt.normalize()
+                    == date_d365.normalize()
+                ].copy()
+
+                if not x.empty:
+                    x["ABS"] = (
+                        pd.to_numeric(x["POS Amount"],errors="coerce") - amount_d365
+                    ).abs()
+
+                    exact = x[x["ABS"] <= 0.005]
+                    within = x[x["ABS"] <= tolerance]
+
+                    if len(exact) == 1:
+                        sel = exact.iloc[0]
+                        status = "Matched"
+                        rule = "AUTH/TENDER MISSING - Unique Store + Terminal + Date + Exact Amount"
+                    elif len(exact) > 1:
+                        reason = (
+                            "D365 Auth/Tender missing - multiple exact candidates; "
+                            "Finance review required"
+                        )
+                    elif len(within) == 1:
+                        sel = within.iloc[0]
+                        status = "Matched"
+                        rule = "AUTH/TENDER MISSING - Unique Store + Terminal + Date + Approved Tolerance"
+                    elif len(within) > 1:
+                        reason = (
+                            f"D365 Auth/Tender missing - multiple candidates within SAR "
+                            f"{tolerance:.2f}; Finance review required"
+                        )
 
         if sel is None:
             rr=s.to_dict()
@@ -858,7 +1121,11 @@ def reconcile(tender,pos,tolerance=1.0):
             "Date":s["Date"],
             "Receipt ID":s["Receipt ID"],
             "Auth Code":s["Auth Code"],
-            "Payment Type":payment,
+            "Payment Type":(
+                _norm_payment(sel.get("POS Payment",""))
+                if rule.startswith("AUTH/TENDER MISSING")
+                else payment
+            ),
             "D365 Amount":s["D365 Amount"],
             "POS Amount":sel["POS Amount"],
             "Net Amount":sel["Net Amount"],
@@ -871,6 +1138,10 @@ def reconcile(tender,pos,tolerance=1.0):
             "Posting Date":sel["Posting Date"],
             "Settlement Delay Days":sel["Settlement Delay Days"],
             "Terminal ID":sel["Terminal ID"],
+            "Provider Reference":sel.get("Provider Reference",""),
+            "Provider Order Reference":sel.get("Provider Order Reference",""),
+            "Payout ID":sel.get("Payout ID",""),
+            "Settlement ID":sel.get("Settlement ID",""),
             "Source File":sel["Source File"],
             "D365 Duplicate":s["D365 Duplicate"],
             "POS Duplicate":False,
@@ -879,7 +1150,16 @@ def reconcile(tender,pos,tolerance=1.0):
             "Bank Settled":False,
             "Bank Name":"",
             "Bank Date":pd.NaT,
-            "Bank Amount":np.nan
+            "Bank Amount":np.nan,
+            "Remarks":(
+                "Auth Code and D365 Tender missing – Matched using unique Store + Terminal + Date + Amount; POS Payment Type used."
+                if rule.startswith("AUTH/TENDER MISSING")
+                else (
+                    "Auth Code Missing – Matched using Store + Terminal + Date + Payment Type + Amount"
+                    if rule.startswith("AUTH MISSING")
+                    else "Reconciled successfully."
+                )
+            )
         })
 
     matched=pd.DataFrame(rows)
@@ -901,6 +1181,12 @@ def reconcile(tender,pos,tolerance=1.0):
                 return "Provider transaction date is missing or inconsistent with the source file period. Validate provider date mapping."
             if st=="Duplicate Provider/POS":
                 return "Duplicate provider/POS transaction requires review."
+            auth=str(r.get("Auth Code","") if pd.notna(r.get("Auth Code","")) else "").strip().upper()
+            if auth in {"","NAN","NONE","NULL"}:
+                return (
+                    "Auth Code missing in POS and a unique match could not be proven using "
+                    "Store + Terminal + Date + Payment Type + Amount. Finance review required."
+                )
             return "Valid mapped provider transaction found but no matching D365 Store Tender transaction."
 
         unmatched_pos["Reason"]=unmatched_pos.apply(_reason,axis=1)
@@ -956,6 +1242,24 @@ def normalize_bank(df,bank):
     return out
 
 def apply_bank_settlement(recon,bank,tolerance=1.0):
+    """
+    DEPRECATED as of the Unified Bank Settlement Engine.
+
+    This generic amount+/-7day matcher used to run automatically on every
+    "RUN RECONCILIATION" click for every payment type, in parallel with the
+    provider-specific ANB/AMEX/TAP/TABBY/TAMARA verification on the Bank
+    Settlement Audit page. Two independent code paths could both write
+    "Bank Settled" with different math, so a transaction could look settled
+    from one pass using logic that ignored provider-specific rules (e.g. the
+    TABBY SAR 5 transfer fee).
+
+    Bank settlement is now a single control gate: bank_settlement_final.py
+    (ANB/AMEX terminal-batch verification + TAP/TABBY/TAMARA payout
+    verification) is the only code path allowed to set "Bank Settled" /
+    "Bank Name" / "Bank Date" / "Bank Amount" / "Settlement Status" on the
+    matched table. This function is kept only for backward compatibility /
+    ad-hoc use and is no longer called from the reconciliation pipeline.
+    """
     if recon.empty:return recon
     out=recon.copy()
     if bank is None or bank.empty:return out
@@ -973,6 +1277,177 @@ def apply_bank_settlement(recon,bank,tolerance=1.0):
             used.add(best.name)
             out.at[i,"Bank Settled"]=True;out.at[i,"Bank Name"]=best["Bank"];out.at[i,"Bank Date"]=best["Bank Date"];out.at[i,"Bank Amount"]=best["Bank Amount"]
     return out
+
+def init_settlement_columns(matched):
+    """
+    Canonical settlement-column defaults, applied once right after
+    reconcile() so every downstream page sees the same schema whether or
+    not bank verification has run yet.
+    """
+    if matched is None or matched.empty:
+        return matched
+    out=matched.copy()
+    defaults={
+        "Bank Settled":False,"Bank Name":"","Bank Date":pd.NaT,
+        "Bank Amount":np.nan,"Settlement Status":"Awaiting Bank Settlement",
+        "Settlement Delay Days":np.nan,
+    }
+    for c,v in defaults.items():
+        if c not in out.columns:
+            out[c]=v
+    return out
+
+# ---------------------------------------------------------------------------
+# Refund reconciliation
+# ---------------------------------------------------------------------------
+def normalize_refunds(df,source="REFUND"):
+    """
+    Normalize a provider/POS refund-and-reversal export into structured
+    refund rows. Amount is always stored as a positive magnitude; the
+    file's own sign or Cr/Dr wording is not assumed.
+    """
+    d=norm_cols(df)
+
+    amt=find(d,[
+        "refund amount","amount","transaction amount","gross amount",
+        "captured amount","reversal amount","refunded amount","value"
+    ])
+    if not amt:
+        raise ValueError(f"{source}: Refund Amount column is required.")
+
+    date=find(d,[
+        "refund date","transaction date","date","captured date","created at",
+        "creation date","reversal date","localdate","local date"
+    ])
+    store_col=find(d,["store","store code","store name"])
+    branch_col=find(d,["branch name","branch_name","outlet"])
+    ac=find(d,[
+        "auth code","authorization code","auth","rrn","reference","payment id",
+        "order_reference_id","trans approval cd","authorization_id","tr arf","tr_arf"
+    ])
+    original_ref=find(d,[
+        "original auth code","original reference","original transaction",
+        "original_transaction_id","original order","original_order_reference_id",
+        "original charge_id","ref transaction","related transaction"
+    ])
+    ptype=find(d,["scheme","card type","card","payment type","payment_type","channel"])
+    terminal=find(d,["terminal id","tid","terminal","terminal_id"])
+    reason=find(d,["reason","refund reason","remarks","comment"])
+    status=find(d,["status","transaction status","settlement_status"])
+
+    rows=[]
+    for i,r in d.iterrows():
+        a=amount(r.get(amt))
+        if pd.isna(a) or a==0:
+            continue
+        st=str(r.get(status,"")).strip().upper() if status else ""
+        if st in {"CANCEL","CANCELLED","FAILED","FAIL","VOID","VOIDED"}:
+            continue
+
+        store_raw=""
+        for c in (store_col,branch_col):
+            if c:
+                v=r.get(c)
+                if pd.notna(v) and str(v).strip():
+                    store_raw=str(v).strip();break
+        sc=STORE_MAP.get(store_raw.upper(),store_raw)
+
+        pt=str(r.get(ptype,source)).strip().upper() if ptype else source
+        pt=_norm_payment(pt)
+
+        rows.append({
+            "Refund Row":i+1,
+            "Source File":source,
+            "Store":sc,
+            "Refund Date":dt(r.get(date)) if date else pd.NaT,
+            "Auth Code":auth(r.get(ac)) if ac else "",
+            "Original Reference":str(r.get(original_ref,"")).strip() if original_ref else "",
+            "Payment Type":pt,
+            "Refund Amount":abs(a),
+            "Terminal ID":str(r.get(terminal,"")).strip() if terminal else "",
+            "Reason":str(r.get(reason,"")).strip() if reason else "",
+        })
+
+    return pd.DataFrame(rows)
+
+def reconcile_refunds(refunds,matched_sales):
+    """
+    Prove every refund against a real, previously reconciled sale before it
+    is treated as legitimate.
+
+    Matching hierarchy:
+      1. Original Reference / Auth Code equals the sale's Auth Code
+         (Amount also agrees within SAR 1).
+      2. No usable original reference: Store + Payment Type + Amount +
+         same-day match against a matched sale, only when exactly one
+         candidate exists.
+      3. No proof found -> "Refund Without Matching Sale" exception.
+
+    A matched sale can back at most one refund.
+    """
+    if refunds is None or refunds.empty:
+        return pd.DataFrame()
+
+    sales=matched_sales.copy() if matched_sales is not None and not matched_sales.empty else pd.DataFrame()
+    used=set()
+    rows=[]
+
+    if not sales.empty:
+        sales["_PAY"]=sales.get("Payment Type",pd.Series("",index=sales.index)).apply(_norm_payment)
+        sales["_AMT"]=pd.to_numeric(sales.get("POS Amount",sales.get("D365 Amount",np.nan)),errors="coerce")
+        sales["_AUTH"]=sales.get("Auth Code",pd.Series("",index=sales.index)).astype(str).str.strip()
+        sales["_DATE"]=pd.to_datetime(sales.get("Date",sales.get("POS Date")),errors="coerce")
+
+    for _,r in refunds.iterrows():
+        store=str(r.get("Store","")).strip()
+        pay=_norm_payment(r.get("Payment Type",""))
+        amt=float(r.get("Refund Amount",0.0))
+        ref=str(r.get("Original Reference","")).strip() or str(r.get("Auth Code","")).strip()
+
+        sel=None
+        rule=""
+        if not sales.empty:
+            cand=sales[~sales.index.isin(used)]
+
+            if ref:
+                x=cand[cand["_AUTH"]==ref]
+                x=x[(x["_AMT"]-amt).abs()<=1.0]
+                if len(x)==1:
+                    sel=x.iloc[0];rule="Original Reference + Amount"
+
+            if sel is None:
+                x=cand[
+                    (cand.get("Store Code",pd.Series("",index=cand.index)).astype(str).str.strip()==store) &
+                    (cand["_PAY"]==pay) &
+                    ((cand["_AMT"]-amt).abs()<=1.0)
+                ]
+                rdate=r.get("Refund Date")
+                if pd.notna(rdate) and len(x)>1:
+                    xd=x[x["_DATE"].dt.normalize()==pd.to_datetime(rdate).normalize()]
+                    if len(xd)==1:
+                        x=xd
+                if len(x)==1:
+                    sel=x.iloc[0];rule="Store + Tender + Amount (unique)"
+
+        rr=r.to_dict()
+        if sel is not None:
+            used.add(sel.name)
+            rr["Status"]="Matched"
+            rr["Match Rule"]=rule
+            rr["Original Sale Store"]=sel.get("Store Code","")
+            rr["Original Sale Date"]=sel.get("Date",sel.get("POS Date",pd.NaT))
+            rr["Original Auth Code"]=sel.get("Auth Code","")
+            rr["Exception"]=""
+        else:
+            rr["Status"]="Exception"
+            rr["Match Rule"]=""
+            rr["Original Sale Store"]=""
+            rr["Original Sale Date"]=pd.NaT
+            rr["Original Auth Code"]=""
+            rr["Exception"]="Refund Without Matching Sale"
+        rows.append(rr)
+
+    return pd.DataFrame(rows)
 
 def make_carry_forward(unmatched_sales,unmatched_pos,previous=None):
     fs=[]
@@ -1112,7 +1587,7 @@ def _d365_dimension(account, store_code, department=""):
         return f"{account}-{store_code}--{department}"
     return f"{account}-{store_code}---"
 
-def create_jv(recon,gl=None,commission_master=None):
+def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None):
     """
     Final D365 JV logic confirmed with Finance.
 
@@ -1220,6 +1695,23 @@ def create_jv(recon,gl=None,commission_master=None):
             # Unknown payment groups must not silently post to a guessed GL.
             continue
 
+        src_dates = pd.to_datetime(g["Date"], errors="coerce").dropna()
+        source_date = src_dates.min() if not src_dates.empty else pd.NaT
+        source_period = source_date.strftime("%b-%Y") if pd.notna(source_date) else ""
+
+        requested_acc = pd.to_datetime(accounting_date, errors="coerce") if accounting_date is not None else pd.NaT
+        if pd.notna(requested_acc):
+            jv_accounting_date = requested_acc.normalize()
+        elif period_control:
+            closed = pd.to_datetime(period_control.get("Closed Through Date",""), errors="coerce")
+            next_open = pd.to_datetime(period_control.get("Next Open Date",""), errors="coerce")
+            if pd.notna(source_date) and pd.notna(closed) and source_date.normalize() <= closed.normalize() and pd.notna(next_open):
+                jv_accounting_date = next_open.normalize()
+            else:
+                jv_accounting_date = source_date.normalize() if pd.notna(source_date) else (next_open.normalize() if pd.notna(next_open) else pd.Timestamp.today().normalize())
+        else:
+            jv_accounting_date = source_date.normalize() if pd.notna(source_date) else pd.Timestamp.today().normalize()
+
         common={
             "Valid":"",
             "Company accounts":gl_effective["COMPANY"],
@@ -1234,6 +1726,11 @@ def create_jv(recon,gl=None,commission_master=None):
             "Currency":gl_effective["CURRENCY"],
             "Exchange rate":"",
             "Gross Amount":gross,
+            "Source Date":source_date,
+            "Source Period":source_period,
+            "JV Accounting Date":jv_accounting_date,
+            "Accounting Period":jv_accounting_date.strftime("%b-%Y") if pd.notna(jv_accounting_date) else "",
+            "Carry Forward From Closed Period":bool(pd.notna(source_date) and pd.notna(jv_accounting_date) and source_date.to_period("M") != jv_accounting_date.to_period("M")),
             "Bank Settlement Verified":True,
         }
 
@@ -1296,9 +1793,7 @@ def create_jv(recon,gl=None,commission_master=None):
     # D365 line numbering.
     j["RecId"]=range(1,len(j)+1)
     j["Line number"]=j.groupby("Journal batch number").cumcount()+1
-    j["Date"]=pd.to_datetime(
-        j["Week"].str.split("/").str[-1], errors="coerce"
-    ).dt.strftime("%d-%b-%y")
+    j["Date"]=pd.to_datetime(j["JV Accounting Date"],errors="coerce").dt.strftime("%d-%b-%y")
 
     chk=j.groupby("Journal batch number")[["Debit","Credit"]].sum().reset_index()
     chk["Difference"]=(chk["Debit"]-chk["Credit"]).round(2)
@@ -1473,6 +1968,165 @@ def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)"):
     out["Validated By/System"]=validated_by
     out["Mapping Version"]=out[batch_col].map(version_by_batch).fillna(out.get("Mapping Version",""))
     return out
+
+
+def create_adjustment_jv(store,payment_type,amount,reason,gl=None,commission_master=None,
+                          accounting_date=None,period_control=None,batch_seq=1,source_date=None):
+    """
+    Build a single-transaction Adjustment / Reversal JV for a late
+    transaction or correction discovered after period close.
+
+    This intentionally reuses the exact same Finance-confirmed GL mapping,
+    dimension format and 4-line (Bank/Commission/VAT/Sale) structure as the
+    normal weekly JV in create_jv() - it is not a new GL treatment, only a
+    controlled, individually-triggered version of the same posting for a
+    transaction that could not go through the normal weekly batch because
+    the period was already closed when it was created/create_jv() ran.
+
+    A positive amount books a missing sale (Debit Bank/Commission/VAT,
+    Credit Sale). A negative amount reverses a prior entry: every line's
+    Debit/Credit is swapped so the batch still balances and still uses the
+    correct account on the correct side.
+
+    Returns an empty DataFrame if the payment group/store display name is
+    not recognized, mirroring create_jv()'s "never guess a GL account"
+    control gate. validate_jv() is expected to be run on the result exactly
+    like a normal JV batch - the dimension/account rules it recomputes are
+    identical.
+    """
+    if not store or amount is None or float(amount)==0:
+        return pd.DataFrame()
+
+    gl_effective={**D365_JV_DEFAULTS,**(gl or {})}
+    payment=_norm_payment(payment_type)
+    group=jv_group(payment)
+
+    sale_gl_by_group={
+        "CARD": gl_effective["CC_GL"],
+        "AMEX": gl_effective["AMEX_GL"],
+        "TABBY": gl_effective["TABBY_GL"],
+        "TAMARA": gl_effective["TAMARA_GL"],
+        "TAP": gl_effective["TAP_GL"],
+    }
+    sale_main=sale_gl_by_group.get(group)
+    if not sale_main:
+        return pd.DataFrame()
+
+    info=_d365_store_info(store)
+    store_code=info["store_code"]; store_name=info["store_name"]; location=info["location"]
+    if info["store_name"]==store_code:
+        # No display name configured - validate_jv() would reject this
+        # batch anyway; fail loudly here instead of creating an
+        # unpostable JV.
+        return pd.DataFrame()
+
+    rate_map,vat_map,method_map=_commission_master_maps(commission_master)
+    method=method_map.get(payment,"PROVIDER_ACTUAL")
+    rate=rate_map.get(payment,np.nan)
+    vat_rate=vat_map.get(payment,15.0)
+    gross=round(abs(float(amount)),2)
+    if method=="CONTRACT_RATE" and pd.notna(rate):
+        comm=round(gross*float(rate)/100.0,2)
+        vat=round(comm*float(vat_rate)/100.0,2)
+        fee_basis="CONTRACT_RATE"
+    else:
+        comm=0.0; vat=0.0
+        fee_basis="PROVIDER_ACTUAL (manual - no commission/VAT captured)"
+    net=round(gross-comm-vat,2)
+
+    src_date=pd.to_datetime(source_date,errors="coerce")
+    if pd.isna(src_date):
+        src_date=pd.Timestamp.today().normalize()
+
+    requested_acc=pd.to_datetime(accounting_date,errors="coerce") if accounting_date is not None else pd.NaT
+    if pd.notna(requested_acc):
+        jv_accounting_date=requested_acc.normalize()
+    elif period_control:
+        next_open=pd.to_datetime(period_control.get("Next Open Date",""),errors="coerce")
+        jv_accounting_date=next_open.normalize() if pd.notna(next_open) else pd.Timestamp.today().normalize()
+    else:
+        jv_accounting_date=pd.Timestamp.today().normalize()
+
+    month,year=_d365_month_year(jv_accounting_date)
+    reversal=float(amount)<0
+    batch=f"ADJ-{store_code}-{jv_accounting_date:%y%m%d}-{batch_seq:03d}"
+
+    def db_cr(debit_amt):
+        return (0.0,debit_amt) if reversal else (debit_amt,0.0)
+
+    common={
+        "Valid":"",
+        "Company accounts":gl_effective["COMPANY"],
+        "Journal batch number":batch,
+        "Store Code":store_code,
+        "Store Name":store_name,
+        "Brand":store_name.split()[0] if store_name else "",
+        "Week":jv_accounting_date.to_period("W-SUN").strftime("%Y-%m-%d"),
+        "Group":group,
+        "Fee Basis":fee_basis,
+        "Rate %":f"{rate:.2f}%" if pd.notna(rate) else "",
+        "Currency":gl_effective["CURRENCY"],
+        "Exchange rate":"",
+        "Gross Amount":gross,
+        "Source Date":src_date,
+        "Source Period":src_date.strftime("%b-%Y"),
+        "JV Accounting Date":jv_accounting_date,
+        "Accounting Period":jv_accounting_date.strftime("%b-%Y"),
+        "Carry Forward From Closed Period":src_date.to_period("M")!=jv_accounting_date.to_period("M"),
+        "Bank Settlement Verified":True,
+        "Adjustment Type":"REVERSAL" if reversal else "LATE TRANSACTION",
+        "Adjustment Reason":reason or "",
+    }
+
+    bd,bc=db_cr(net)
+    cd,cc=db_cr(comm)
+    vd,vc=db_cr(vat)
+    sd,sc=(gross,0.0) if reversal else (0.0,gross)
+
+    rows=[
+        {**common,"Account type":"Bank","Main Account":gl_effective["BANK_ACCOUNT"],
+         "Ledger Dimension":gl_effective["BANK_ACCOUNT"],"Default Dimension":store_code,
+         "Location":location,"Brand Dimension":"","Department":"",
+         "Debit":bd,"Credit":bc,"Description":_d365_description("BANK",store_name,month,year)},
+        {**common,"Account type":"Ledger","Main Account":gl_effective["COMMISSION_GL"],
+         "Ledger Dimension":_d365_dimension(gl_effective["COMMISSION_GL"],store_code,"Sale"),
+         "Default Dimension":store_code,"Location":location,"Brand Dimension":"","Department":"Sale",
+         "Debit":cd,"Credit":cc,"Description":_d365_description("COMMISSION",store_name,month,year)},
+        {**common,"Account type":"Vendor","Main Account":gl_effective["VAT_VENDOR"],
+         "Ledger Dimension":gl_effective["VAT_VENDOR"],"Default Dimension":store_code,
+         "Location":"604" if store_code=="601" else location,"Brand Dimension":"","Department":"Sale",
+         "Debit":vd,"Credit":vc,"Description":_d365_description("VAT",store_name,month,year)},
+        {**common,"Account type":"Ledger","Main Account":sale_main,
+         "Ledger Dimension":_d365_dimension(sale_main,store_code),"Default Dimension":store_code,
+         "Location":location,"Brand Dimension":"","Department":"",
+         "Debit":sd,"Credit":sc,"Description":_d365_description("SALE",store_name,month,year)},
+    ]
+
+    j=pd.DataFrame(rows)
+    j["RecId"]=range(1,len(j)+1)
+    j["Line number"]=range(1,len(j)+1)
+    j["Date"]=jv_accounting_date.strftime("%d-%b-%y")
+
+    debit=pd.to_numeric(j["Debit"],errors="coerce").fillna(0.0)
+    credit=pd.to_numeric(j["Credit"],errors="coerce").fillna(0.0)
+    j["Difference"]=round(float(debit.sum())-float(credit.sum()),2)
+    j["Balanced"]=abs(j["Difference"].iloc[0])<=0.01
+
+    j["Approval Status"]="PENDING"
+    j["D365 Status"]="NOT POSTED"
+    j["Voucher"]=""
+
+    gl_snapshot_json=json.dumps(gl_effective,sort_keys=True)
+    j["GL Mapping Snapshot"]=gl_snapshot_json
+    j["Mapping Version"]=hashlib.sha1(gl_snapshot_json.encode()).hexdigest()[:12]
+
+    j["Journal Batch"]=j["Journal batch number"]
+    j["Account"]=j["Main Account"]
+    j["Narration"]=j["Description"]
+    j["Bank Name"]=""
+    j["Bank Settled"]=j["Bank Settlement Verified"]
+
+    return j
 
 
 def to_excel(sheets):

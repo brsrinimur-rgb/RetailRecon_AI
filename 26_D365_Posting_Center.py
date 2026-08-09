@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from datetime import datetime
 import auth, theme, db
 
@@ -15,6 +16,19 @@ if j.empty:
     st.stop()
 
 approved_mask = (j["Approval Status"] == "APPROVED") & (j["Balanced"] == True)
+
+period_open = []
+period_reason = []
+for _, r in j.iterrows():
+    acc_date = r.get("JV Accounting Date", r.get("Date",""))
+    entity = r.get("Company accounts","ULC") or "ULC"
+    ok, msg = db.is_accounting_date_open(acc_date, entity)
+    period_open.append(bool(ok))
+    period_reason.append(msg)
+
+j["Accounting Period Open"] = period_open
+j["Accounting Period Check"] = period_reason
+approved_mask = approved_mask & j["Accounting Period Open"]
 if "Validation Passed" in j.columns:
     # Final control gate before anything reaches D365: even an APPROVED,
     # balanced batch is refused here if it fails the chart-of-accounts check -
@@ -28,7 +42,7 @@ not_postable = j[(j["Approval Status"] == "APPROVED") & ~approved_mask]["Journal
 if not_postable:
     st.error(
         f"{len(not_postable)} batch(es) are Approved but still blocked from posting "
-        f"(unbalanced or failed D365 validation): {', '.join(not_postable)}"
+        f"(unbalanced, failed D365 validation, or accounting period closed): {', '.join(not_postable)}"
     )
 if st.button("PUSH APPROVED JV TO D365", type="primary", disabled=not bool(batches)):
     for n, b in enumerate(batches, 1):
