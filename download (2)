@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+ENV/
+
+# Runtime database / temp files
+retailrecon.db
+retailrecon.db-shm
+retailrecon.db-wal
+*.sqlite
+*.sqlite3
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# User uploads / generated exports
+uploads/
+exports/
+*.log

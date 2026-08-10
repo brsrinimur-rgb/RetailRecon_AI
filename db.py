@@ -143,30 +143,28 @@ init_db()
 # ---------------------------------------------------------------- JV batches
 def replace_jv(df: pd.DataFrame):
     """
-    Save JV rows. The full row is kept as JSON so persistence never again
-    silently drops columns when core.create_jv()'s output shape changes -
-    this previously wrote to a table ("jv_batches") that init_db() never
-    created, meaning every JV Creation click crashed. Fields used for
-    filtering/updates elsewhere (approval, posting, validation) are also
-    stored in real columns so those operations stay fast and simple.
+    Upsert newly-created JV batches without destroying unrelated JV history.
+
+    Safety rules:
+    - Empty input does nothing.
+    - Only incoming Journal Batches are replaced.
+    - APPROVED or POSTED batches cannot be silently regenerated/overwritten.
+    - Unrelated historical batches remain untouched.
+    - Full D365 row shape is preserved as JSON.
     """
     import json
     import numpy as np
 
-    conn = get_conn()
-    conn.execute("DELETE FROM jv_batches")
-
+    init_db()
     if df is None or df.empty:
-        conn.commit()
-        conn.close()
         return
 
     def _clean(v):
         if v is None:
             return None
-        if isinstance(v, (pd.Timestamp,)):
+        if isinstance(v, pd.Timestamp):
             return "" if pd.isna(v) else v.isoformat()
-        if isinstance(v, (np.generic,)):
+        if isinstance(v, np.generic):
             v = v.item()
         try:
             if pd.isna(v):
@@ -179,41 +177,94 @@ def replace_jv(df: pd.DataFrame):
         for name in names:
             if name in row.index:
                 v = row.get(name)
-                if pd.isna(v) if not isinstance(v, str) else False:
-                    return default
+                try:
+                    if pd.isna(v):
+                        return default
+                except (TypeError, ValueError):
+                    pass
                 return v
         return default
 
-    now = datetime.now().isoformat(timespec="seconds")
-    rows = []
-    for _, r in df.iterrows():
-        journal_batch = str(value(r, "Journal Batch", "Journal batch number", default=""))
-        line_number = value(r, "Line number", default=None)
-        try:
-            line_number = int(line_number) if line_number not in (None, "") else None
-        except (TypeError, ValueError):
-            line_number = None
-        approval_status = str(value(r, "Approval Status", default="PENDING"))
-        d365_status = str(value(r, "D365 Status", default="NOT POSTED"))
-        voucher = str(value(r, "Voucher", default=""))
-        balanced = bool(value(r, "Balanced", default=False))
-        validation_passed = bool(value(r, "Validation Passed", default=True))
-        row_json = json.dumps({k: _clean(v) for k, v in r.to_dict().items()}, default=str)
+    d=df.copy()
+    incoming_batches=sorted({
+        str(value(r,"Journal Batch","Journal batch number",default="")).strip()
+        for _,r in d.iterrows()
+        if str(value(r,"Journal Batch","Journal batch number",default="")).strip()
+    })
+    if not incoming_batches:
+        raise ValueError("JV save failed: no Journal Batch / Journal batch number found.")
 
-        rows.append((
-            journal_batch, line_number, approval_status, d365_status, voucher,
-            1 if balanced else 0, 1 if validation_passed else 0, row_json, now
-        ))
+    conn=get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
 
-    conn.executemany(
-        """INSERT INTO jv_batches
-           (journal_batch,line_number,approval_status,d365_status,voucher,
-            balanced,validation_passed,row_json,created_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        rows
-    )
-    conn.commit()
-    conn.close()
+        marks=",".join("?" for _ in incoming_batches)
+        existing=conn.execute(
+            f"""SELECT journal_batch,
+                       MAX(CASE WHEN approval_status='APPROVED' THEN 1 ELSE 0 END),
+                       MAX(CASE WHEN d365_status='POSTED' THEN 1 ELSE 0 END)
+                FROM jv_batches
+                WHERE journal_batch IN ({marks})
+                GROUP BY journal_batch""",
+            incoming_batches
+        ).fetchall()
+
+        locked=[]
+        for batch, approved, posted in existing:
+            if posted:
+                locked.append(f"{batch} (POSTED)")
+            elif approved:
+                locked.append(f"{batch} (APPROVED)")
+        if locked:
+            raise ValueError(
+                "JV regeneration blocked. These batches are already approved/posted: "
+                + ", ".join(locked)
+            )
+
+        # Replace only the incoming pending batch(es), never the whole table.
+        conn.execute(
+            f"DELETE FROM jv_batches WHERE journal_batch IN ({marks})",
+            incoming_batches
+        )
+
+        now=datetime.now().isoformat(timespec="seconds")
+        rows=[]
+        for _,r in d.iterrows():
+            journal_batch=str(value(r,"Journal Batch","Journal batch number",default="")).strip()
+            line_number=value(r,"Line number",default=None)
+            try:
+                line_number=int(line_number) if line_number not in (None,"") else None
+            except (TypeError,ValueError):
+                line_number=None
+
+            approval_status=str(value(r,"Approval Status",default="PENDING"))
+            d365_status=str(value(r,"D365 Status",default="NOT POSTED"))
+            voucher=str(value(r,"Voucher",default=""))
+            balanced=bool(value(r,"Balanced",default=False))
+            validation_passed=bool(value(r,"Validation Passed",default=True))
+            row_json=json.dumps(
+                {k:_clean(v) for k,v in r.to_dict().items()},
+                default=str
+            )
+
+            rows.append((
+                journal_batch,line_number,approval_status,d365_status,voucher,
+                1 if balanced else 0,1 if validation_passed else 0,row_json,now
+            ))
+
+        conn.executemany(
+            """INSERT INTO jv_batches
+               (journal_batch,line_number,approval_status,d365_status,voucher,
+                balanced,validation_passed,row_json,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            rows
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def load_jv() -> pd.DataFrame:

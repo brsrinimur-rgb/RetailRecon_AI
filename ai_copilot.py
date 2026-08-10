@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import difflib
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -70,11 +71,75 @@ def _find_store_codes(q):
     stop={"000","100","200","365"}
     return [x for x in hits if x not in stop]
 
+def _store_name_map(db_module=None):
+    """
+    Store Code -> known display/provider names, so a question can name a
+    store ("Tahlia Mall sales") instead of only its numeric code. Combines
+    the confirmed D365 store display names (core.D365_STORE_DISPLAY) with
+    whatever provider store names Finance has mapped in the Store Mapping
+    Master, so both "official" and provider-file naming work.
+    """
+    names={}
+    try:
+        import core as _core
+        for code,info in _core.D365_STORE_DISPLAY.items():
+            n=str(info.get("store_name","")).strip()
+            if n:
+                names.setdefault(code,set()).add(n)
+    except Exception:
+        pass
+    if db_module is not None:
+        try:
+            sm=db_module.load_store_mapping_master()
+            if not sm.empty and {"Store Code","Provider Store Name"}.issubset(sm.columns):
+                for _,r in sm.iterrows():
+                    code=_norm_store(r.get("Store Code",""))
+                    n=str(r.get("Provider Store Name","")).strip()
+                    if code and n:
+                        names.setdefault(code,set()).add(n)
+        except Exception:
+            pass
+    return names
+
+def _find_store_codes_by_name(q,db_module=None):
+    """
+    Match known store names inside free text. Requires the matched name to
+    be at least 4 characters so a generic single word (e.g. "Mall") never
+    becomes a false-positive store match on its own.
+    """
+    name_map=_store_name_map(db_module)
+    if not name_map:
+        return []
+    ql=q.lower()
+    hits=[]
+    for code,names in name_map.items():
+        for n in names:
+            nl=n.lower().strip()
+            if len(nl)>=4 and nl in ql:
+                hits.append(code)
+                break
+    return hits
+
+# Fuzzy-match candidates: only full canonical words, never short codes like
+# "vc"/"mc"/"p1" - typo-tolerance on a 2-letter abbreviation is too noisy to
+# be reliable (almost anything is "close" to a 2-letter string).
+_PAYMENT_FUZZY_CANDIDATES = {
+    a: p for p, aliases in PAYMENT_ALIASES.items() for a in aliases if len(a) >= 4 and " " not in a
+}
+
 def _find_payment(q):
     ql=q.lower()
     for payment, aliases in PAYMENT_ALIASES.items():
         if any(re.search(rf"\b{re.escape(a)}\b", ql) for a in aliases):
             return payment
+    # Typo tolerance: "mastercart", "vise", "tammara", "amx" etc. Cutoff 0.72
+    # was chosen to catch realistic single/double-character typos on real
+    # payment names without matching ordinary finance vocabulary (checked
+    # against words like "sales","store","total","refund","settle", etc.).
+    for tok in re.findall(r"[a-z]{3,}", ql):
+        match=difflib.get_close_matches(tok, _PAYMENT_FUZZY_CANDIDATES.keys(), n=1, cutoff=0.72)
+        if match:
+            return _PAYMENT_FUZZY_CANDIDATES[match[0]]
     return None
 
 def _parse_named_date(text, default_year=None):
@@ -121,6 +186,29 @@ def _parse_date_scope(q, data_min=None, data_max=None, prior=None):
         return d,d,"on"
     if re.search(r"\btoday\b",ql):
         return today,today,"on"
+
+    # Relative periods, anchored on "today" the same way yesterday/today
+    # already are above (system clock, not the dataset's max date - the
+    # dataset itself may only cover a partial period).
+    if re.search(r"\b(mtd|month[\s-]?to[\s-]?date)\b",ql):
+        return today.replace(day=1),today,"range"
+    if re.search(r"\b(ytd|year[\s-]?to[\s-]?date)\b",ql):
+        return today.replace(month=1,day=1),today,"range"
+    if re.search(r"\bthis\s+week\b",ql):
+        start=today-pd.Timedelta(days=today.weekday())
+        return start,today,"range"
+    if re.search(r"\blast\s+week\b",ql):
+        this_week_start=today-pd.Timedelta(days=today.weekday())
+        end=this_week_start-pd.Timedelta(days=1)
+        start=end-pd.Timedelta(days=6)
+        return start,end,"range"
+    if re.search(r"\bthis\s+month\b",ql):
+        return today.replace(day=1),today,"range"
+    if re.search(r"\blast\s+month\b",ql):
+        first_this_month=today.replace(day=1)
+        end=first_this_month-pd.Timedelta(days=1)
+        start=end.replace(day=1)
+        return start,end,"range"
 
     # 1-5 Aug 2026 / 1 – 5 August 2026
     m=re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s+([a-z]{3,9})(?:\s+(20\d{2}))?\b",ql)
@@ -205,7 +293,7 @@ def _parse_date_scope(q, data_min=None, data_max=None, prior=None):
         return prior.date_from,prior.date_to,prior.date_mode
     return None,None,""
 
-def interpret_query(question, result, prior: CopilotContext|None=None):
+def interpret_query(question, result, prior: CopilotContext|None=None, db_module=None):
     prior=prior or CopilotContext()
     q=question.strip()
     ql=q.lower()
@@ -216,6 +304,8 @@ def interpret_query(question, result, prior: CopilotContext|None=None):
     data_max=all_dates.max().normalize() if not all_dates.empty else pd.NaT
 
     stores=_find_store_codes(q)
+    if not stores:
+        stores=_find_store_codes_by_name(q,db_module)
     if not stores:
         stores=prior.store_codes.copy()
 
@@ -245,8 +335,24 @@ def interpret_query(question, result, prior: CopilotContext|None=None):
         intent="missing_pos"
     elif any(x in ql for x in ["missing d365","provider only"]):
         intent="missing_d365"
+    elif any(x in ql for x in [
+        "biggest risk","highest risk","risk today","risks today","top risk","top risks",
+        "priority exception","priority exceptions","what needs attention","needs attention",
+        "anomaly","anomalies","control risk"
+    ]):
+        intent="risk"
+    elif any(x in ql for x in ["store performance","store score","store control score","which store is worst","which store needs attention"]):
+        intent="store_performance"
+    elif any(x in ql for x in ["provider performance","provider score","payment performance","which provider","provider delay"]):
+        intent="provider_performance"
     elif any(x in ql for x in ["exception","anything wrong","issues","problem","unmatched"]):
         intent="exceptions"
+    elif any(x in ql for x in [
+        "tell date","tell me the date","what date","which date","what dates","which dates",
+        "date range","what period","which period","show date","current date range",
+        "what's the date","whats the date"
+    ]):
+        intent="date_range"
     elif (
         payment=="CASH"
         and any(x in ql for x in [
@@ -577,6 +683,27 @@ def _cash_report(result,ctx,question="",db_module=None):
     return {"text":" ".join(lines),"table":summary.reset_index(drop=True)}
 
 
+def _date_range_answer(result,ctx):
+    """
+    Answer "tell date" / "what date" style follow-ups: report the date span
+    of the CURRENT analysis scope (store/payment/date context retained from
+    the prior turn) without recomputing or repeating totals.
+    """
+    df=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
+    dates=pd.to_datetime(df.get("Date",pd.Series(dtype="datetime64[ns]")),errors="coerce").dropna()
+    scope=_scope_text(ctx)
+    if dates.empty:
+        return {
+            "text":f"I don't have any transactions in scope for **{scope}** to determine a date range.",
+            "table":pd.DataFrame(),
+        }
+    d_min,d_max=dates.min(),dates.max()
+    if d_min==d_max:
+        text=f"The current analysis for **{scope}** is for a single date: **{_fmt_date(d_min)}**."
+    else:
+        text=f"The current analysis date range for **{scope}** is **{_fmt_date(d_min)} to {_fmt_date(d_max)}**."
+    return {"text":text,"table":pd.DataFrame()}
+
 def _exceptions_answer(result,ctx):
     us=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
     up=_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")
@@ -661,8 +788,10 @@ def _summary_answer(result,ctx):
         text+=f" Of **{total_matched:,} matched/review transaction(s)** in scope, **{settled:,}** are bank settled."
     return {"text":text,"table":sales["table"]}
 
-def _compare_answer(result,ctx,question):
+def _compare_answer(result,ctx,question,db_module=None):
     stores=_find_store_codes(question)
+    if len(stores)<2:
+        stores=list(dict.fromkeys(stores+_find_store_codes_by_name(question,db_module)))
     if len(stores)<2:
         return {"text":"For a comparison, please mention at least two store codes, for example: `compare 601 and 603 sales as of 9 Aug 2026`.","table":pd.DataFrame()}
     tender=result.get("tender",pd.DataFrame()).copy()
@@ -676,7 +805,240 @@ def _compare_answer(result,ctx,question):
     best=table.sort_values("Sales/Tender Total",ascending=False).iloc[0]
     return {"text":f"For {_scope_text(ctx)}, **Store {best['Store Code']}** has the higher tender total at **{_fmt_sar(best['Sales/Tender Total'])}**.","table":table}
 
-def answer_question(question, result, db_module=None, prior_context=None):
+def _allowed_store_codes(user_context):
+    """
+    Optional role-aware scope.
+    Finance/Admin roles remain unrestricted.
+    A future Store User can be restricted by setting:
+      user_context["store_codes"] = ["601", ...]
+    This keeps the Copilot aligned with application permissions without
+    changing existing finance-user behavior.
+    """
+    if not user_context:
+        return None
+    stores=user_context.get("store_codes") or user_context.get("stores")
+    if stores:
+        return {_norm_store(x) for x in stores if _norm_store(x)}
+    return None
+
+def _restrict_df_to_stores(df, allowed):
+    if df is None or df.empty or not allowed:
+        return df
+    x=df.copy()
+    for col in ["Store Code","POS Store","Store"]:
+        if col in x.columns:
+            return x[x[col].map(_norm_store).isin(allowed)].copy()
+    return x
+
+def _apply_user_scope(result, user_context):
+    allowed=_allowed_store_codes(user_context)
+    if not allowed or not result:
+        return result
+    scoped={}
+    for k,v in result.items():
+        if isinstance(v,pd.DataFrame):
+            scoped[k]=_restrict_df_to_stores(v,allowed)
+        else:
+            scoped[k]=v
+    return scoped
+
+def _risk_answer(result,ctx,question=""):
+    """
+    Finance-control risk view built only from active application data.
+    It does not make fraud accusations; it prioritizes review items.
+    """
+    ql=str(question or "").lower()
+    us=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
+    up=_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")
+    m=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
+
+    rows=[]
+
+    # Missing POS / provider settlement.
+    if not us.empty:
+        amt=pd.to_numeric(us.get("D365 Amount",0),errors="coerce").fillna(0).abs()
+        for idx,r in us.iterrows():
+            rows.append({
+                "Risk Type":"Missing POS/Provider",
+                "Store Code":_norm_store(r.get("Store Code","")),
+                "Date":r.get("Date",pd.NaT),
+                "Payment Type":str(r.get("D365 Payment","")),
+                "Reference":str(r.get("Auth Code","") or r.get("Receipt ID","")),
+                "Amount":float(abs(pd.to_numeric(pd.Series([r.get("D365 Amount",0)]),errors="coerce").fillna(0).iloc[0])),
+                "Age Days":max(0,(pd.Timestamp.today().normalize()-pd.to_datetime(r.get("Date"),errors="coerce").normalize()).days) if pd.notna(pd.to_datetime(r.get("Date"),errors="coerce")) else 0,
+                "Reason":str(r.get("Reason","Missing settlement")),
+            })
+
+    # Provider/POS without D365 or mapping/date issues.
+    if not up.empty:
+        for idx,r in up.iterrows():
+            status=str(r.get("Exception Status",r.get("Status","Provider/POS exception")))
+            rows.append({
+                "Risk Type":status,
+                "Store Code":_norm_store(r.get("POS Store","")),
+                "Date":r.get("POS Date",pd.NaT),
+                "Payment Type":str(r.get("POS Payment","")),
+                "Reference":str(r.get("Auth Code","") or r.get("Provider Reference","")),
+                "Amount":float(abs(pd.to_numeric(pd.Series([r.get("POS Amount",0)]),errors="coerce").fillna(0).iloc[0])),
+                "Age Days":max(0,(pd.Timestamp.today().normalize()-pd.to_datetime(r.get("POS Date"),errors="coerce").normalize()).days) if pd.notna(pd.to_datetime(r.get("POS Date"),errors="coerce")) else 0,
+                "Reason":str(r.get("Reason",status)),
+            })
+
+    # Matched but bank not settled.
+    if not m.empty and "Bank Settled" in m.columns:
+        u=m[~m["Bank Settled"].fillna(False).astype(bool)].copy()
+        for idx,r in u.iterrows():
+            rows.append({
+                "Risk Type":"Bank Settlement Outstanding",
+                "Store Code":_norm_store(r.get("Store Code","")),
+                "Date":r.get("Date",pd.NaT),
+                "Payment Type":str(r.get("Payment Type","")),
+                "Reference":str(r.get("Auth Code","")),
+                "Amount":float(abs(pd.to_numeric(pd.Series([r.get("D365 Amount",r.get("Sales Amount",0))]),errors="coerce").fillna(0).iloc[0])),
+                "Age Days":max(0,(pd.Timestamp.today().normalize()-pd.to_datetime(r.get("Posting Date",r.get("Date")),errors="coerce").normalize()).days) if pd.notna(pd.to_datetime(r.get("Posting Date",r.get("Date")),errors="coerce")) else 0,
+                "Reason":"Matched transaction has not yet been verified against bank settlement.",
+            })
+
+    risk=pd.DataFrame(rows)
+    if risk.empty:
+        return {"text":f"I found no open reconciliation or bank-settlement risks for **{_scope_text(ctx)}** in the active data.","table":risk}
+
+    # Priority score: materiality + aging + issue class.
+    type_weight={
+        "Bank Settlement Outstanding":30,
+        "Missing POS/Provider":25,
+        "Missing D365":20,
+        "Terminal Mapping Required":15,
+        "Merchant Mapping Required":15,
+        "Store Mapping Required":15,
+        "Date Validation Required":10,
+        "Duplicate Provider/POS":10,
+    }
+    risk["Priority Score"]=(
+        risk["Risk Type"].map(type_weight).fillna(10)
+        + np.minimum(risk["Age Days"].fillna(0),30)
+        + np.minimum(np.log10(risk["Amount"].clip(lower=1))*10,40)
+    ).round(1)
+    risk["Priority"]=pd.cut(
+        risk["Priority Score"],
+        bins=[-np.inf,25,45,65,np.inf],
+        labels=["Low","Medium","High","Critical"]
+    ).astype(str)
+    risk=risk.sort_values(["Priority Score","Amount"],ascending=[False,False]).reset_index(drop=True)
+
+    topn=10
+    mtop=re.search(r"\btop\s+(\d+)\b",ql)
+    if mtop:
+        topn=max(1,min(100,int(mtop.group(1))))
+    if any(x in ql for x in ["biggest","highest","largest","top"]):
+        show=risk.head(topn)
+    else:
+        show=risk.head(50)
+
+    total=float(risk["Amount"].sum())
+    critical=int((risk["Priority"]=="Critical").sum())
+    top=show.iloc[0]
+    text=(
+        f"For **{_scope_text(ctx)}**, I found **{len(risk):,} open finance-control risk item(s)** "
+        f"with gross exposure of about **{_fmt_sar(total)}**. "
+        f"**{critical:,}** item(s) are currently Critical by amount/age/control priority. "
+        f"The highest-priority item is **{top['Risk Type']}** for Store **{top['Store Code'] or 'Unmapped'}**, "
+        f"amount **{_fmt_sar(top['Amount'])}**, age **{int(top['Age Days'])} day(s)**."
+    )
+    return {"text":text,"table":show}
+
+def _store_performance_answer(result,ctx):
+    tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
+    us=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
+    up=_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")
+    m=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
+
+    stores=set()
+    for df,col in [(tender,"Store Code"),(us,"Store Code"),(up,"POS Store"),(m,"Store Code")]:
+        if df is not None and not df.empty and col in df.columns:
+            stores |= set(df[col].map(_norm_store).dropna().astype(str))
+    rows=[]
+    for s in sorted(x for x in stores if x):
+        ts=tender[tender["Store Code"].map(_norm_store)==s] if not tender.empty and "Store Code" in tender.columns else pd.DataFrame()
+        ms=m[m["Store Code"].map(_norm_store)==s] if not m.empty and "Store Code" in m.columns else pd.DataFrame()
+        uss=us[us["Store Code"].map(_norm_store)==s] if not us.empty and "Store Code" in us.columns else pd.DataFrame()
+        ups=up[up["POS Store"].map(_norm_store)==s] if not up.empty and "POS Store" in up.columns else pd.DataFrame()
+        sales=float(pd.to_numeric(ts.get("D365 Amount",0),errors="coerce").fillna(0).sum()) if not ts.empty else 0
+        matched_amt=float(pd.to_numeric(ms.get("D365 Amount",0),errors="coerce").fillna(0).sum()) if not ms.empty else 0
+        open_amt=0.0
+        if not uss.empty:
+            open_amt+=float(pd.to_numeric(uss.get("D365 Amount",0),errors="coerce").fillna(0).abs().sum())
+        if not ups.empty:
+            open_amt+=float(pd.to_numeric(ups.get("POS Amount",0),errors="coerce").fillna(0).abs().sum())
+        bank_open=0
+        if not ms.empty and "Bank Settled" in ms.columns:
+            bank_open=int((~ms["Bank Settled"].fillna(False).astype(bool)).sum())
+        exc=len(uss)+len(ups)
+        score=max(0.0,100.0-min(60.0,exc*5.0)-min(30.0,bank_open*3.0)-min(10.0,(open_amt/max(abs(sales),1))*100))
+        rows.append({
+            "Store Code":s,
+            "D365 Tender Total":sales,
+            "Matched Amount":matched_amt,
+            "Open Exception Amount":open_amt,
+            "Exception Count":exc,
+            "Bank Outstanding Count":bank_open,
+            "Control Score":round(score,1),
+        })
+    table=pd.DataFrame(rows)
+    if table.empty:
+        return {"text":"No store performance data is available in the active reconciliation.","table":table}
+    table=table.sort_values(["Control Score","Open Exception Amount"],ascending=[True,False])
+    worst=table.iloc[0]
+    text=(
+        f"Store control performance is calculated from current reconciliation exceptions and bank-outstanding items. "
+        f"Store **{worst['Store Code']}** currently needs the most attention with a control score of "
+        f"**{worst['Control Score']:.1f}/100** and open exception exposure of **{_fmt_sar(worst['Open Exception Amount'])}**."
+    )
+    return {"text":text,"table":table}
+
+def _provider_performance_answer(result,ctx):
+    pos=result.get("pos",pd.DataFrame())
+    m=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
+    up=_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")
+    rows=[]
+    providers=set()
+    if pos is not None and not pos.empty:
+        if "Provider" in pos.columns:
+            providers |= set(pos["Provider"].astype(str).str.upper().replace({"":"POS"}))
+        if "POS Payment" in pos.columns:
+            providers |= set(pos["POS Payment"].astype(str).str.upper())
+    if not m.empty and "Payment Type" in m.columns:
+        providers |= set(m["Payment Type"].astype(str).str.upper())
+    for p in sorted(x for x in providers if x and x!="NAN"):
+        mm=m[m["Payment Type"].astype(str).str.upper()==p] if not m.empty and "Payment Type" in m.columns else pd.DataFrame()
+        uu=up[up["POS Payment"].astype(str).str.upper()==p] if not up.empty and "POS Payment" in up.columns else pd.DataFrame()
+        settled=int(mm["Bank Settled"].fillna(False).astype(bool).sum()) if not mm.empty and "Bank Settled" in mm.columns else 0
+        total=len(mm)
+        delay=pd.to_numeric(mm.get("Settlement Delay Days",pd.Series(dtype=float)),errors="coerce").dropna()
+        rows.append({
+            "Provider / Payment":p,
+            "Matched Transactions":total,
+            "Bank Settled":settled,
+            "Awaiting Bank":max(total-settled,0),
+            "Provider-side Exceptions":len(uu),
+            "Average Settlement Delay Days":round(float(delay.mean()),2) if not delay.empty else np.nan,
+            "Commission":float(pd.to_numeric(mm.get("Commission",0),errors="coerce").fillna(0).sum()) if not mm.empty else 0.0,
+            "VAT":float(pd.to_numeric(mm.get("VAT",0),errors="coerce").fillna(0).sum()) if not mm.empty else 0.0,
+        })
+    table=pd.DataFrame(rows)
+    if table.empty:
+        return {"text":"No provider/payment performance data is available in the current reconciliation.","table":table}
+    worst=table.sort_values(["Awaiting Bank","Provider-side Exceptions"],ascending=False).iloc[0]
+    text=(
+        f"Provider/payment performance is based on the active reconciliation. "
+        f"**{worst['Provider / Payment']}** currently has the largest open workload with "
+        f"**{int(worst['Awaiting Bank'])}** awaiting-bank item(s) and "
+        f"**{int(worst['Provider-side Exceptions'])}** provider-side exception(s)."
+    )
+    return {"text":text,"table":table.sort_values(["Awaiting Bank","Provider-side Exceptions"],ascending=False)}
+
+
+def answer_question(question, result, db_module=None, prior_context=None, user_context=None):
     if not result:
         return {
             "text":"I don't have an active reconciliation yet. Please run POS Reconciliation first; then I can answer questions about sales, cash, MADA/Visa/Mastercard, providers, exceptions, bank settlement, commission, corrections and JV status.",
@@ -685,7 +1047,9 @@ def answer_question(question, result, db_module=None, prior_context=None):
             "intent":"no_data",
         }
 
-    intent,ctx=interpret_query(question,result,prior_context)
+    result=_apply_user_scope(result,user_context)
+    allowed_stores=_allowed_store_codes(user_context)
+    intent,ctx=interpret_query(question,result,prior_context,db_module)
     ql=question.lower()
 
     if intent=="greeting":
@@ -695,12 +1059,26 @@ def answer_question(question, result, db_module=None, prior_context=None):
         ctx.payment="CASH"
         payload=_cash_report(result,ctx,question,db_module)
     elif intent=="sales":
-        payload=_sales_answer(result,ctx,detail=False)
+        # A CASH-scoped "sales" question is a cash query and must always go
+        # through the Advanced Cash Report, never the generic tender-total
+        # line ("CASH total is SAR X across Y transaction line(s)").
+        if ctx.payment=="CASH":
+            payload=_cash_report(result,ctx,question,db_module)
+        else:
+            payload=_sales_answer(result,ctx,detail=False)
+    elif intent=="date_range":
+        payload=_date_range_answer(result,ctx)
     elif intent=="transactions":
         if ctx.payment=="CASH":
             payload=_cash_report(result,ctx,question,db_module)
         else:
             payload=_sales_answer(result,ctx,detail=True)
+    elif intent=="risk":
+        payload=_risk_answer(result,ctx,question)
+    elif intent=="store_performance":
+        payload=_store_performance_answer(result,ctx)
+    elif intent=="provider_performance":
+        payload=_provider_performance_answer(result,ctx)
     elif intent in {"exceptions","missing_pos","missing_d365"}:
         if intent=="missing_pos":
             df=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
@@ -719,9 +1097,13 @@ def answer_question(question, result, db_module=None, prior_context=None):
     elif intent=="lookup":
         payload=_lookup_answer(result,ctx,question)
     elif intent=="compare":
-        payload=_compare_answer(result,ctx,question)
+        payload=_compare_answer(result,ctx,question,db_module)
     elif intent=="corrections":
-        if db_module is None:
+        # correction_log has no per-store column, so it cannot be safely
+        # scoped to a Store User's assigned store(s) - block rather than leak.
+        if allowed_stores:
+            payload={"text":"Correction requests span all stores and aren't available in a store-scoped view.","table":pd.DataFrame()}
+        elif db_module is None:
             payload={"text":"Correction status is unavailable because the database module is not connected.","table":pd.DataFrame()}
         else:
             df=db_module.load_correction_log()
@@ -735,6 +1117,9 @@ def answer_question(question, result, db_module=None, prior_context=None):
             payload={"text":"JV status is unavailable because the database module is not connected.","table":pd.DataFrame()}
         else:
             df=db_module.load_jv()
+            if allowed_stores:
+                # JV rows carry Store Code, so this can be scoped safely.
+                df=_restrict_df_to_stores(df,allowed_stores)
             if df.empty:
                 payload={"text":"No JV batches are currently stored.","table":df}
             else:
@@ -742,7 +1127,10 @@ def answer_question(question, result, db_module=None, prior_context=None):
                 posted=int(df.get("Posted",pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if "Posted" in df.columns else 0
                 payload={"text":f"I found **{len(df):,} JV row(s)** in the control table; **{approved:,}** are approved and **{posted:,}** are marked posted.","table":df.head(500)}
     elif intent=="close":
-        if db_module is None:
+        # Close calendar is a firm-wide finance control, not store-specific.
+        if allowed_stores:
+            payload={"text":"The close calendar is a firm-wide finance control and isn't available in a store-scoped view.","table":pd.DataFrame()}
+        elif db_module is None:
             payload={"text":"Close-calendar status is unavailable because the database module is not connected.","table":pd.DataFrame()}
         else:
             try:
@@ -760,7 +1148,13 @@ def answer_question(question, result, db_module=None, prior_context=None):
             df=up[mask].copy()
             payload={"text":f"I found **{len(df):,} provider transaction(s)** requiring terminal, merchant or store mapping.","table":df.head(500)}
     else:
-        payload=_summary_answer(result,ctx)
+        # Same rule for the generic/summary fallback: a CASH-scoped summary
+        # request must render the Advanced Cash Report, not the old
+        # generic-sales-derived summary text.
+        if ctx.payment=="CASH":
+            payload=_cash_report(result,ctx,question,db_module)
+        else:
+            payload=_summary_answer(result,ctx)
 
     payload["context"]=ctx
     payload["intent"]=intent
