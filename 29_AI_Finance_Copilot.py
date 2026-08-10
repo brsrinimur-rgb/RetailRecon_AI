@@ -39,14 +39,14 @@ with st.expander("☀️ Daily Finance Briefing",expanded=True):
 st.markdown("#### Try asking")
 q1,q2,q3,q4=st.columns(4)
 quick=None
-if q1.button("601 sales as of 9 Aug 2026",use_container_width=True):
+if q1.button("All store cash sales",use_container_width=True):
+    quick="need all store cash sales"
+if q2.button("601 sales as of 9 Aug 2026",use_container_width=True):
     quick="601 sales as of 9 Aug 2026"
-if q2.button("Which transactions are not settled?",use_container_width=True):
+if q3.button("Which transactions are not settled?",use_container_width=True):
     quick="which transactions are not settled?"
-if q3.button("Show pending corrections",use_container_width=True):
+if q4.button("Show pending corrections",use_container_width=True):
     quick="show pending corrections"
-if q4.button("Which mappings are missing?",use_container_width=True):
-    quick="which mappings are missing?"
 
 for msg in st.session_state.copilot_messages:
     with st.chat_message(msg["role"]):

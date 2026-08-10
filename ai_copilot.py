@@ -79,20 +79,40 @@ def _find_payment(q):
 
 def _parse_named_date(text, default_year=None):
     text=text.strip().lower().replace(","," ")
+    year_default=int(default_year or pd.Timestamp.today().year)
+
     # 9 aug 2026 / 9 august
     m=re.search(r"\b(\d{1,2})\s+([a-z]{3,9})(?:\s+(\d{4}))?\b",text)
     if m and m.group(2) in MONTHS:
         day=int(m.group(1)); month=MONTHS[m.group(2)]
-        year=int(m.group(3)) if m.group(3) else int(default_year or pd.Timestamp.today().year)
+        year=int(m.group(3)) if m.group(3) else year_default
         return pd.Timestamp(year=year,month=month,day=day)
-    # 2026-08-09
+
+    # aug 9 2026 / august 9
+    m=re.search(r"\b([a-z]{3,9})\s+(\d{1,2})(?:\s+(\d{4}))?\b",text)
+    if m and m.group(1) in MONTHS:
+        month=MONTHS[m.group(1)]; day=int(m.group(2))
+        year=int(m.group(3)) if m.group(3) else year_default
+        return pd.Timestamp(year=year,month=month,day=day)
+
+    # ISO 2026-08-09
     m=re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b",text)
     if m:
         return pd.Timestamp(int(m.group(1)),int(m.group(2)),int(m.group(3)))
+
+    # Natural finance question numeric date: D/M/YYYY (separate from source-file parser).
+    m=re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b",text)
+    if m:
+        day,month,year=map(int,m.groups())
+        try:
+            return pd.Timestamp(year=year,month=month,day=day)
+        except Exception:
+            return None
+
     return None
 
 def _parse_date_scope(q, data_min=None, data_max=None, prior=None):
-    ql=q.lower()
+    ql=q.lower().strip()
     today=pd.Timestamp.today().normalize()
     default_year=(data_max.year if pd.notna(data_max) else today.year)
 
@@ -102,12 +122,53 @@ def _parse_date_scope(q, data_min=None, data_max=None, prior=None):
     if re.search(r"\btoday\b",ql):
         return today,today,"on"
 
-    # from X to Y
+    # 1-5 Aug 2026 / 1 – 5 August 2026
+    m=re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s+([a-z]{3,9})(?:\s+(20\d{2}))?\b",ql)
+    if m and m.group(3) in MONTHS:
+        year=int(m.group(4)) if m.group(4) else int(default_year)
+        month=MONTHS[m.group(3)]
+        d1=pd.Timestamp(year=year,month=month,day=int(m.group(1)))
+        d2=pd.Timestamp(year=year,month=month,day=int(m.group(2)))
+        return min(d1,d2),max(d1,d2),"range"
+
+    # 1/8/2026 - 5/8/2026
+    m=re.search(r"\b(\d{1,2}/\d{1,2}/20\d{2})\s*[-–]\s*(\d{1,2}/\d{1,2}/20\d{2})\b",ql)
+    if m:
+        d1=_parse_named_date(m.group(1),default_year)
+        d2=_parse_named_date(m.group(2),default_year)
+        if d1 is not None and d2 is not None:
+            return min(d1,d2),max(d1,d2),"range"
+
+    # between X and Y
+    m=re.search(r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:$|[?.])",ql)
+    if m:
+        d1=_parse_named_date(m.group(1),default_year)
+        d2=_parse_named_date(m.group(2),default_year)
+        if d1 is not None and d2 is not None:
+            return min(d1,d2),max(d1,d2),"range"
+
+    # from X to/until/through Y
     m=re.search(r"\bfrom\s+(.+?)\s+(?:to|until|through)\s+(.+?)(?:$|[?.])",ql)
     if m:
         d1=_parse_named_date(m.group(1),default_year)
         d2=_parse_named_date(m.group(2),default_year)
         if d1 is not None and d2 is not None:
+            return min(d1,d2),max(d1,d2),"range"
+
+    # Bare range: "1 Aug 2026 to 5 Aug 2026", "Aug 1 through Aug 5"
+    m=re.search(r"(.+?)\s+(?:to|through|until)\s+(.+?)(?:$|[?.])",ql)
+    if m:
+        d1=_parse_named_date(m.group(1),default_year)
+        d2=_parse_named_date(m.group(2),default_year)
+        if d1 is not None and d2 is not None:
+            # If one side omits year but the other has it, align years.
+            explicit_years=re.findall(r"\b(20\d{2})\b",ql)
+            if explicit_years:
+                yr=int(explicit_years[-1])
+                if not re.search(r"\b20\d{2}\b",m.group(1)):
+                    d1=d1.replace(year=yr)
+                if not re.search(r"\b20\d{2}\b",m.group(2)):
+                    d2=d2.replace(year=yr)
             return min(d1,d2),max(d1,d2),"range"
 
     # as of / up to / through
@@ -125,12 +186,12 @@ def _parse_date_scope(q, data_min=None, data_max=None, prior=None):
         if d is not None:
             return d,d,"on"
 
-    # plain named date after sales/details etc. Treat as on-date unless phrase says as of.
+    # Plain named date = one day.
     d=_parse_named_date(ql,default_year)
     if d is not None:
         return d,d,"on"
 
-    # month scope
+    # Month scope
     for name,month in MONTHS.items():
         if re.search(rf"\b{name}\b",ql):
             year_match=re.search(r"\b(20\d{2})\b",ql)
@@ -139,6 +200,7 @@ def _parse_date_scope(q, data_min=None, data_max=None, prior=None):
             end=start+pd.offsets.MonthEnd(1)
             return start,end,"month"
 
+    # Keep prior date range on follow-up.
     if prior and prior.date_from is not None:
         return prior.date_from,prior.date_to,prior.date_mode
     return None,None,""
@@ -185,6 +247,15 @@ def interpret_query(question, result, prior: CopilotContext|None=None):
         intent="missing_d365"
     elif any(x in ql for x in ["exception","anything wrong","issues","problem","unmatched"]):
         intent="exceptions"
+    elif (
+        payment=="CASH"
+        and any(x in ql for x in [
+            "cash","sales","sale","refund","refunds","net","highest","lowest",
+            "top","rank","ranking","average","largest","details","transactions",
+            "trend","daily","all store","all stores"
+        ])
+    ):
+        intent="cash_report"
     elif any(x in ql for x in ["refund","refunds"]):
         intent="refunds"
     elif any(x in ql for x in ["compare","comparison","versus"," vs "]):
@@ -199,7 +270,13 @@ def interpret_query(question, result, prior: CopilotContext|None=None):
     elif any(x in ql for x in ["summary","briefing","overview","dashboard"]):
         intent="summary"
     else:
-        intent=prior.last_intent or "summary"
+        if prior.last_intent=="cash_report" and any(x in ql for x in [
+            "highest","lowest","top","rank","ranking","details","transactions",
+            "show","only","daily","trend","store"
+        ]):
+            intent="cash_report"
+        else:
+            intent=prior.last_intent or "summary"
 
     ctx=CopilotContext(
         store_codes=stores,
@@ -292,6 +369,213 @@ def _sales_answer(result,ctx,detail=False):
         cols=[c for c in ["Store Code","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount","Cash Classification","Cash Amount"] if c in tender.columns]
         return {"text":" ".join(lines), "table":tender[cols].sort_values(["Date","Receipt ID"] if "Date" in cols else cols[:1])}
     return {"text":" ".join(lines), "table":pd.DataFrame({"Payment Type":grp.index,"Amount":grp.values})}
+
+def _cash_report(result,ctx,question="",db_module=None):
+    """
+    Advanced D365 Store Tender cash analytics.
+
+    Source of truth: D365 Store Tender CASH only.
+    Positive value = Cash Sales.
+    Negative value = Cash Refund.
+    No POS/provider settlement is expected for CASH.
+    """
+    ql=str(question or "").lower()
+
+    # Force cash regardless of prior payment wording.
+    cash_ctx=CopilotContext(
+        store_codes=ctx.store_codes,
+        payment="CASH",
+        date_from=ctx.date_from,
+        date_to=ctx.date_to,
+        date_mode=ctx.date_mode,
+        last_intent="cash_report",
+    )
+    cash=_filter_tender(result.get("tender",pd.DataFrame()),cash_ctx)
+
+    if cash.empty:
+        return {
+            "text":f"I couldn't find Cash transactions in D365 Store Tender for **{_scope_text(cash_ctx)}**.",
+            "table":pd.DataFrame(),
+        }
+
+    cash=cash.copy()
+    cash["Store Code"]=cash["Store Code"].map(_norm_store)
+    cash["Date"]=pd.to_datetime(cash["Date"],errors="coerce")
+    cash["Cash Signed Amount"]=pd.to_numeric(
+        cash.get("Cash Amount",cash.get("D365 Amount",0)),errors="coerce"
+    ).fillna(0.0)
+    cash["Cash Classification"]=np.where(
+        cash["Cash Signed Amount"]>0,"Cash Sales",
+        np.where(cash["Cash Signed Amount"]<0,"Cash Refund","")
+    )
+
+    # Optional store-name enrichment from master data.
+    name_map={}
+    if db_module is not None:
+        try:
+            sm=db_module.load_store_mapping_master()
+            if not sm.empty and {"Store Code","Provider Store Name"}.issubset(sm.columns):
+                sm=sm.copy()
+                sm["Store Code"]=sm["Store Code"].map(_norm_store)
+                grouped=sm.groupby("Store Code")["Provider Store Name"].apply(
+                    lambda s:" / ".join(dict.fromkeys(
+                        [str(x).strip() for x in s if str(x).strip()]
+                    ))
+                )
+                name_map=grouped.to_dict()
+        except Exception:
+            name_map={}
+
+    # Same scope across ALL payment types for Cash Mix % denominator.
+    all_ctx=CopilotContext(
+        store_codes=ctx.store_codes,
+        payment=None,
+        date_from=ctx.date_from,
+        date_to=ctx.date_to,
+        date_mode=ctx.date_mode,
+    )
+    all_tender=_filter_tender(result.get("tender",pd.DataFrame()),all_ctx)
+    if not all_tender.empty:
+        all_tender=all_tender.copy()
+        all_tender["Store Code"]=all_tender["Store Code"].map(_norm_store)
+        all_tender["Amt"]=pd.to_numeric(all_tender.get("D365 Amount",0),errors="coerce").fillna(0.0)
+        positive_total_by_store=(
+            all_tender[all_tender["Amt"]>0]
+            .groupby("Store Code")["Amt"].sum()
+            .to_dict()
+        )
+        all_stores=set(all_tender["Store Code"].dropna().astype(str))
+    else:
+        positive_total_by_store={}
+        all_stores=set()
+
+    rows=[]
+    for store,g in cash.groupby("Store Code",dropna=False):
+        a=g["Cash Signed Amount"]
+        sales=a[a>0]
+        refunds=a[a<0]
+        cash_sales=float(sales.sum())
+        refund_abs=float(abs(refunds.sum()))
+        net=float(a.sum())
+        total_positive=float(positive_total_by_store.get(str(store),0.0))
+        cash_mix=(cash_sales/total_positive*100.0) if total_positive else 0.0
+        refund_ratio=(refund_abs/cash_sales*100.0) if cash_sales else (100.0 if refund_abs else 0.0)
+
+        rows.append({
+            "Store Code":str(store),
+            "Store Name":name_map.get(str(store),""),
+            "Cash Sales":cash_sales,
+            "Cash Refunds":refund_abs,
+            "Net Cash":net,
+            "Sales Count":int((a>0).sum()),
+            "Refund Count":int((a<0).sum()),
+            "Total Cash Transactions":int((a!=0).sum()),
+            "Average Cash Sale":float(sales.mean()) if not sales.empty else 0.0,
+            "Largest Cash Sale":float(sales.max()) if not sales.empty else 0.0,
+            "Largest Cash Refund":float(abs(refunds.min())) if not refunds.empty else 0.0,
+            "Cash Refund Ratio %":refund_ratio,
+            "Cash Mix % of Positive Tender Sales":cash_mix,
+            "First Cash Date":g["Date"].min(),
+            "Last Cash Date":g["Date"].max(),
+        })
+
+    summary=pd.DataFrame(rows)
+    if summary.empty:
+        return {"text":"No cash activity found in the selected scope.","table":summary}
+
+    # Ranking/filter behavior from natural language.
+    if any(x in ql for x in ["highest","top","rank","ranking"]):
+        summary=summary.sort_values(["Net Cash","Cash Sales"],ascending=[False,False])
+        m=re.search(r"\btop\s+(\d+)\b",ql)
+        if m:
+            summary=summary.head(max(1,int(m.group(1))))
+    elif "lowest" in ql:
+        summary=summary.sort_values(["Net Cash","Cash Sales"],ascending=[True,True])
+    else:
+        summary=summary.sort_values("Store Code")
+
+    # Transaction drill-down.
+    wants_transactions=any(x in ql for x in [
+        "transaction details","transactions","receipt details","show details","details for"
+    ]) or (ctx.store_codes and "details" in ql)
+
+    if wants_transactions:
+        cols=[c for c in [
+            "Store Code","Date","Receipt ID","Auth Code","Cash Classification",
+            "Cash Signed Amount","Customer Name","Staff","Sales Person",
+            "D365 Amount","D365 Row"
+        ] if c in cash.columns]
+        details=cash[cols].sort_values(["Store Code","Date","Receipt ID"])
+        sales_total=float(cash.loc[cash["Cash Signed Amount"]>0,"Cash Signed Amount"].sum())
+        refund_total=float(abs(cash.loc[cash["Cash Signed Amount"]<0,"Cash Signed Amount"].sum()))
+        net_total=float(cash["Cash Signed Amount"].sum())
+        text=(
+            f"Here are the cash transaction details for **{_scope_text(cash_ctx)}**. "
+            f"Cash Sales are **{_fmt_sar(sales_total)}**, Cash Refunds are **{_fmt_sar(refund_total)}**, "
+            f"and Net Cash is **{_fmt_sar(net_total)}** across **{len(cash):,}** cash transaction(s). "
+            "These values come directly from D365 Store Tender; cash does not require POS/provider settlement."
+        )
+        return {"text":text,"table":details.head(2000)}
+
+    # Daily trend.
+    if any(x in ql for x in ["daily","day by day","trend"]):
+        tmp=cash.copy()
+        tmp["Cash Sales"]=tmp["Cash Signed Amount"].clip(lower=0)
+        tmp["Cash Refunds"]=(-tmp["Cash Signed Amount"].clip(upper=0))
+        daily=tmp.groupby(["Date","Store Code"],as_index=False).agg(
+            Cash_Sales=("Cash Sales","sum"),
+            Cash_Refunds=("Cash Refunds","sum"),
+            Net_Cash=("Cash Signed Amount","sum"),
+            Transactions=("Cash Signed Amount","size"),
+        )
+        daily=daily.rename(columns={
+            "Cash_Sales":"Cash Sales","Cash_Refunds":"Cash Refunds",
+            "Net_Cash":"Net Cash"
+        })
+        return {
+            "text":f"Here is the day-by-day cash trend for **{_scope_text(cash_ctx)}**.",
+            "table":daily.sort_values(["Date","Store Code"]).head(2000),
+        }
+
+    total_sales=float(summary["Cash Sales"].sum())
+    total_refunds=float(summary["Cash Refunds"].sum())
+    total_net=float(summary["Net Cash"].sum())
+    total_count=int(summary["Total Cash Transactions"].sum())
+    highest=summary.sort_values("Net Cash",ascending=False).iloc[0]
+    refund_rank=summary[summary["Cash Refunds"]>0].sort_values(
+        "Cash Refund Ratio %",ascending=False
+    )
+    negative_stores=summary[summary["Net Cash"]<0]
+    cash_store_codes=set(summary["Store Code"].astype(str))
+    no_cash_stores=sorted(all_stores-cash_store_codes)
+
+    lines=[
+        f"Here is the cash analysis for **{_scope_text(cash_ctx)}**.",
+        f"Cash Sales are **{_fmt_sar(total_sales)}**, Cash Refunds are **{_fmt_sar(total_refunds)}**, "
+        f"and Net Cash is **{_fmt_sar(total_net)}** across **{total_count:,}** cash transaction(s).",
+        f"**Store {highest['Store Code']}** has the highest Net Cash at **{_fmt_sar(highest['Net Cash'])}**.",
+    ]
+    if not refund_rank.empty:
+        rr=refund_rank.iloc[0]
+        lines.append(
+            f"**Store {rr['Store Code']}** has the highest cash refund ratio in this selected scope "
+            f"at **{float(rr['Cash Refund Ratio %']):,.2f}%**."
+        )
+    if not negative_stores.empty:
+        lines.append(
+            f"**{len(negative_stores)} store(s)** have negative Net Cash in the selected period and should be reviewed."
+        )
+    if no_cash_stores:
+        lines.append(
+            f"**{len(no_cash_stores)} store(s)** in the selected D365 tender scope have no cash activity."
+        )
+    lines.append(
+        "Cash is sourced directly from D365 Store Tender: positive Cash = Cash Sales, "
+        "negative Cash = Cash Refund. No POS/provider settlement is expected for cash."
+    )
+
+    return {"text":" ".join(lines),"table":summary.reset_index(drop=True)}
+
 
 def _exceptions_answer(result,ctx):
     us=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
@@ -406,10 +690,17 @@ def answer_question(question, result, db_module=None, prior_context=None):
 
     if intent=="greeting":
         payload={"text":"Good morning. I can help with the active RetailRecon data — ask me about a store, date, payment type, settlement, exceptions, commission, refunds, corrections or JV/D365 status.","table":pd.DataFrame()}
+    elif intent=="cash_report":
+        # Cash questions use a dedicated D365 Store Tender finance report.
+        ctx.payment="CASH"
+        payload=_cash_report(result,ctx,question,db_module)
     elif intent=="sales":
         payload=_sales_answer(result,ctx,detail=False)
     elif intent=="transactions":
-        payload=_sales_answer(result,ctx,detail=True)
+        if ctx.payment=="CASH":
+            payload=_cash_report(result,ctx,question,db_module)
+        else:
+            payload=_sales_answer(result,ctx,detail=True)
     elif intent in {"exceptions","missing_pos","missing_d365"}:
         if intent=="missing_pos":
             df=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)

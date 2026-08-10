@@ -37,6 +37,7 @@ card(b,"Store Mapping Master","Upload/change Provider Store Name → D365 Store 
 card(c,"POS Terminal Master","Upload/change Terminal ID → Store Code mappings without changing code.","pages/16_POS_Terminal_Master.py","🖥️")
 card(a,"Merchant ID Master","Upload/change Merchant ID → Store Code mappings for provider files with no Terminal ID.","pages/17_Merchant_ID_Master.py","🏷️")
 card(b,"Bank Claim Follow Up","Track missing/delayed settlements, claims, ownership, aging and follow-up.","pages/15_Bank_Claim_Follow_Up.py","📨")
+card(c,"AI Finance Copilot","Ask natural-language questions across sales, tenders, exceptions, settlement, corrections and JV status.","pages/29_AI_Finance_Copilot.py","🤖")
 
 st.subheader("2. Close, Configuration & Exception Control")
 a,b,c=st.columns(3)
@@ -119,6 +120,10 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         terminal_master=db.load_terminal_master()
         if not pos.empty:
             pos=core.apply_terminal_master(pos,terminal_master)
+
+        # Apply maker-checker approved Auth Code corrections before matching.
+        # Original Auth Code remains preserved in the tender audit columns.
+        tender=db.apply_approved_corrections(tender)
 
         # Cash comes directly from D365 Store Tender and never requires a POS/provider settlement.
         cash_transactions=tender[tender["D365 Payment"].astype(str).str.upper()=="CASH"].copy() if not tender.empty else pd.DataFrame()
