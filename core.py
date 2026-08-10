@@ -437,10 +437,19 @@ def normalize_tender(df):
             elif "FLOOSS" in cu:p="FLOOSS"
             elif "PAYLATER" in cu or "PAY_LATER" in cu:p="PAYLATER"
             elif "DEEMA" in cu:p="DEEMA"
+            elif cu=="CASH" or cu.startswith("CASH ") or cu.endswith(" CASH"):
+                p="CASH"
             if p:
                 a=amount(r.get(c))
                 if pd.notna(a) and abs(a)>0:
-                    rr=base.copy();rr["D365 Payment"]=p;rr["D365 Amount"]=a;rows.append(rr);found=True
+                    rr=base.copy()
+                    rr["D365 Payment"]=p
+                    rr["D365 Amount"]=a
+                    if p=="CASH":
+                        rr["Cash Classification"]="Cash Sales" if a>0 else "Cash Refund"
+                        rr["Cash Amount"]=a
+                    rows.append(rr)
+                    found=True
         if not found:
             total=find(d,["total","sales amount"])
             if total:
@@ -449,6 +458,14 @@ def normalize_tender(df):
                     rr=base.copy();rr["D365 Payment"]="UNKNOWN";rr["D365 Amount"]=a;rows.append(rr)
     out=pd.DataFrame(rows)
     if out.empty:return out
+    if "Cash Classification" not in out.columns:
+        out["Cash Classification"]=""
+    else:
+        out["Cash Classification"]=out["Cash Classification"].fillna("")
+    if "Cash Amount" not in out.columns:
+        out["Cash Amount"]=0.0
+    else:
+        out["Cash Amount"]=pd.to_numeric(out["Cash Amount"],errors="coerce").fillna(0.0)
     out["D365 Payment"]=out["D365 Payment"].apply(_norm_payment)
     out["D365 Match Key"]=out.apply(
         lambda r: f"{str(r['Store Code']).strip()}|"

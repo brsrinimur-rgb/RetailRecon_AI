@@ -15,7 +15,7 @@ PAYMENTS = ["MADA", "VISA", "MASTER", "AMEX", "TABBY", "TAMARA", "TAP", "FLOOSS"
 TX_COLUMNS = [
     "Store Code", "Date", "Receipt ID", "Auth Code", "D365 Source Type",
     "Reservation Type", "Reservation Flow", "Sales Order", "Customer Account",
-    "Customer Name", "Description", "Reservation Cash", "Order Balance",
+    "Customer Name", "Description", "Cash Classification", "Cash Amount", "Reservation Cash", "Order Balance",
     "Reservation Report Total", "Reservation Auth Resolution",
     "D365 MADA", "POS MADA", "Diff MADA",
     "D365 VISA", "POS VISA", "Diff VISA",
@@ -47,6 +47,7 @@ def _zero_tx():
         d[f"POS {p}"] = 0.0
         d[f"Diff {p}"] = 0.0
     d.update({
+        "Cash Amount": 0.0,
         "Reservation Cash": 0.0,
         "Order Balance": 0.0,
         "Reservation Report Total": 0.0,
@@ -95,6 +96,29 @@ def transaction_reconciliation(result):
             x[f"D365 {p}"] = d365
             x[f"POS {p}"] = pos
             x[f"Diff {p}"] = round(d365 - pos, 2)
+        rows.append(x)
+
+    cash = result.get("cash_transactions", pd.DataFrame())
+    for _, r in cash.iterrows():
+        x = _zero_tx()
+        amt = float(r.get("Cash Amount", r.get("D365 Amount", 0)) or 0)
+        cls = str(r.get("Cash Classification","")).strip() or ("Cash Sales" if amt > 0 else "Cash Refund")
+        x.update({
+            "Store Code": r.get("Store Code", ""),
+            "Date": r.get("Date", pd.NaT),
+            "Receipt ID": r.get("Receipt ID", ""),
+            "Auth Code": r.get("Auth Code", ""),
+            "D365 Source Type": "Store Tender",
+            "Cash Classification": cls,
+            "Cash Amount": amt,
+            "D365 Total": amt,
+            "POS Total": 0.0,
+            "Total Difference": 0.0,
+            "D365 Tender": "CASH",
+            "POS Tender": "",
+            "Status": cls,
+            "Remarks": "Cash transaction from D365 Store Tender. No POS/provider settlement required.",
+        })
         rows.append(x)
 
     us = result.get("unmatched_sales", pd.DataFrame())

@@ -120,7 +120,11 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         if not pos.empty:
             pos=core.apply_terminal_master(pos,terminal_master)
 
-        matched,us,up=core.reconcile(tender,pos,tolerance)
+        # Cash comes directly from D365 Store Tender and never requires a POS/provider settlement.
+        cash_transactions=tender[tender["D365 Payment"].astype(str).str.upper()=="CASH"].copy() if not tender.empty else pd.DataFrame()
+        tender_for_pos=tender[tender["D365 Payment"].astype(str).str.upper()!="CASH"].copy() if not tender.empty else tender.copy()
+
+        matched,us,up=core.reconcile(tender_for_pos,pos,tolerance)
         banks=[]
         bank_skipped=[]
         for f in bank_uploads or []:
@@ -160,6 +164,7 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
             qdf=pd.concat([qdf,bqdf],ignore_index=True,sort=False)
 
         st.session_state.ct_result={"matched":matched,"unmatched_sales":us,"unmatched_pos":up,"carry_forward":cf,
+                                    "cash_transactions":cash_transactions,
                                     "tender":tender,"pos":pos,"bank":bank,"quarantine":qdf}
         st.success("Reconciliation completed and saved to the current control-tower session.")
     except Exception as e:
@@ -168,16 +173,28 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
 r=st.session_state.get("ct_result")
 if r:
     m=r["matched"];us=r["unmatched_sales"];up=r["unmatched_pos"]
-    k1,k2,k3,k4,k5=st.columns(5)
+    cash_tx=r.get("cash_transactions",pd.DataFrame())
+    k1,k2,k3,k4,k5,k6=st.columns(6)
     k1.metric("Matched / Review",len(m));k2.metric("Unmatched D365",len(us));k3.metric("Unmatched POS",len(up))
-    k4.metric("Bank Settled",int(m["Bank Settled"].sum()) if not m.empty else 0)
-    k5.metric("Max Diff",f"SAR {m['Difference'].abs().max():,.2f}" if not m.empty else "SAR 0.00")
-    tabs=st.tabs(["Matched","Unmatched D365","Unmatched POS","Carry Forward","Quarantine"])
-    with tabs[0]:st.dataframe(m,use_container_width=True,hide_index=True)
-    with tabs[1]:st.dataframe(us,use_container_width=True,hide_index=True)
-    with tabs[2]:st.dataframe(up,use_container_width=True,hide_index=True)
-    with tabs[3]:st.dataframe(r["carry_forward"],use_container_width=True,hide_index=True)
-    with tabs[4]:st.dataframe(r["quarantine"],use_container_width=True,hide_index=True)
+    k4.metric("Cash Transactions",len(cash_tx))
+    k5.metric("Bank Settled",int(m["Bank Settled"].sum()) if not m.empty else 0)
+    k6.metric("Max Diff",f"SAR {m['Difference'].abs().max():,.2f}" if not m.empty else "SAR 0.00")
+    tabs=st.tabs(["Matched","Cash Sales / Refunds","Unmatched D365","Unmatched POS","Carry Forward","Quarantine"])
+    with tabs[0]:
+        st.dataframe(m,use_container_width=True,hide_index=True)
+    with tabs[1]:
+        if cash_tx.empty:
+            st.info("No Cash Sales / Cash Refund transactions in the uploaded Store Tender.")
+        else:
+            cash_view_cols=[c for c in [
+                "Store Code","Date","Receipt ID","Auth Code","Cash Classification","Cash Amount",
+                "D365 Raw Auth Code","D365 Row"
+            ] if c in cash_tx.columns]
+            st.dataframe(cash_tx[cash_view_cols],use_container_width=True,hide_index=True)
+    with tabs[2]:st.dataframe(us,use_container_width=True,hide_index=True)
+    with tabs[3]:st.dataframe(up,use_container_width=True,hide_index=True)
+    with tabs[4]:st.dataframe(r["carry_forward"],use_container_width=True,hide_index=True)
+    with tabs[5]:st.dataframe(r["quarantine"],use_container_width=True,hide_index=True)
     blob=report_export.create_reconciliation_pack(r,tolerance)
     st.download_button(
         "DOWNLOAD RECONCILIATION PACK",
