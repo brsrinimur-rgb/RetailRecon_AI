@@ -1,6 +1,5 @@
 from __future__ import annotations
 import csv
-import io
 import io, re, json, hashlib
 from datetime import datetime
 from pathlib import Path
@@ -91,6 +90,20 @@ def auth(v):
     if pd.isna(v): return ""
     s=re.sub(r"[^A-Z0-9]","",str(v).strip().upper())
     if s.isdigit() and len(s)<6:s=s.zfill(6)
+    return s
+
+def provider_ref_key(v):
+    """
+    Matching-only canonical reference for TABBY/TAMARA.
+    Numeric leading zeros are ignored for comparison only.
+    Original D365/provider reference remains unchanged for audit/display.
+    """
+    s=auth(v)
+    if not s:
+        return ""
+    if s.isdigit():
+        x=s.lstrip("0")
+        return x if x else "0"
     return s
 
 def dt(v):
@@ -389,7 +402,7 @@ def is_pos_summary_or_nontransaction(row, terminal_col=None, auth_col=None, date
 def normalize_pos(df,source="POS",forced_payment=None):
     d=norm_cols(df)
     ac=find(d,[
-        # TABBY: Order number is the primary business key used as D365 Auth Code.
+        # TABBY: Order number is the primary provider reference used against D365 Auth Code.
         "order number","order no","order_no","order id","order_id",
         "order_reference_id",
         "auth code","authorization code","auth","rrn","reference",
@@ -416,10 +429,15 @@ def normalize_pos(df,source="POS",forced_payment=None):
                     return str(v).strip()
         return ""
     date=find(d,[
-        # TABBY exports use "Creation date".
+        # Provider exports: Tabby commonly uses Creation date; Tamara exports
+        # can use order/creation/capture/settlement date labels.
         "pos date","transaction date","creation date","creation_date",
-        "date","captured date","created at",
-        "localdate","local date","transaction_date"
+        "order date","order_date","order created at","order_created_at",
+        "order creation date","order_creation_date",
+        "created at","created_at","created date","created_date",
+        "captured date","capture date","captured at","captured_at",
+        "settlement date","settlement_date","settled at","settled_at",
+        "localdate","local date","transaction_date","date"
     ])
     posting=find(d,[
         "posting date","settlement date","payout date","posting_date","settlement_date"
@@ -801,6 +819,7 @@ def reconcile(tender,pos,tolerance=1.0):
         payment=_norm_payment(s["D365 Payment"])
         amount_d365=float(s["D365 Amount"])
         auth_d365=str(s["Auth Code"]).strip()
+        provider_key_d365=provider_ref_key(auth_d365) if payment in {"TABBY","TAMARA"} else auth_d365
         store_d365=str(s["Store Code"]).strip()
         date_d365=pd.to_datetime(s["Date"],errors="coerce")
 
@@ -848,7 +867,11 @@ def reconcile(tender,pos,tolerance=1.0):
         # Rule 1: Auth + Exact Amount (with store if reliable)
         # ------------------------------------------------------
         if auth_d365:
-            x=store_pool[store_pool["Auth Code"].astype(str).str.strip()==auth_d365].copy()
+            if payment in {"TABBY","TAMARA"}:
+                _provider_keys=store_pool["Auth Code"].apply(provider_ref_key)
+                x=store_pool[_provider_keys==provider_key_d365].copy()
+            else:
+                x=store_pool[store_pool["Auth Code"].astype(str).str.strip()==auth_d365].copy()
             if not x.empty:
                 x["ABS"]=(pd.to_numeric(x["POS Amount"],errors="coerce")-amount_d365).abs()
 
@@ -857,6 +880,8 @@ def reconcile(tender,pos,tolerance=1.0):
                     sel=exact.iloc[0]
                     if payment=="TABBY":
                         rule="TABBY Order Number + Store + Exact Amount" if not same_store.empty else "TABBY Order Number + Exact Amount"
+                    elif payment=="TAMARA":
+                        rule="TAMARA Reference + Store + Exact Amount" if not same_store.empty else "TAMARA Reference + Exact Amount"
                     else:
                         rule="Store + Date/Auth + Tender + Exact Amount" if not same_store.empty else "Auth + Tender + Exact Amount"
                     status="Matched"
@@ -898,10 +923,7 @@ def reconcile(tender,pos,tolerance=1.0):
 
                 if len(exact)==1:
                     sel=exact.iloc[0]
-                    if payment=="TABBY":
-                        rule="TABBY Order Number + Store + Date + Exact Amount" if not same_store.empty else "TABBY Order Number + Date + Exact Amount"
-                    else:
-                        rule="Store + Date + Tender + Exact Amount" if not same_store.empty else "Date + Tender + Exact Amount"
+                    rule="Store + Date + Tender + Exact Amount" if not same_store.empty else "Date + Tender + Exact Amount"
                     status="Matched"
                 elif len(exact)>1:
                     reason=f"Multiple {payment} candidates: same Date + Amount"
@@ -929,6 +951,8 @@ def reconcile(tender,pos,tolerance=1.0):
             "Date":s["Date"],
             "Receipt ID":s["Receipt ID"],
             "Auth Code":s["Auth Code"],
+            "Provider Reference":sel["Auth Code"] if payment in {"TABBY","TAMARA"} else "",
+            "Provider Reference Key":provider_ref_key(sel["Auth Code"]) if payment in {"TABBY","TAMARA"} else "",
             "Payment Type":payment,
             "D365 Amount":s["D365 Amount"],
             "POS Amount":sel["POS Amount"],

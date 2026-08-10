@@ -2,13 +2,10 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 import importlib
-import inspect
-import hashlib
 import auth, theme, core, db
 import report_export
 
-# Force Streamlit to execute the current core.py from disk rather than a
-# previously cached module object left in the long-running Cloud process.
+# Reload current core.py from disk on each page run to avoid stale Streamlit module state.
 core = importlib.reload(core)
 
 st.set_page_config(page_title="POS Reconciliation - Retail Control Tower",layout="wide",page_icon="🧾")
@@ -16,54 +13,6 @@ auth.require_login({"Admin","Finance Manager","Finance Maker","Finance Checker"}
 auth.render_user_sidebar()
 st.markdown(theme.global_css(),unsafe_allow_html=True)
 st.markdown(theme.top_banner("RETAIL CONTROL TOWER","POS Reconciliation – POS-to-GL Control Center"),unsafe_allow_html=True)
-
-# ---------------------------------------------------------------------
-# DEPLOYMENT / BYTECODE DIAGNOSTIC
-# ---------------------------------------------------------------------
-DEPLOYMENT_BUILD = "POS_RECON_FORCE_CORE_RELOAD_2026_08_10_V2"
-
-try:
-    _core_source = inspect.getsource(core.read_upload)
-except Exception as _diag_err:
-    _core_source = f"Unable to inspect core.read_upload: {_diag_err}"
-
-_core_file = getattr(core, "__file__", "Unknown")
-_core_hash = hashlib.sha1(_core_source.encode("utf-8", errors="ignore")).hexdigest()[:12]
-
-# Source check and *running bytecode* check are separate.  This catches the
-# exact problem where inspect() sees a newly-written file but Python is still
-# executing an older function object.
-_source_has_pd_read_csv = "pd.read_csv" in _core_source
-_bytecode_names = set(getattr(core.read_upload, "__code__", type("X",(),{"co_names":()})) .co_names)
-_bytecode_has_read_csv = "read_csv" in _bytecode_names
-
-with st.expander("🛠️ Deployment Diagnostic", expanded=True):
-    d1,d2,d3,d4 = st.columns(4)
-    d1.metric("Page Build", DEPLOYMENT_BUILD)
-    d2.metric("core.py Hash", _core_hash)
-    d3.metric("Source pd.read_csv", "YES ❌" if _source_has_pd_read_csv else "NO ✅")
-    d4.metric("Bytecode read_csv", "YES ❌" if _bytecode_has_read_csv else "NO ✅")
-
-    st.write("**Loaded core.py:**")
-    st.code(str(_core_file))
-
-    st.write("**Running function line:**", getattr(core.read_upload.__code__, "co_firstlineno", "Unknown"))
-    st.write("**Running bytecode names:**")
-    st.code(", ".join(sorted(map(str, _bytecode_names))))
-
-    if _source_has_pd_read_csv or _bytecode_has_read_csv:
-        st.error(
-            "The running parser is not the corrected version. core.py was reloaded, "
-            "but read_csv is still present. Check the committed core.py on the deployed branch."
-        )
-    else:
-        st.success(
-            "Source and running bytecode both confirm the corrected CSV parser is active."
-        )
-
-    st.write("**Actual core.read_upload() source:**")
-    st.code(_core_source, language="python")
-
 
 st.markdown(theme.section_title(1,"POS-TO-GL CONTROL CENTER"),unsafe_allow_html=True)
 st.caption("One operating hub for the full lifecycle: Reconcile → Validate → Settle → Correct → Close → Configure GL → Create JV → Approve → Post to D365 → Verify → Adjust Late Transactions.")
@@ -116,12 +65,6 @@ bank_uploads=st.file_uploader("Upload Bank Statements (ANB / Al Rajhi)",type=["x
 prev_cf=st.file_uploader("Previous Carry Forward (optional)",type=["xlsx","xls","csv"],key="cf")
 
 if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
-    if _source_has_pd_read_csv or _bytecode_has_read_csv:
-        st.error(
-            "Reconciliation stopped: Streamlit is not executing the corrected core.read_upload(). "
-            "The diagnostic above shows whether the mismatch is in source or bytecode."
-        )
-        st.stop()
     try:
         tender_parts=[];pos_parts=[];quarantine=[]
         for f in uploads or []:
