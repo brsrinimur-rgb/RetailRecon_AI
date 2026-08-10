@@ -9,7 +9,6 @@ st.markdown(theme.global_css(), unsafe_allow_html=True)
 st.markdown(theme.top_banner("RETAIL CONTROL TOWER", "JV Creation"), unsafe_allow_html=True)
 
 st.title("JV Creation")
-st.warning("Bank Settlement Verification must be completed. Unsettled ANB/TAP/TABBY/TAMARA items are not eligible for the normal JV.")
 
 st.info(
     "Confirmed D365 mapping: Bank 1015 | Commission 7231 | VAT Vendor P0672 | "

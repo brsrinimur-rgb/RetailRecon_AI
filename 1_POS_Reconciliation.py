@@ -25,7 +25,7 @@ def card(col,title,desc,page,icon):
 st.subheader("1. Reconciliation & Treasury Controls")
 a,b,c=st.columns(3)
 card(a,"Commission Validation","Validate settled POS/provider commission and VAT against signed contract rates.","pages/10_Commission_Validation.py","🧾")
-card(b,"Bank Settlement Audit","Verify ANB/TAP/TABBY/TAMARA settlements against real bank credits and measure settlement delay.","pages/11_Bank_Settlement_Audit.py","🏦")
+card(b,"Bank Settlement Audit","Match POS batches to real bank credits and measure actual settlement delay.","pages/11_Bank_Settlement_Audit.py","🏦")
 card(c,"Refund Reconciliation","Control refunds, reversals and provider/bank refund settlement.","pages/12_Refund_Reconciliation.py","↩️")
 a,b,c=st.columns(3)
 card(a,"POS Auto Mapper","Learn and map new POS/provider layouts without replacing proven reconciliation rules.","pages/13_POS_Auto_Mapper.py","🧩")
@@ -57,12 +57,8 @@ with st.sidebar:
     st.caption("Matched within approved SAR 1 tolerance can proceed only after bank settlement and Finance approval.")
 
 uploads=st.file_uploader("Upload D365 Store Tender + POS/AMEX/Tabby/Tamara/Tap files",type=["xlsx","xls","csv"],accept_multiple_files=True)
+bank_uploads=st.file_uploader("Upload Bank Statements (ANB / Al Rajhi)",type=["xlsx","xls","csv"],accept_multiple_files=True)
 prev_cf=st.file_uploader("Previous Carry Forward (optional)",type=["xlsx","xls","csv"],key="cf")
-st.caption(
-    "Bank statements are no longer uploaded here. Bank verification runs exclusively on the "
-    "Bank Settlement Audit page (ANB Cards/AMEX/TAP/TABBY/TAMARA) - the single source of truth "
-    "for Bank Settled / Bank Date / Bank Amount / Settlement Status."
-)
 
 if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
     try:
@@ -121,20 +117,47 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
             pos=core.apply_terminal_master(pos,terminal_master)
 
         matched,us,up=core.reconcile(tender,pos,tolerance)
-        # Bank verification is a deliberate, separate control gate (Bank Settlement
-        # Audit page), not an automatic side effect of reconciliation. Initialize
-        # the canonical settlement columns here so every downstream page sees a
-        # consistent schema before that page runs.
-        matched=core.init_settlement_columns(matched)
+        banks=[]
+        bank_skipped=[]
+        for f in bank_uploads or []:
+            for sheet,df in core.read_upload(f).items():
+                bank="Al Rajhi Bank" if "rajhi" in f.name.lower() else "ANB Bank"
+                try:
+                    b=core.normalize_bank(df,bank)
+                    if b is not None and not b.empty:
+                        b["Bank Source File"]=f.name
+                        b["Bank Source Sheet"]=sheet
+                        banks.append(b)
+                    else:
+                        bank_skipped.append({
+                            "File":f.name,
+                            "Sheet":sheet,
+                            "Reason":"No usable bank transaction rows"
+                        })
+                except Exception as e:
+                    # Do not stop the complete reconciliation because a workbook
+                    # contains a cover/summary/non-transaction sheet.
+                    bank_skipped.append({
+                        "File":f.name,
+                        "Sheet":sheet,
+                        "Reason":str(e)
+                    })
+
+        bank=pd.concat(banks,ignore_index=True) if banks else pd.DataFrame()
+        matched=core.apply_bank_settlement(matched,bank,tolerance)
         previous=None
         if prev_cf:
             previous=list(core.read_upload(prev_cf).values())[0]
         cf=core.make_carry_forward(us,up,previous)
         qdf=pd.DataFrame(quarantine)
+        bqdf=pd.DataFrame(bank_skipped)
+        if not bqdf.empty:
+            bqdf["Type"]="BANK_SHEET_SKIPPED"
+            qdf=pd.concat([qdf,bqdf],ignore_index=True,sort=False)
 
         st.session_state.ct_result={"matched":matched,"unmatched_sales":us,"unmatched_pos":up,"carry_forward":cf,
-                                    "tender":tender,"pos":pos,"quarantine":qdf}
-        st.success("Reconciliation completed and saved to the current control-tower session. Next: run Bank Settlement Audit.")
+                                    "tender":tender,"pos":pos,"bank":bank,"quarantine":qdf}
+        st.success("Reconciliation completed and saved to the current control-tower session.")
     except Exception as e:
         st.exception(e)
 

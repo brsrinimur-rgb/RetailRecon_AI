@@ -196,37 +196,3 @@ Example:
 
 D365 posting gate:
 Approved + Balanced + Validation Passed + Bank Settled + Accounting Date Open + Not Previously Posted.
-
-
-## POS Auth Code Missing — Controlled Fallback
-If POS Auth Code is blank, auto-match is allowed only when Store Code, mapped Terminal ID, transaction date, payment type and amount agree and exactly one candidate exists. Amount may be exact or within the approved SAR 1 tolerance. The remark is `Auth Code Missing in POS – Matched using Store + Terminal + Date + Payment Type + Amount`. If Auth Code is present but different, or multiple candidates exist, the system does not guess. Distinct Terminal IDs are not collapsed as duplicate POS rows.
-
-
-## Fully Integrated Bank Settlement Logic
-Bank verification is a control gate after D365 ↔ POS/provider reconciliation, not a second reconciliation.
-
-- ANB Cards: Terminal ID + Payment Type + POS Transaction Date + grouped POS gross + TX count → ANB credit/date.
-- TAP: payout_id → SUM(net_amount) = bank credit.
-- TABBY: Expected Bank Credit = Transferred Amount - SAR 5.00 once per payout/transfer.
-- TAMARA: Expected Bank Credit = Payable to Merchant exactly; no SAR 5 deduction.
-- Unsettled items remain Awaiting Bank Settlement and carry forward.
-- Normal JV still requires Matched + Difference <= SAR 1 + Bank Settled + Balanced + Validation Passed + Approval + Open Accounting Date.
-
-
-## Date and Provider Import Correction
-- ISO dates such as `2026-07-03` are now parsed year-first and are no longer flipped to `2026-03-07`.
-- Excel serial dates remain supported.
-- `Creation date`, `created_at GMT+03:00`, charge/capture date aliases are recognized.
-- Filenames such as `traf 09582037.xlsx` no longer create a false year-2037 validation exception.
-- TABBY Payment ID / TAMARA Order Reference / TAP Charge ID are retained as Provider Reference rather than falsely treated as D365 Auth Code.
-- Exact-duplicate collapse now includes Provider Reference so distinct BNPL transactions are not merged.
-- TABBY/TAMARA/TAP may use resolved Store + Date + Amount + payment type as a unique fallback when no terminal exists.
-
-
-## Critical Control Fixes
-- Creating a new JV no longer deletes historical approved/posted JVs.
-- Approved or posted batches cannot be silently regenerated.
-- TAP/TABBY/TAMARA verified payouts now write Bank Settled back to matched reconciliation rows using explicit provider/order references.
-- Provider/order/payout identifiers are retained through normalization and matched output.
-- Duplicate collapse only occurs when a stable transaction identity exists; anonymous same-amount transactions are never silently merged.
-- Stale Auth Missing regression wording was aligned with the current controlled-fallback remark.
