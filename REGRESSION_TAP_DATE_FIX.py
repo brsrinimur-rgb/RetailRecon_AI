@@ -28,7 +28,6 @@ raw=pd.DataFrame([{
     "merchant id":"283731",
 }])
 out=core.normalize_pos(raw,src,"TAP")
-assert out.iloc[0]["POS Payment"]=="TAP"
 assert out.iloc[0]["POS Date"].strftime("%Y-%m-%d")=="2026-08-03"
 
 print("TAP DATE REGRESSION PASS")

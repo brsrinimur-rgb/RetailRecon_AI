@@ -524,6 +524,8 @@ def is_pos_summary_or_nontransaction(row, terminal_col=None, auth_col=None, date
 def normalize_pos(df,source="POS",forced_payment=None):
     d=norm_cols(df)
     ac=find(d,[
+        # TAP: reference_order is the primary provider reference used against D365 Auth Code.
+        "reference_order","reference order","referenceorder",
         # TABBY: Order number is the primary provider reference used against D365 Auth Code.
         "order number","order no","order_no","order id","order_id",
         "order_reference_id",
@@ -568,6 +570,8 @@ def normalize_pos(df,source="POS",forced_payment=None):
     # In the new POS format, payment_type can be "Contactless",
     # while scheme contains the accounting tender (Mada/VISA/MasterCard).
     ptype=find(d,[
+        # TAP: payment_scheme is the finance tender (MADA/VISA/MASTERCARD/etc.).
+        "payment_scheme","payment scheme",
         "scheme","card type","card","payment type","payment_type","channel"
     ])
     terminal=find(d,["terminal id","tid","terminal","terminal_id"])
@@ -599,7 +603,12 @@ def normalize_pos(df,source="POS",forced_payment=None):
             continue
         sr=_store_value(r)
         sc=STORE_MAP.get(sr.upper(),sr)
-        pt=forced_payment or str(r.get(ptype,source)).strip().upper()
+        is_tap_charge="CHARGE_" in str(source).upper()
+        if is_tap_charge:
+            # Provider is TAP, but tender comes from payment_scheme.
+            pt=str(r.get(ptype,"")).strip().upper() if ptype else ""
+        else:
+            pt=forced_payment or str(r.get(ptype,source)).strip().upper()
         # Finance-confirmed POS codes.
         pt={"P":"MADA","P1":"MADA","AX":"AMEX","MC":"MASTERCARD","VC":"VISA"}.get(pt,pt)
         if "MASTER" in pt or pt=="MASTERCARD":pt="MASTERCARD"
@@ -618,10 +627,10 @@ def normalize_pos(df,source="POS",forced_payment=None):
         provider_hint="TAP" if "CHARGE_" in str(source).upper() else ""
         pos_date=parse_provider_date(r.get(date),source,provider_hint) if date else pd.NaT
         posting_date=parse_provider_date(r.get(posting),source,provider_hint) if posting else pd.NaT
-        if "CHARGE_" in str(source).upper():
-            pt="TAP"
-        rows.append({"POS Row":i+1,"Source File":source,"POS Store":sc,"POS Date":pos_date,
+        provider_name="TAP" if is_tap_charge else (str(forced_payment).upper() if forced_payment else "")
+        rows.append({"POS Row":i+1,"Source File":source,"Provider":provider_name,"POS Store":sc,"POS Date":pos_date,
                      "Posting Date":posting_date,"Auth Code":auth(r.get(ac)),
+                     "Provider Reference":str(r.get(ac,"")).strip() if ac else "",
                      "POS Payment":pt,"POS Amount":a,"Net Amount":n if pd.notna(n) else a,
                      "Commission":c if pd.notna(c) else 0.0,"VAT":v if pd.notna(v) else 0.0,
                      "Terminal ID":str(r.get(terminal,"")).strip() if terminal else "",
