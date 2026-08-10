@@ -154,6 +154,66 @@ def dt(v):
     # Text month dates / other unambiguous forms.
     return pd.to_datetime(s,errors="coerce")
 
+
+def parse_provider_date(v, source_file="", provider_hint=""):
+    """
+    Provider-aware date parser.
+
+    TAP charge exports are resolved against the date range embedded in the
+    source filename, e.g. 260801_to_260809 = 01-Aug-2026 to 09-Aug-2026.
+    """
+    src=str(source_file or "")
+    hint=str(provider_hint or "").upper()
+    is_tap=("CHARGE_" in src.upper()) or ("TAP" in hint)
+
+    if not is_tap:
+        return dt(v)
+
+    if isinstance(v,(pd.Timestamp,datetime)):
+        return pd.to_datetime(v,errors="coerce")
+
+    if isinstance(v,(int,float,np.integer,np.floating)) and not isinstance(v,bool):
+        fv=float(v)
+        if 20000 <= fv <= 80000:
+            try:
+                return pd.Timestamp("1899-12-30") + pd.to_timedelta(fv,unit="D")
+            except Exception:
+                pass
+
+    s="" if v is None else str(v).strip()
+    if not s or s.lower() in {"nan","nat","none","null"}:
+        return pd.NaT
+
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}",s):
+        return pd.to_datetime(s,errors="coerce",yearfirst=True)
+
+    pm=re.search(r"(\d{6})_to_(\d{6})",src,re.I)
+    start=end=None
+    if pm:
+        try:
+            start=pd.to_datetime(pm.group(1),format="%y%m%d")
+            end=pd.to_datetime(pm.group(2),format="%y%m%d")
+        except Exception:
+            start=end=None
+
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{4}",s):
+        cands=[]
+        for dayfirst in (True,False):
+            try:
+                d=pd.to_datetime(s,errors="coerce",dayfirst=dayfirst)
+                if pd.notna(d):
+                    cands.append(d.normalize())
+            except Exception:
+                pass
+        if start is not None and end is not None:
+            inside=[d for d in cands if start.normalize() <= d <= end.normalize()]
+            if inside:
+                return inside[0]
+        return pd.to_datetime(s,errors="coerce",dayfirst=True)
+
+    return pd.to_datetime(s,errors="coerce",dayfirst=True)
+
+
 def find(df,names):
     for n in names:
         n=ccol(n)
@@ -555,8 +615,13 @@ def normalize_pos(df,source="POS",forced_payment=None):
         n=amount(r.get(net)) if net else a
         c=amount(r.get(comm)) if comm else 0.0
         v=amount(r.get(vat)) if vat else 0.0
-        rows.append({"POS Row":i+1,"Source File":source,"POS Store":sc,"POS Date":dt(r.get(date)) if date else pd.NaT,
-                     "Posting Date":dt(r.get(posting)) if posting else pd.NaT,"Auth Code":auth(r.get(ac)),
+        provider_hint="TAP" if "CHARGE_" in str(source).upper() else ""
+        pos_date=parse_provider_date(r.get(date),source,provider_hint) if date else pd.NaT
+        posting_date=parse_provider_date(r.get(posting),source,provider_hint) if posting else pd.NaT
+        if "CHARGE_" in str(source).upper():
+            pt="TAP"
+        rows.append({"POS Row":i+1,"Source File":source,"POS Store":sc,"POS Date":pos_date,
+                     "Posting Date":posting_date,"Auth Code":auth(r.get(ac)),
                      "POS Payment":pt,"POS Amount":a,"Net Amount":n if pd.notna(n) else a,
                      "Commission":c if pd.notna(c) else 0.0,"VAT":v if pd.notna(v) else 0.0,
                      "Terminal ID":str(r.get(terminal,"")).strip() if terminal else "",
