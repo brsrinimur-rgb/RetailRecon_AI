@@ -88,6 +88,16 @@ if r3.button("Provider performance",use_container_width=True):
 if r4.button("Top 10 risks",use_container_width=True):
     quick="show top 10 risks"
 
+s1,s2,s3,s4=st.columns(4)
+if s1.button("Finance briefing",use_container_width=True):
+    quick="give me a finance briefing"
+if s2.button("Settlement status",use_container_width=True):
+    quick="show settlement status"
+if s3.button("Data quality",use_container_width=True):
+    quick="check data quality"
+if s4.button("Close readiness",use_container_width=True):
+    quick="can I close the period?"
+
 for msg in st.session_state.copilot_messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["text"])

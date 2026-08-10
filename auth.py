@@ -5,15 +5,6 @@ USERS = {
     "finance": {"password":"finance123","role":"Finance Manager","name":"Finance Manager"},
     "maker": {"password":"maker123","role":"Finance Maker","name":"Finance Maker"},
     "checker": {"password":"checker123","role":"Finance Checker","name":"Finance Checker"},
-
-    # --- Store User role (controlled addition) ------------------------
-    # Read-only, store-scoped access to the AI Finance Copilot only.
-    # Does not change or touch the finance roles above in any way.
-    # store_codes selects which stores this login can see; the Copilot's
-    # existing _allowed_store_codes/_apply_user_scope mechanism restricts
-    # every DataFrame answer to these codes automatically.
-    "store601": {"password":"store601pass","role":"Store User","name":"Store User - Aigner Tahlia Mall","store_codes":["601"]},
-    "store606": {"password":"store606pass","role":"Store User","name":"Store User - Aigner Riyadh Park","store_codes":["606"]},
 }
 
 def require_login(allowed_roles=None):
@@ -38,8 +29,6 @@ def require_login(allowed_roles=None):
             st.write("finance / finance123")
             st.write("maker / maker123")
             st.write("checker / checker123")
-            st.write("store601 / store601pass  (Store User, store 601 only)")
-            st.write("store606 / store606pass  (Store User, store 606 only)")
         st.stop()
     if allowed_roles and st.session_state.user["role"] not in allowed_roles:
         st.error("You do not have permission to access this page.")
@@ -49,8 +38,6 @@ def render_user_sidebar():
     u = st.session_state.get("user")
     if not u: return
     st.sidebar.caption(f"{u['name']} · {u['role']}")
-    if u.get("store_codes"):
-        st.sidebar.caption(f"Scoped to store(s): {', '.join(u['store_codes'])}")
     if st.sidebar.button("Log out", use_container_width=True):
         st.session_state.user = None
         st.rerun()

@@ -866,12 +866,8 @@ def _norm_payment(v):
 
 def _collapse_exact_pos_duplicates(pos):
     """
-    Collapse only provably-identical repeated POS/provider rows.
-
-    Safety:
-    - Never collapse rows that have no stable transaction identity.
-    - Stable identity = Auth Code OR Provider Reference OR Provider Order Reference.
-    - Same Store/Date/Amount alone is NOT enough because two genuine sales can be identical.
+    Collapse exact repeated POS records caused by overlapping/daily statement uploads.
+    The transaction remains matchable, while we retain duplicate-source information.
     """
     if pos is None or pos.empty:
         return pos
@@ -880,49 +876,24 @@ def _collapse_exact_pos_duplicates(pos):
     d["POS Payment"]=d["POS Payment"].apply(_norm_payment)
     d["_DATE_KEY"]=pd.to_datetime(d["POS Date"],errors="coerce").dt.normalize()
     d["_STORE_KEY"]=d["POS Store"].astype(str).str.strip()
-    d["_AUTH_KEY"]=d.get("Auth Code",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
-    d["_PROVIDER_REF_KEY"]=d.get("Provider Reference",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
-    d["_ORDER_REF_KEY"]=d.get("Provider Order Reference",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
-    d["_TERMINAL_KEY"]=d.get("Terminal ID",pd.Series("",index=d.index)).fillna("").astype(str).str.strip()
+    d["_AUTH_KEY"]=d["Auth Code"].astype(str).str.strip()
     d["_AMT_KEY"]=pd.to_numeric(d["POS Amount"],errors="coerce").round(2)
 
-    identity_present=(
-        d["_AUTH_KEY"].ne("") |
-        d["_PROVIDER_REF_KEY"].ne("") |
-        d["_ORDER_REF_KEY"].ne("")
-    )
-
-    identifiable=d[identity_present].copy()
-    anonymous=d[~identity_present].copy()
+    key=["_STORE_KEY","_DATE_KEY","_AUTH_KEY","POS Payment","_AMT_KEY"]
+    grp=d.groupby(key,dropna=False,sort=False)
 
     rows=[]
-
-    if not identifiable.empty:
-        key=[
-            "_STORE_KEY","_DATE_KEY","_AUTH_KEY","_PROVIDER_REF_KEY",
-            "_ORDER_REF_KEY","_TERMINAL_KEY","POS Payment","_AMT_KEY"
-        ]
-        for _,g in identifiable.groupby(key,dropna=False,sort=False):
-            r=g.iloc[0].copy()
-            r["Exact POS Repeat Count"]=len(g)
-            r["Exact POS Repeat Collapsed"]=len(g)>1
-            if "Source File" in g.columns:
-                r["Source File"]=" | ".join(sorted(set(g["Source File"].astype(str))))
-            r["POS Duplicate"]=False
-            rows.append(r)
-
-    # Anonymous rows are never silently merged.
-    for _,r0 in anonymous.iterrows():
-        r=r0.copy()
-        r["Exact POS Repeat Count"]=1
-        r["Exact POS Repeat Collapsed"]=False
+    for _,g in grp:
+        r=g.iloc[0].copy()
+        r["Exact POS Repeat Count"]=len(g)
+        r["Exact POS Repeat Collapsed"]=len(g)>1
+        if "Source File" in g.columns:
+            r["Source File"]=" | ".join(sorted(set(g["Source File"].astype(str))))
+        # This is no longer treated as an ambiguous duplicate when every key field is identical.
+        r["POS Duplicate"]=False
         rows.append(r)
 
-    helper=[
-        "_DATE_KEY","_STORE_KEY","_AUTH_KEY","_PROVIDER_REF_KEY",
-        "_ORDER_REF_KEY","_TERMINAL_KEY","_AMT_KEY"
-    ]
-    out=pd.DataFrame(rows).drop(columns=helper,errors="ignore")
+    out=pd.DataFrame(rows).drop(columns=["_DATE_KEY","_STORE_KEY","_AUTH_KEY","_AMT_KEY"],errors="ignore")
     return out.reset_index(drop=True)
 
 def _date_plausible_for_source(pos_date, source_file):

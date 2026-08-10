@@ -101,6 +101,39 @@ def _store_name_map(db_module=None):
             pass
     return names
 
+def _best_store_name(store_code, db_module=None):
+    code=_norm_store(store_code)
+    if not code:
+        return ""
+    try:
+        import core as _core
+        info=_core.D365_STORE_DISPLAY.get(code,{})
+        n=str(info.get("store_name","")).strip()
+        if n:
+            return n
+    except Exception:
+        pass
+    names=_store_name_map(db_module).get(code,set())
+    cleaned=[str(x).strip() for x in names if str(x).strip()]
+    return " / ".join(sorted(dict.fromkeys(cleaned))) if cleaned else ""
+
+def _store_label(store_code, db_module=None):
+    code=_norm_store(store_code)
+    name=_best_store_name(code,db_module)
+    return f"Store {code} – {name}" if name else f"Store {code}"
+
+def _add_store_name_column(df, db_module=None, store_col="Store Code"):
+    if df is None or df.empty or store_col not in df.columns:
+        return df
+    out=df.copy()
+    names=out[store_col].map(lambda x:_best_store_name(x,db_module))
+    if "Store Name" in out.columns:
+        old=out["Store Name"].astype(str)
+        out["Store Name"]=names.where(names.astype(str).str.len()>0,old)
+    else:
+        out.insert(list(out.columns).index(store_col)+1,"Store Name",names)
+    return out
+
 def _find_store_codes_by_name(q,db_module=None):
     """
     Match known store names inside free text. Requires the matched name to
@@ -345,6 +378,28 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
         intent="store_performance"
     elif any(x in ql for x in ["provider performance","provider score","payment performance","which provider","provider delay"]):
         intent="provider_performance"
+    elif any(x in ql for x in [
+        "matched and unmatched","matched & unmatched","match and unmatched","matched/unmatched",
+        "reconciliation status","match status","match rate","how much matched","how much unmatched",
+        "matched amount","unmatched amount"
+    ]):
+        intent="reconciliation_status"
+    elif any(x in ql for x in ["can i close","ready to close","close readiness","can we close","period close"]):
+        intent="close_readiness"
+    elif any(x in ql for x in ["finance briefing","today's finance briefing","today finance briefing","management briefing","cfo briefing"]):
+        intent="management_brief"
+    elif any(x in ql for x in ["bank settled","awaiting bank","settlement delay","oldest unsettled","settlement status","how much is settled"]):
+        intent="settlement_intelligence"
+    elif any(x in ql for x in ["commission error","commission errors","commission validation","commission amount","vat on commission","commission difference"]):
+        intent="commission_intelligence"
+    elif any(x in ql for x in ["refund total","refunds by","refund ratio","largest refund","highest refund","show refunds","refund intelligence"]):
+        intent="refund_intelligence"
+    elif any(x in ql for x in ["duplicate files","duplicate auth","missing dates","unmapped terminal","unmapped merchant","unknown stores","data quality","today's upload","today upload"]):
+        intent="data_quality"
+    elif any(x in ql for x in ["source file","source files","where did this come from","evidence","data source"]):
+        intent="source_evidence"
+    elif any(x in ql for x in ["help","what can you answer","what can i ask","capabilities"]):
+        intent="copilot_help"
     elif any(x in ql for x in ["exception","anything wrong","issues","problem","unmatched"]):
         intent="exceptions"
     elif any(x in ql for x in [
@@ -447,34 +502,47 @@ def _scope_text(ctx):
         parts.append(f"up to {_fmt_date(ctx.date_to)}")
     return " | ".join(parts) if parts else "current loaded reconciliation"
 
-def _sales_answer(result,ctx,detail=False):
+def _sales_answer(result,ctx,detail=False,db_module=None):
     tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
     if tender.empty:
-        return {
-            "text":f"I couldn't find D365 Store Tender sales for {_scope_text(ctx)} in the active reconciliation.",
-            "table":pd.DataFrame()
-        }
-
+        return {"text":f"I couldn't find D365 Store Tender sales for {_scope_text(ctx)} in the active reconciliation.","table":pd.DataFrame()}
+    tender=tender.copy()
     tender["D365 Amount"]=pd.to_numeric(tender.get("D365 Amount",0),errors="coerce").fillna(0.0)
+    if "Store Code" in tender.columns:
+        tender["Store Code"]=tender["Store Code"].map(_norm_store)
+        tender=_add_store_name_column(tender,db_module,"Store Code")
     grp=tender.groupby(tender["D365 Payment"].astype(str).str.upper(),dropna=False)["D365 Amount"].sum().sort_values(ascending=False)
-
     gross=float(tender["D365 Amount"].sum())
     positive=float(tender.loc[tender["D365 Amount"]>0,"D365 Amount"].sum())
     refunds=float(tender.loc[tender["D365 Amount"]<0,"D365 Amount"].sum())
-
-    scope=_scope_text(ctx)
-    lines=[f"Here are the D365 Store Tender sales for **{scope}**.",
-           f"Net tender total is **{_fmt_sar(gross)}**. Positive sales total **{_fmt_sar(positive)}** and refunds/negative tenders total **{_fmt_sar(refunds)}**."]
+    if len(ctx.store_codes)==1:
+        parts=[_store_label(ctx.store_codes[0],db_module)]
+        if ctx.payment: parts.append(ctx.payment)
+        if ctx.date_from is not None and ctx.date_to is not None:
+            if ctx.date_from==ctx.date_to: parts.append(_fmt_date(ctx.date_from))
+            elif ctx.date_mode=="as_of": parts.append(f"up to {_fmt_date(ctx.date_to)}")
+            else: parts.append(f"{_fmt_date(ctx.date_from)} to {_fmt_date(ctx.date_to)}")
+        elif ctx.date_to is not None: parts.append(f"up to {_fmt_date(ctx.date_to)}")
+        scope=" | ".join(parts)
+    else:
+        scope=_scope_text(ctx)
+    lines=[f"Here are the D365 Store Tender sales for **{scope}**.",f"Net tender total is **{_fmt_sar(gross)}**. Positive sales total **{_fmt_sar(positive)}** and refunds/negative tenders total **{_fmt_sar(refunds)}**."]
     if not ctx.payment:
         mix=", ".join(f"{p}: {_fmt_sar(v)}" for p,v in grp.items() if abs(float(v))>0)
         if mix: lines.append("Payment breakdown: "+mix+".")
     else:
         lines.append(f"{ctx.payment} total is **{_fmt_sar(gross)}** across **{len(tender):,}** transaction line(s).")
-
     if detail:
-        cols=[c for c in ["Store Code","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount","Cash Classification","Cash Amount"] if c in tender.columns]
-        return {"text":" ".join(lines), "table":tender[cols].sort_values(["Date","Receipt ID"] if "Date" in cols else cols[:1])}
-    return {"text":" ".join(lines), "table":pd.DataFrame({"Payment Type":grp.index,"Amount":grp.values})}
+        cols=[c for c in ["Store Code","Store Name","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount","Cash Classification","Cash Amount"] if c in tender.columns]
+        sorts=[c for c in ["Date","Receipt ID"] if c in cols]
+        table=tender[cols].sort_values(sorts) if sorts else tender[cols]
+        return {"text":" ".join(lines),"table":table}
+    if "Store Code" in tender.columns:
+        base=tender.copy(); base["Payment Type"]=base["D365 Payment"].astype(str).str.upper()
+        summary=base.groupby(["Store Code","Store Name","Payment Type"],dropna=False).agg(Amount=("D365 Amount","sum"), **{"Transaction Count":("D365 Amount","size")}).reset_index()
+    else:
+        summary=pd.DataFrame({"Payment Type":grp.index,"Amount":grp.values})
+    return {"text":" ".join(lines),"table":summary}
 
 def _cash_report(result,ctx,question="",db_module=None):
     """
@@ -777,8 +845,8 @@ def _lookup_answer(result,ctx,question):
     table=pd.concat(frames,ignore_index=True,sort=False)
     return {"text":f"I found **{len(table):,} record(s)** for **{token}** across the active reconciliation datasets.","table":table.head(500)}
 
-def _summary_answer(result,ctx):
-    sales=_sales_answer(result,ctx,False)
+def _summary_answer(result,ctx,db_module=None):
+    sales=_sales_answer(result,ctx,False,db_module)
     ex=_exceptions_answer(result,ctx)
     m=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
     settled=int(m["Bank Settled"].fillna(False).astype(bool).sum()) if (not m.empty and "Bank Settled" in m.columns) else 0
@@ -800,7 +868,7 @@ def _compare_answer(result,ctx,question,db_module=None):
         c=CopilotContext(store_codes=[s],payment=ctx.payment,date_from=ctx.date_from,date_to=ctx.date_to,date_mode=ctx.date_mode)
         x=_filter_tender(tender,c)
         amt=pd.to_numeric(x.get("D365 Amount",0),errors="coerce").fillna(0).sum() if not x.empty else 0
-        rows.append({"Store Code":s,"Sales/Tender Total":amt,"Transaction Lines":len(x)})
+        rows.append({"Store Code":s,"Store Name":_best_store_name(s,db_module),"Sales/Tender Total":amt,"Transaction Lines":len(x)})
     table=pd.DataFrame(rows)
     best=table.sort_values("Sales/Tender Total",ascending=False).iloc[0]
     return {"text":f"For {_scope_text(ctx)}, **Store {best['Store Code']}** has the higher tender total at **{_fmt_sar(best['Sales/Tender Total'])}**.","table":table}
@@ -842,7 +910,25 @@ def _apply_user_scope(result, user_context):
             scoped[k]=v
     return scoped
 
-def _risk_answer(result,ctx,question=""):
+
+def _reconciliation_status_answer(result,ctx,question="",db_module=None):
+    matched=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
+    missing_pos=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
+    missing_d365=_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")
+    def _sum(df,cols):
+        if df is None or df.empty:return 0.0
+        for c in cols:
+            if c in df.columns:return float(pd.to_numeric(df[c],errors="coerce").fillna(0).abs().sum())
+        return 0.0
+    ma=_sum(matched,["D365 Amount","Sales Amount","POS Amount"]); ua=_sum(missing_pos,["D365 Amount","Sales Amount"]); pa=_sum(missing_d365,["POS Amount","Net Amount"])
+    mc,uc,pc=len(matched),len(missing_pos),len(missing_d365)
+    rate=mc/(mc+uc)*100 if mc+uc else 0.0
+    scope=_store_label(ctx.store_codes[0],db_module) if len(ctx.store_codes)==1 else _scope_text(ctx)
+    if ctx.payment:scope+=f" | {ctx.payment}"
+    table=pd.DataFrame([{"Category":"Matched","Amount":ma,"Transactions":mc},{"Category":"Unmatched D365 / Missing POS","Amount":ua,"Transactions":uc},{"Category":"Unmatched POS / Missing D365","Amount":pa,"Transactions":pc},{"Category":"Total Exceptions","Amount":ua+pa,"Transactions":uc+pc}])
+    return {"text":f"Here is the reconciliation status for **{scope}**. **Matched:** {_fmt_sar(ma)} across **{mc:,}** transaction(s). **Unmatched D365 / Missing POS:** {_fmt_sar(ua)} across **{uc:,}** transaction(s). **Unmatched POS / Missing D365:** {_fmt_sar(pa)} across **{pc:,}** transaction(s). **Total Exceptions:** {_fmt_sar(ua+pa)} across **{uc+pc:,}** transaction(s). **D365 transaction match rate:** {rate:,.2f}%.","table":table}
+
+def _risk_answer(result,ctx,question="",db_module=None):
     """
     Finance-control risk view built only from active application data.
     It does not make fraud accusations; it prioritizes review items.
@@ -900,6 +986,8 @@ def _risk_answer(result,ctx,question=""):
             })
 
     risk=pd.DataFrame(rows)
+    if not risk.empty and "Store Code" in risk.columns:
+        risk=_add_store_name_column(risk,db_module,"Store Code")
     if risk.empty:
         return {"text":f"I found no open reconciliation or bank-settlement risks for **{_scope_text(ctx)}** in the active data.","table":risk}
 
@@ -942,12 +1030,12 @@ def _risk_answer(result,ctx,question=""):
         f"For **{_scope_text(ctx)}**, I found **{len(risk):,} open finance-control risk item(s)** "
         f"with gross exposure of about **{_fmt_sar(total)}**. "
         f"**{critical:,}** item(s) are currently Critical by amount/age/control priority. "
-        f"The highest-priority item is **{top['Risk Type']}** for Store **{top['Store Code'] or 'Unmapped'}**, "
+        f"The highest-priority item is **{top['Risk Type']}** for **{_store_label(top['Store Code'],db_module) if top['Store Code'] else 'Unmapped Store'}**, "
         f"amount **{_fmt_sar(top['Amount'])}**, age **{int(top['Age Days'])} day(s)**."
     )
     return {"text":text,"table":show}
 
-def _store_performance_answer(result,ctx):
+def _store_performance_answer(result,ctx,db_module=None):
     tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
     us=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
     up=_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")
@@ -977,6 +1065,7 @@ def _store_performance_answer(result,ctx):
         score=max(0.0,100.0-min(60.0,exc*5.0)-min(30.0,bank_open*3.0)-min(10.0,(open_amt/max(abs(sales),1))*100))
         rows.append({
             "Store Code":s,
+            "Store Name":_best_store_name(s,db_module),
             "D365 Tender Total":sales,
             "Matched Amount":matched_amt,
             "Open Exception Amount":open_amt,
@@ -1038,6 +1127,157 @@ def _provider_performance_answer(result,ctx):
     return {"text":text,"table":table.sort_values(["Awaiting Bank","Provider-side Exceptions"],ascending=False)}
 
 
+
+def _fc_num(df, cols, absolute=False):
+    if df is None or df.empty: return 0.0
+    for c in cols:
+        if c in df.columns:
+            s=pd.to_numeric(df[c],errors="coerce").fillna(0)
+            return float(s.abs().sum() if absolute else s.sum())
+    return 0.0
+
+def _fc_date_series(df, candidates):
+    if df is None or df.empty:return pd.Series(dtype="datetime64[ns]")
+    for c in candidates:
+        if c in df.columns:return pd.to_datetime(df[c],errors="coerce")
+    return pd.Series(pd.NaT,index=df.index)
+
+def _fc_source_answer(result,ctx,db_module=None):
+    frames=[
+        ("D365 Store Tender",_filter_tender(result.get("tender",pd.DataFrame()),ctx)),
+        ("Matched Reconciliation",_filter_recon(result.get("matched",pd.DataFrame()),ctx)),
+        ("D365 Missing POS/Provider",_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)),
+        ("POS/Provider Missing D365",_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")),
+    ]
+    rows=[]
+    for label,df in frames:
+        if df is None or df.empty: continue
+        sources=[]
+        if "Source" in df.columns:sources=[x for x in df["Source"].dropna().astype(str).unique() if x.strip()]
+        rows.append({"Data Source":label,"Rows":len(df),"Source Files":" | ".join(sources[:20])})
+    tab=pd.DataFrame(rows)
+    return {"text":f"These are the active evidence sources for **{_scope_text(ctx)}**. I only use data loaded in RetailRecon AI and do not invent missing source evidence.","table":tab}
+
+def _fc_data_quality(result,ctx,db_module=None):
+    tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
+    pos=result.get("pos",pd.DataFrame()).copy()
+    issues=[]
+    def add(name,count,detail):
+        if count: issues.append({"Control":name,"Issue Count":int(count),"Action":detail})
+    if not tender.empty:
+        if "Auth Code" in tender.columns:
+            a=tender["Auth Code"].astype(str).str.strip()
+            add("Duplicate D365 Auth Code",int(a[a.ne("")].duplicated(keep=False).sum()),"Review duplicated authorization references before close.")
+        d=_fc_date_series(tender,["Date"])
+        add("Missing D365 Date",int(d.isna().sum()),"Correct/validate Store Tender transaction date.")
+    if pos is not None and not pos.empty:
+        if "Auth Code" in pos.columns:
+            a=pos["Auth Code"].astype(str).str.strip()
+            add("Duplicate POS/Provider Auth Code",int(a[a.ne("")].duplicated(keep=False).sum()),"Validate whether these are genuine repeated transactions or duplicate uploads.")
+        d=_fc_date_series(pos,["POS Date","Date"])
+        add("Missing Provider/POS Date",int(d.isna().sum()),"Validate provider transaction-date mapping.")
+        for c,label in [("POS Store","Unmapped Store"),("Terminal ID","Missing Terminal ID"),("Merchant ID","Missing Merchant ID")]:
+            if c in pos.columns:add(label,int(pos[c].fillna("").astype(str).str.strip().isin(["","nan","None"]).sum()),"Complete master-data mapping.")
+    tab=pd.DataFrame(issues)
+    if tab.empty:return {"text":f"I found no obvious upload/data-quality issues for **{_scope_text(ctx)}** in the active data.","table":tab}
+    return {"text":f"I found **{int(tab['Issue Count'].sum()):,}** data-quality/control flags across **{len(tab)}** control type(s). Review these before final close or D365 posting.","table":tab}
+
+def _fc_settlement(result,ctx,db_module=None):
+    m=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
+    if m.empty:return {"text":f"I don't have matched settlement data for **{_scope_text(ctx)}**.","table":pd.DataFrame()}
+    settled=m[m["Bank Settled"].fillna(False).astype(bool)] if "Bank Settled" in m.columns else pd.DataFrame()
+    openx=m[~m["Bank Settled"].fillna(False).astype(bool)] if "Bank Settled" in m.columns else m
+    sa=_fc_num(settled,["Net Amount","D365 Amount","Sales Amount"],True)
+    oa=_fc_num(openx,["Net Amount","D365 Amount","Sales Amount"],True)
+    delay=pd.to_numeric(m.get("Settlement Delay Days",pd.Series(dtype=float)),errors="coerce")
+    tab=pd.DataFrame([
+      {"Status":"Bank Settled","Amount":sa,"Transactions":len(settled)},
+      {"Status":"Awaiting Bank","Amount":oa,"Transactions":len(openx)},
+    ])
+    avg=float(delay.mean()) if not delay.dropna().empty else None
+    oldest=""
+    if not openx.empty:
+        ds=_fc_date_series(openx,["Posting Date","POS Date","Date"])
+        if ds.notna().any(): oldest=_fmt_date(ds.min())
+    text=f"For **{_scope_text(ctx)}**, bank-settled amount is **{_fmt_sar(sa)}** ({len(settled):,} transactions) and **{_fmt_sar(oa)}** ({len(openx):,}) is awaiting bank verification."
+    if avg is not None:text+=f" Average settlement delay is **{avg:.2f} day(s)**."
+    if oldest:text+=f" Oldest currently open transaction date is **{oldest}**."
+    return {"text":text,"table":tab}
+
+def _fc_commission(result,ctx,db_module=None):
+    m=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
+    if m.empty:return {"text":f"I don't have matched commission data for **{_scope_text(ctx)}**.","table":pd.DataFrame()}
+    comm=_fc_num(m,["Commission"],True); vat=_fc_num(m,["VAT"],True)
+    cols=[c for c in ["Store Code","Payment Type","Commission","VAT","D365 Amount","Net Amount"] if c in m.columns]
+    tab=m[cols].copy() if cols else pd.DataFrame()
+    if "Store Code" in tab.columns:tab=_add_store_name_column(tab,db_module,"Store Code")
+    return {"text":f"For **{_scope_text(ctx)}**, recorded commission is **{_fmt_sar(comm)}** and VAT on commission is **{_fmt_sar(vat)}**. Expected-vs-actual rate validation is shown only where the active reconciliation contains sufficient rate/configuration data.","table":tab.head(500)}
+
+def _fc_refunds(result,ctx,db_module=None):
+    tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
+    if tender.empty:return {"text":f"I don't have D365 tender data for **{_scope_text(ctx)}**.","table":pd.DataFrame()}
+    x=tender.copy(); x["D365 Amount"]=pd.to_numeric(x.get("D365 Amount",0),errors="coerce").fillna(0)
+    r=x[x["D365 Amount"]<0].copy()
+    amt=float(r["D365 Amount"].sum()); gross=float(x.loc[x["D365 Amount"]>0,"D365 Amount"].sum())
+    ratio=(abs(amt)/gross*100) if gross else 0
+    if "Store Code" in r.columns:r=_add_store_name_column(r,db_module,"Store Code")
+    cols=[c for c in ["Store Code","Store Name","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount"] if c in r.columns]
+    return {"text":f"For **{_scope_text(ctx)}**, refunds/negative tenders total **{_fmt_sar(amt)}** across **{len(r):,}** transaction line(s). Refund-to-positive-sales ratio is **{ratio:.2f}%**.","table":r[cols].sort_values("D365 Amount").head(500) if cols else r.head(500)}
+
+def _fc_jv(result,ctx,db_module=None):
+    if db_module is None or not hasattr(db_module,"load_jv_batches"):
+        return {"text":"I don't have access to JV batch status in this session.","table":pd.DataFrame()}
+    try:jv=db_module.load_jv_batches()
+    except Exception:return {"text":"I couldn't read the JV batch status from the application database.","table":pd.DataFrame()}
+    if jv is None or jv.empty:return {"text":"No JV batches are currently available.","table":pd.DataFrame()}
+    x=jv.copy()
+    if ctx.store_codes and "Store Code" in x.columns:x=x[x["Store Code"].map(_norm_store).isin(ctx.store_codes)]
+    status_col="D365 Status" if "D365 Status" in x.columns else ("Status" if "Status" in x.columns else None)
+    if status_col:
+        tab=x.groupby(x[status_col].fillna("UNKNOWN").astype(str),dropna=False).size().reset_index(name="Batches").rename(columns={status_col:"JV Status"})
+    else:tab=pd.DataFrame([{"JV Status":"Available","Batches":len(x)}])
+    return {"text":f"I found **{len(x):,} JV batch(es)** for **{_scope_text(ctx)}**. The table shows the current workflow/posting status from the application database.","table":tab}
+
+def _fc_close_readiness(result,ctx,db_module=None):
+    risk=_risk_answer(result,ctx,"what needs attention",db_module)
+    blockers=risk.get("table",pd.DataFrame())
+    reasons=[]
+    if blockers is not None and not blockers.empty: reasons.append(f"{len(blockers):,} open reconciliation/settlement risk item(s)")
+    if db_module is not None and hasattr(db_module,"load_corrections"):
+        try:
+            c=db_module.load_corrections()
+            if c is not None and not c.empty and "Status" in c.columns:
+                n=int(c["Status"].astype(str).str.upper().eq("PENDING").sum())
+                if n:reasons.append(f"{n:,} pending correction(s)")
+        except Exception:pass
+    ready=not reasons
+    status="READY TO CLOSE" if ready else "NOT READY"
+    text=f"**{status}** for **{_scope_text(ctx)}**."
+    if reasons:text+=" Blockers: "+"; ".join(reasons)+"."
+    else:text+=" I found no blocker in the reconciliation, settlement-risk and pending-correction checks available to the Copilot."
+    return {"text":text,"table":blockers.head(100) if blockers is not None else pd.DataFrame()}
+
+def _fc_management_brief(result,ctx,db_module=None):
+    sales=_sales_answer(result,ctx,False,db_module)
+    recon=_reconciliation_status_answer(result,ctx,"matched and unmatched",db_module)
+    risk=_risk_answer(result,ctx,"top 10 risks",db_module)
+    settle=_fc_settlement(result,ctx,db_module)
+    text="**Finance Control Briefing**\n\n"+sales["text"]+"\n\n"+recon["text"]+"\n\n"+settle["text"]+"\n\n"+risk["text"]
+    return {"text":text,"table":risk.get("table",pd.DataFrame())}
+
+def _fc_help():
+    groups=[
+      ("Sales & Cash","sales by store/date/payment, rankings, refunds, cash sales/refunds, payment mix"),
+      ("Reconciliation","matched/unmatched, missing POS, missing D365, match rate, exception drill-down"),
+      ("Settlement","bank settled, awaiting bank, settlement delay, oldest outstanding"),
+      ("Providers","provider/payment performance, Tabby/Tamara/Tap/card exceptions"),
+      ("Controls","commission/VAT, refunds, data quality, duplicates, mappings, risk priorities"),
+      ("Close & JV","close readiness, pending corrections, JV workflow/posting status"),
+      ("Management","finance briefing, what needs attention, store performance, provider performance"),
+      ("Evidence","source files and active data sources used for the answer"),
+    ]
+    return {"text":"I can answer application-grounded Finance Control questions across sales, reconciliation, settlement, providers, controls, close/JV and management reporting. I will say when the active application does not contain enough data.","table":pd.DataFrame(groups,columns=["Area","Examples"])}
+
 def answer_question(question, result, db_module=None, prior_context=None, user_context=None):
     if not result:
         return {
@@ -1058,6 +1298,24 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
         # Cash questions use a dedicated D365 Store Tender finance report.
         ctx.payment="CASH"
         payload=_cash_report(result,ctx,question,db_module)
+    elif intent=="close_readiness":
+        payload=_fc_close_readiness(result,ctx,db_module)
+    elif intent=="management_brief":
+        payload=_fc_management_brief(result,ctx,db_module)
+    elif intent=="settlement_intelligence":
+        payload=_fc_settlement(result,ctx,db_module)
+    elif intent=="commission_intelligence":
+        payload=_fc_commission(result,ctx,db_module)
+    elif intent=="refund_intelligence":
+        payload=_fc_refunds(result,ctx,db_module)
+    elif intent=="data_quality":
+        payload=_fc_data_quality(result,ctx,db_module)
+    elif intent=="source_evidence":
+        payload=_fc_source_answer(result,ctx,db_module)
+    elif intent=="copilot_help":
+        payload=_fc_help()
+    elif intent=="reconciliation_status":
+        payload=_reconciliation_status_answer(result,ctx,question,db_module)
     elif intent=="sales":
         # A CASH-scoped "sales" question is a cash query and must always go
         # through the Advanced Cash Report, never the generic tender-total
@@ -1065,18 +1323,18 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
         if ctx.payment=="CASH":
             payload=_cash_report(result,ctx,question,db_module)
         else:
-            payload=_sales_answer(result,ctx,detail=False)
+            payload=_sales_answer(result,ctx,detail=False,db_module=db_module)
     elif intent=="date_range":
         payload=_date_range_answer(result,ctx)
     elif intent=="transactions":
         if ctx.payment=="CASH":
             payload=_cash_report(result,ctx,question,db_module)
         else:
-            payload=_sales_answer(result,ctx,detail=True)
+            payload=_sales_answer(result,ctx,detail=True,db_module=db_module)
     elif intent=="risk":
-        payload=_risk_answer(result,ctx,question)
+        payload=_risk_answer(result,ctx,question,db_module)
     elif intent=="store_performance":
-        payload=_store_performance_answer(result,ctx)
+        payload=_store_performance_answer(result,ctx,db_module)
     elif intent=="provider_performance":
         payload=_provider_performance_answer(result,ctx)
     elif intent in {"exceptions","missing_pos","missing_d365"}:
@@ -1154,7 +1412,7 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
         if ctx.payment=="CASH":
             payload=_cash_report(result,ctx,question,db_module)
         else:
-            payload=_summary_answer(result,ctx)
+            payload=_summary_answer(result,ctx,db_module)
 
     payload["context"]=ctx
     payload["intent"]=intent
