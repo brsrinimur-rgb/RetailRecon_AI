@@ -58,6 +58,18 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         time TEXT, d365_row INTEGER, new_auth TEXT, reason TEXT, user TEXT, status TEXT
     )""")
+    # Correction approval audit columns (backward-compatible migration).
+    _corr_cols={r[1] for r in conn.execute("PRAGMA table_info(correction_log)").fetchall()}
+    for _name,_type in [
+        ("original_auth","TEXT"),
+        ("store_code","TEXT"),
+        ("receipt_id","TEXT"),
+        ("approver","TEXT"),
+        ("approval_time","TEXT"),
+        ("approval_comment","TEXT"),
+    ]:
+        if _name not in _corr_cols:
+            conn.execute(f"ALTER TABLE correction_log ADD COLUMN {_name} {_type}")
     conn.execute("""CREATE TABLE IF NOT EXISTS adjustments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT, store TEXT, provider TEXT, amount REAL, reason TEXT, status TEXT, user TEXT
@@ -284,27 +296,182 @@ def load_approval_log() -> pd.DataFrame:
 
 
 # ----------------------------------------------------------- correction log
-def append_correction_log(d365_row, new_auth, reason, user):
-    conn = get_conn()
+def append_correction_log(
+    d365_row, new_auth, reason, user,
+    original_auth="", store_code="", receipt_id=""
+):
+    """
+    Submit an Auth Code correction for maker-checker approval.
+    The original transaction identity is captured so approved corrections can
+    be safely reapplied on reconciliation reruns.
+    """
+    conn=get_conn()
     conn.execute(
-        """INSERT INTO correction_log (time,d365_row,new_auth,reason,user,status)
-           VALUES (?,?,?,?,?,?)""",
-        (datetime.now().isoformat(timespec="seconds"), int(d365_row), new_auth, reason, user, "PENDING APPROVAL"),
+        """INSERT INTO correction_log
+           (time,d365_row,new_auth,reason,user,status,original_auth,store_code,receipt_id,
+            approver,approval_time,approval_comment)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            datetime.now().isoformat(timespec="seconds"),
+            int(d365_row),
+            str(new_auth).strip(),
+            str(reason).strip(),
+            str(user).strip(),
+            "PENDING APPROVAL",
+            str(original_auth).strip(),
+            str(store_code).strip(),
+            str(receipt_id).strip(),
+            "",
+            "",
+            "",
+        ),
     )
     conn.commit()
     conn.close()
 
 
-def load_correction_log() -> pd.DataFrame:
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """SELECT time AS "Time", d365_row AS "D365 Row", new_auth AS "New Auth",
-                  reason AS "Reason", user AS "User", status AS "Status"
-           FROM correction_log ORDER BY id DESC""",
-        conn,
-    )
+def load_correction_log(status=None) -> pd.DataFrame:
+    conn=get_conn()
+    sql="""SELECT id AS "ID", time AS "Submitted At", d365_row AS "D365 Row",
+                  store_code AS "Store Code", receipt_id AS "Receipt ID",
+                  original_auth AS "Original Auth", new_auth AS "New Auth",
+                  reason AS "Reason", user AS "Submitted By", status AS "Status",
+                  approver AS "Approver", approval_time AS "Approval Time",
+                  approval_comment AS "Approval Comment"
+           FROM correction_log"""
+    params=[]
+    if status:
+        sql += " WHERE status=?"
+        params=[status]
+    sql += " ORDER BY id DESC"
+    df=pd.read_sql_query(sql,conn,params=params)
     conn.close()
     return df
+
+
+def decide_correction(correction_id, decision, approver, comment=""):
+    """
+    Approve or reject a pending correction.
+    Enforces maker-checker: submitter cannot approve/reject their own request.
+    Returns (ok, message).
+    """
+    decision=str(decision).strip().upper()
+    if decision not in {"APPROVED","REJECTED"}:
+        return False,"Decision must be APPROVED or REJECTED."
+
+    conn=get_conn()
+    row=conn.execute(
+        "SELECT user,status,new_auth FROM correction_log WHERE id=?",
+        (int(correction_id),)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return False,"Correction request not found."
+
+    maker,status,new_auth=row
+    if str(status).upper()!="PENDING APPROVAL":
+        conn.close()
+        return False,f"Correction is already {status}."
+    if str(maker).strip().lower()==str(approver).strip().lower():
+        conn.close()
+        return False,"Maker-checker control: you cannot approve or reject your own correction."
+
+    conn.execute(
+        """UPDATE correction_log
+           SET status=?, approver=?, approval_time=?, approval_comment=?
+           WHERE id=? AND status='PENDING APPROVAL'""",
+        (
+            decision,
+            str(approver).strip(),
+            datetime.now().isoformat(timespec="seconds"),
+            str(comment).strip(),
+            int(correction_id),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return True,f"Correction {decision.lower()}."
+
+
+def load_approved_corrections() -> pd.DataFrame:
+    return load_correction_log("APPROVED")
+
+
+def apply_approved_corrections(tender: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply approved Auth Code corrections to normalized D365 Store Tender rows.
+
+    Matching priority:
+      1) Store Code + Receipt ID + Original Auth (strongest)
+      2) D365 Row + Original Auth
+      3) D365 Row for legacy correction records
+
+    Original Auth is preserved in 'Original Auth Code' and correction audit
+    fields are stamped onto the transaction.
+    """
+    if tender is None or tender.empty:
+        return tender
+
+    approved=load_approved_corrections()
+    if approved.empty:
+        out=tender.copy()
+        if "Original Auth Code" not in out.columns:
+            out["Original Auth Code"]=out.get("Auth Code","")
+        return out
+
+    out=tender.copy()
+    if "Original Auth Code" not in out.columns:
+        out["Original Auth Code"]=out["Auth Code"].astype(str)
+    if "Auth Correction ID" not in out.columns:
+        out["Auth Correction ID"]=""
+    if "Auth Correction Approved By" not in out.columns:
+        out["Auth Correction Approved By"]=""
+    if "Auth Correction Approval Time" not in out.columns:
+        out["Auth Correction Approval Time"]=""
+
+    # Apply oldest-to-newest so the latest approved correction wins.
+    for _,c in approved.sort_values("ID").iterrows():
+        new_auth=str(c.get("New Auth","")).strip()
+        if not new_auth:
+            continue
+
+        original=str(c.get("Original Auth","")).strip()
+        store=str(c.get("Store Code","")).strip()
+        receipt=str(c.get("Receipt ID","")).strip()
+        row_no=c.get("D365 Row",None)
+
+        mask=pd.Series(False,index=out.index)
+
+        if store and receipt:
+            mask = (
+                out["Store Code"].astype(str).str.strip().eq(store)
+                & out["Receipt ID"].astype(str).str.strip().eq(receipt)
+            )
+            if original:
+                mask &= out["Original Auth Code"].astype(str).str.strip().eq(original)
+
+        if not mask.any() and row_no is not None and "D365 Row" in out.columns:
+            try:
+                mask=out["D365 Row"].astype(int).eq(int(row_no))
+                if original:
+                    mask &= out["Original Auth Code"].astype(str).str.strip().eq(original)
+            except Exception:
+                pass
+
+        if not mask.any() and row_no is not None and "D365 Row" in out.columns and not original:
+            try:
+                mask=out["D365 Row"].astype(int).eq(int(row_no))
+            except Exception:
+                pass
+
+        if mask.any():
+            out.loc[mask,"Auth Code"]=new_auth
+            out.loc[mask,"Auth Correction ID"]=str(c.get("ID",""))
+            out.loc[mask,"Auth Correction Approved By"]=str(c.get("Approver",""))
+            out.loc[mask,"Auth Correction Approval Time"]=str(c.get("Approval Time",""))
+
+    return out
+
 
 
 # ------------------------------------------------------------- adjustments

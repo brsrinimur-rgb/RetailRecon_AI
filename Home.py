@@ -15,3 +15,4 @@ c2.metric("Tolerance","SAR 1.00")
 c3.metric("Posting","Maker-Checker")
 
 st.page_link("pages/1_POS_Reconciliation.py",label="Open POS Reconciliation",icon="🧾")
+st.page_link("pages/29_AI_Finance_Copilot.py",label="Open AI Finance Copilot",icon="🤖")
