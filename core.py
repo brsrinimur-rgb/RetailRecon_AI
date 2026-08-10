@@ -107,7 +107,52 @@ def provider_ref_key(v):
     return s
 
 def dt(v):
-    return pd.to_datetime(v,errors="coerce",dayfirst=True)
+    """
+    Parse RetailRecon source dates safely.
+
+    Actual D365/POS/provider exports use examples such as:
+      8/1/2026  -> 01-Aug-2026
+      8/9/2026  -> 09-Aug-2026
+      7/4/2026  -> 04-Jul-2026
+
+    Therefore ambiguous slash dates are treated as M/D/YYYY unless the first
+    component is >12 (which makes D/M/YYYY unambiguous). ISO and Excel dates
+    are also supported.
+    """
+    if v is None or (isinstance(v,float) and pd.isna(v)):
+        return pd.NaT
+
+    # Already a real date/datetime/Timestamp.
+    if isinstance(v,(pd.Timestamp,datetime)):
+        return pd.to_datetime(v,errors="coerce")
+
+    # Excel serial date.
+    if isinstance(v,(int,float,np.integer,np.floating)) and not isinstance(v,bool):
+        fv=float(v)
+        if 20000 <= fv <= 80000:
+            try:
+                return pd.Timestamp("1899-12-30") + pd.to_timedelta(fv,unit="D")
+            except Exception:
+                pass
+
+    s=str(v).strip()
+    if not s or s.lower() in {"nan","nat","none","null"}:
+        return pd.NaT
+
+    # ISO YYYY-MM-DD / YYYY/MM/DD
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}",s):
+        return pd.to_datetime(s,errors="coerce",yearfirst=True)
+
+    # Numeric slash dates. User's real D365/POS/provider exports are M/D/YYYY.
+    m=re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})(?:\s+.*)?$",s)
+    if m:
+        a,b,_=map(int,m.groups())
+        if a>12 and b<=12:
+            return pd.to_datetime(s,errors="coerce",dayfirst=True)
+        return pd.to_datetime(s,errors="coerce",dayfirst=False)
+
+    # Text month dates / other unambiguous forms.
+    return pd.to_datetime(s,errors="coerce")
 
 def find(df,names):
     for n in names:
@@ -237,7 +282,7 @@ def classify(name,df):
     has_date=find(d,["transdate","transaction date","sales date","date"])
     has_receipt=find(d,["receiptid","receipt id","receipt","receipt number","receipt no"])
     has_auth=find(d,[
-        "auth code","authorization code","auth","authorization","approval code",
+        "auth code","authcode","authorization code","authorizationcode","auth","authorization","approval code",
         "trans approval cd","tr arf","tr_arf","authorization_id"
     ])
     has_terminal=find(d,["terminal id","tid","terminal"])
@@ -297,7 +342,7 @@ def normalize_tender(df):
     store=find(d,["store","store code"])
     date=find(d,["transdate","transaction date","date","sales date"])
     receipt=find(d,["receiptid","receipt id","receipt"])
-    ac=find(d,["auth code","authorization code","auth"])
+    ac=find(d,["auth code","authcode","authorization code","authorizationcode","auth"])
     if not all([store,date,receipt,ac]):raise ValueError("D365 Store Tender requires Store, Transdate, Receiptid and Auth Code.")
     rows=[]
     for i,r in d.iterrows():
@@ -309,7 +354,16 @@ def normalize_tender(df):
 
         s=str(r.get(store,"")).strip()
         sc=STORE_MAP.get(s.upper(),s)
-        base={"D365 Row":i+1,"Store Code":sc,"Date":dt(r.get(date)),"Receipt ID":str(r.get(receipt,"")).strip(),"Auth Code":auth(r.get(ac))}
+        parsed_date=dt(r.get(date))
+        raw_auth="" if pd.isna(r.get(ac)) else str(r.get(ac)).strip()
+        base={
+            "D365 Row":i+1,
+            "Store Code":sc,
+            "Date":parsed_date,
+            "Receipt ID":str(r.get(receipt,"")).strip(),
+            "Auth Code":auth(r.get(ac)),
+            "D365 Raw Auth Code":raw_auth,
+        }
         found=False
         for c in d.columns:
             cu=c.upper(); p=None
@@ -335,6 +389,14 @@ def normalize_tender(df):
                     rr=base.copy();rr["D365 Payment"]="UNKNOWN";rr["D365 Amount"]=a;rows.append(rr)
     out=pd.DataFrame(rows)
     if out.empty:return out
+    out["D365 Payment"]=out["D365 Payment"].apply(_norm_payment)
+    out["D365 Match Key"]=out.apply(
+        lambda r: f"{str(r['Store Code']).strip()}|"
+                  f"{pd.to_datetime(r['Date'],errors='coerce').strftime('%Y-%m-%d') if pd.notna(pd.to_datetime(r['Date'],errors='coerce')) else ''}|"
+                  f"{auth(r['Auth Code'])}|{_norm_payment(r['D365 Payment'])}|"
+                  f"{float(r['D365 Amount']):.2f}",
+        axis=1
+    )
     out["D365 Duplicate"]=out.duplicated(["Store Code","Auth Code","D365 Payment","D365 Amount"],keep=False)
     out["Unique Transaction ID"]=out.apply(lambda r: hashlib.sha1(
         f"{r['Store Code']}|{r['Date']}|{r['Receipt ID']}|{r['Auth Code']}|{r['D365 Payment']}|{r['D365 Amount']}".encode()
@@ -405,7 +467,7 @@ def normalize_pos(df,source="POS",forced_payment=None):
         # TABBY: Order number is the primary provider reference used against D365 Auth Code.
         "order number","order no","order_no","order id","order_id",
         "order_reference_id",
-        "auth code","authorization code","auth","rrn","reference",
+        "auth code","authcode","authorization code","authorizationcode","auth","rrn","reference",
         "payment id","trans approval cd","authorization_id","tr arf","tr_arf"
     ])
     amt=find(d,[
