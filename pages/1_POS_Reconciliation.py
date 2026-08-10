@@ -1,6 +1,8 @@
 from __future__ import annotations
 import pandas as pd
 import streamlit as st
+import inspect
+import hashlib
 import auth, theme, core, db
 import report_export
 
@@ -9,6 +11,46 @@ auth.require_login({"Admin","Finance Manager","Finance Maker","Finance Checker"}
 auth.render_user_sidebar()
 st.markdown(theme.global_css(),unsafe_allow_html=True)
 st.markdown(theme.top_banner("RETAIL CONTROL TOWER","POS Reconciliation – POS-to-GL Control Center"),unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------
+# DEPLOYMENT DIAGNOSTIC
+# Shows exactly which core.py Streamlit Cloud has loaded.
+# This is intentionally visible so deployment/version mismatches can be
+# identified without guessing.
+# ---------------------------------------------------------------------
+DEPLOYMENT_BUILD = "POS_RECON_CORE_DIAGNOSTIC_2026_08_10_V1"
+
+try:
+    _core_source = inspect.getsource(core.read_upload)
+except Exception as _diag_err:
+    _core_source = f"Unable to inspect core.read_upload: {_diag_err}"
+
+_core_file = getattr(core, "__file__", "Unknown")
+_core_hash = hashlib.sha1(_core_source.encode("utf-8", errors="ignore")).hexdigest()[:12]
+_uses_old_parser = "pd.read_csv" in _core_source
+
+with st.expander("🛠️ Deployment Diagnostic", expanded=True):
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Page Build", DEPLOYMENT_BUILD)
+    d2.metric("core.py Hash", _core_hash)
+    d3.metric("Old pd.read_csv Path", "YES ❌" if _uses_old_parser else "NO ✅")
+
+    st.write("**Loaded core.py:**")
+    st.code(str(_core_file))
+
+    if _uses_old_parser:
+        st.error(
+            "This Streamlit process is still running an OLD core.read_upload() "
+            "that contains pd.read_csv. Replace/redeploy core.py before testing uploads."
+        )
+    else:
+        st.success(
+            "The loaded core.read_upload() is the corrected parser and does not contain pd.read_csv."
+        )
+
+    st.write("**Actual core.read_upload() running in this Streamlit process:**")
+    st.code(_core_source, language="python")
+
 
 st.markdown(theme.section_title(1,"POS-TO-GL CONTROL CENTER"),unsafe_allow_html=True)
 st.caption("One operating hub for the full lifecycle: Reconcile → Validate → Settle → Correct → Close → Configure GL → Create JV → Approve → Post to D365 → Verify → Adjust Late Transactions.")
@@ -64,7 +106,15 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
     try:
         tender_parts=[];pos_parts=[];quarantine=[]
         for f in uploads or []:
-            for sheet,df in core.read_upload(f).items():
+            try:
+                _sheets = core.read_upload(f)
+            except Exception as _read_err:
+                st.error(
+                    f"Upload parser failed for {f.name}. Loaded core.py: {_core_file} | "
+                    f"core hash: {_core_hash} | old pd.read_csv path: {_uses_old_parser}"
+                )
+                raise
+            for sheet,df in _sheets.items():
                 typ=core.classify(f"{f.name}-{sheet}",df)
                 if typ=="D365 STORE TENDER":
                     tender_parts.append(core.normalize_tender(df))
@@ -78,7 +128,15 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         # inspect all uploaded sheets directly for the mandatory D365 business keys.
         if not tender_parts:
             for f in uploads or []:
-                for sheet,df in core.read_upload(f).items():
+                try:
+                    _sheets = core.read_upload(f)
+                except Exception:
+                    st.error(
+                        f"Fallback parser failed for {f.name}. Loaded core.py: {_core_file} | "
+                        f"core hash: {_core_hash}"
+                    )
+                    raise
+                for sheet,df in _sheets.items():
                     d=core.norm_cols(df)
                     has_store=core.find(d,["store","store code","store name"])
                     has_date=core.find(d,["transdate","transaction date","sales date","date"])
@@ -90,7 +148,15 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         if not tender_parts:
             detected=[]
             for f in uploads or []:
-                for sheet,df in core.read_upload(f).items():
+                try:
+                    _sheets = core.read_upload(f)
+                except Exception:
+                    st.error(
+                        f"Detection parser failed for {f.name}. Loaded core.py: {_core_file} | "
+                        f"core hash: {_core_hash}"
+                    )
+                    raise
+                for sheet,df in _sheets.items():
                     detected.append(f"{f.name} / {sheet}: {core.classify(f.name,df)} | Columns: {', '.join(map(str, list(df.columns)[:12]))}")
             detail="\n".join(detected) if detected else "No upload files found."
             raise ValueError(
@@ -120,7 +186,15 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         banks=[]
         bank_skipped=[]
         for f in bank_uploads or []:
-            for sheet,df in core.read_upload(f).items():
+            try:
+                _sheets = core.read_upload(f)
+            except Exception:
+                st.error(
+                    f"Bank parser failed for {f.name}. Loaded core.py: {_core_file} | "
+                    f"core hash: {_core_hash}"
+                )
+                raise
+            for sheet,df in _sheets.items():
                 bank="Al Rajhi Bank" if "rajhi" in f.name.lower() else "ANB Bank"
                 try:
                     b=core.normalize_bank(df,bank)
