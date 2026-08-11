@@ -336,6 +336,16 @@ def classify(name,df):
 
     d=norm_cols(df)
 
+    # D365 Sales Details: used as a controlled bridge for Store 613.
+    # Must be detected before Store Tender because some Sales Details exports
+    # can also carry Receipt ID / Auth-like reference columns.
+    sd_store=find(d,["store id","store","store code"])
+    sd_sales_order=find(d,["sales order","salesorder","sales order no","sales order number"])
+    sd_receipt=find(d,["receipt id","receiptid","receipt"])
+    sd_invoice=find(d,["invoice","invoice id","invoice number","invoice no"])
+    if sd_store and sd_sales_order and sd_receipt and sd_invoice:
+        return "D365 SALES DETAILS"
+
     # D365 Store Tender is identified by its business keys first.
     # Do NOT require payment columns to be detected before classifying it.
     has_store=find(d,["store","store code","store name"])
@@ -403,6 +413,8 @@ def normalize_tender(df):
     date=find(d,["transdate","transaction date","date","sales date"])
     receipt=find(d,["receiptid","receipt id","receipt"])
     ac=find(d,["auth code","authcode","authorization code","authorizationcode","auth"])
+    sales_order=find(d,["sales order","salesorder","sales order no","sales order number","order number","order no"])
+    tender_reference=find(d,["payment reference","payment id","reference","transaction id","voucher","invoice"])
     if not all([store,date,receipt,ac]):raise ValueError("D365 Store Tender requires Store, Transdate, Receiptid and Auth Code.")
     rows=[]
     for i,r in d.iterrows():
@@ -423,6 +435,10 @@ def normalize_tender(df):
             "Receipt ID":str(r.get(receipt,"")).strip(),
             "Auth Code":auth(r.get(ac)),
             "D365 Raw Auth Code":raw_auth,
+            "Sales Order":str(r.get(sales_order,"")).strip() if sales_order else "",
+            "StoreTender Reference":str(r.get(tender_reference,"")).strip() if tender_reference else "",
+            "SalesDetails Bridge Status":"",
+            "SalesDetails Source":"",
         }
         found=False
         for c in d.columns:
@@ -479,6 +495,164 @@ def normalize_tender(df):
         f"{r['Store Code']}|{r['Date']}|{r['Receipt ID']}|{r['Auth Code']}|{r['D365 Payment']}|{r['D365 Amount']}".encode()
     ).hexdigest()[:20],axis=1)
     return out
+
+
+def normalize_sales_details(df, source="D365 Sales Details"):
+    """
+    Normalize D365 Sales Details for reconciliation support.
+
+    Primary bridge key for Store 613:
+        Store Code + Sales Order
+
+    Receipt ID and Auth Code are evidence fields. They are never guessed:
+    only a unique non-blank value is eligible to enrich StoreTender.
+    """
+    d=norm_cols(df)
+    store=find(d,["store id","store","store code"])
+    store_name=find(d,["store name","store"])
+    sales_order=find(d,["sales order","salesorder","sales order no","sales order number"])
+    receipt=find(d,["receipt id","receiptid","receipt"])
+    invoice=find(d,["invoice","invoice id","invoice number","invoice no"])
+    invoice_date=find(d,["invoice date","invoicedate","date"])
+    ac=find(d,["auth code","authcode","authorization code","authorizationcode","authorization","approval code"])
+    if not store or not sales_order or not receipt:
+        raise ValueError("D365 Sales Details requires Store ID/Store, Sales Order and Receipt ID.")
+
+    rows=[]
+    for i,r in d.iterrows():
+        raw_store="" if pd.isna(r.get(store)) else str(r.get(store)).strip()
+        sc=STORE_MAP.get(raw_store.upper(),raw_store)
+        so="" if pd.isna(r.get(sales_order)) else str(r.get(sales_order)).strip()
+        rid="" if pd.isna(r.get(receipt)) else str(r.get(receipt)).strip()
+        if not sc or not so:
+            continue
+        rows.append({
+            "SalesDetails Row":i+1,
+            "Store Code":sc,
+            "Store Name":("" if not store_name or pd.isna(r.get(store_name)) else str(r.get(store_name)).strip()),
+            "Sales Order":so,
+            "Receipt ID":rid,
+            "Auth Code":auth(r.get(ac)) if ac else "",
+            "Invoice":("" if not invoice or pd.isna(r.get(invoice)) else str(r.get(invoice)).strip()),
+            "Invoice Date":dt(r.get(invoice_date)) if invoice_date else pd.NaT,
+            "SalesDetails Source":source,
+        })
+    return pd.DataFrame(rows)
+
+def enrich_store613_from_sales_details(tender, sales_details):
+    """
+    Enrich Store 613 StoreTender rows with D365 SalesDetails.
+
+    Rules:
+      - Applies only to Store Code 613.
+      - Match key is Store Code + Sales Order.
+      - Fill Receipt ID only when SalesDetails has exactly one unique non-blank Receipt ID.
+      - Fill Auth Code only when SalesDetails has exactly one unique non-blank Auth Code.
+      - Never overwrite an existing StoreTender Receipt ID/Auth Code.
+      - Ambiguous/missing SalesDetails mappings are explicitly flagged.
+      - Recompute D365 duplicate / unique transaction controls after enrichment.
+    """
+    if tender is None or tender.empty:
+        return tender, pd.DataFrame()
+    out=tender.copy()
+    for c,default in [
+        ("Sales Order",""),("SalesDetails Bridge Status",""),
+        ("SalesDetails Source",""),("Receipt ID",""),("Auth Code","")
+    ]:
+        if c not in out.columns:
+            out[c]=default
+
+    audit=[]
+    if sales_details is None or sales_details.empty:
+        mask=out["Store Code"].astype(str).str.strip().eq("613")
+        out.loc[mask,"SalesDetails Bridge Status"]="SalesDetails Missing"
+        return out, pd.DataFrame()
+
+    sd=sales_details.copy()
+    sd["Store Code"]=sd["Store Code"].astype(str).str.strip()
+    sd["Sales Order"]=sd["Sales Order"].astype(str).str.strip()
+    sd=sd[(sd["Store Code"]=="613") & sd["Sales Order"].ne("")].copy()
+
+    grouped={}
+    for so,g in sd.groupby("Sales Order",dropna=False):
+        receipts=sorted({str(x).strip() for x in g.get("Receipt ID",pd.Series(dtype=str)).dropna() if str(x).strip()})
+        auths=sorted({auth(x) for x in g.get("Auth Code",pd.Series(dtype=str)).dropna() if auth(x)})
+        sources=sorted({str(x).strip() for x in g.get("SalesDetails Source",pd.Series(dtype=str)).dropna() if str(x).strip()})
+        invoices=sorted({str(x).strip() for x in g.get("Invoice",pd.Series(dtype=str)).dropna() if str(x).strip()})
+        grouped[str(so).strip()]={
+            "receipts":receipts,"auths":auths,"sources":sources,"invoices":invoices,
+            "rows":len(g)
+        }
+
+    for idx,r in out.iterrows():
+        if str(r.get("Store Code","")).strip()!="613":
+            continue
+        so=str(r.get("Sales Order","")).strip()
+        old_receipt=str(r.get("Receipt ID","")).strip()
+        old_auth=auth(r.get("Auth Code",""))
+        if not so:
+            status="Sales Order Missing"
+            out.at[idx,"SalesDetails Bridge Status"]=status
+            audit.append({"D365 Row":r.get("D365 Row"),"Store Code":"613","Sales Order":"","Receipt ID":old_receipt,"Auth Code":old_auth,"Bridge Status":status})
+            continue
+        info=grouped.get(so)
+        if not info:
+            status="Sales Order Not Found in SalesDetails"
+            out.at[idx,"SalesDetails Bridge Status"]=status
+            audit.append({"D365 Row":r.get("D365 Row"),"Store Code":"613","Sales Order":so,"Receipt ID":old_receipt,"Auth Code":old_auth,"Bridge Status":status})
+            continue
+
+        receipts=info["receipts"]; auths=info["auths"]
+        status_bits=[]
+        if old_receipt:
+            status_bits.append("Receipt Preserved")
+        elif len(receipts)==1:
+            out.at[idx,"Receipt ID"]=receipts[0]
+            status_bits.append("Receipt Bridged")
+        elif len(receipts)>1:
+            status_bits.append("Ambiguous Receipt")
+        else:
+            status_bits.append("Receipt Missing")
+
+        if old_auth:
+            status_bits.append("Auth Preserved")
+        elif len(auths)==1:
+            out.at[idx,"Auth Code"]=auths[0]
+            out.at[idx,"D365 Raw Auth Code"]=auths[0]
+            status_bits.append("Auth Bridged")
+        elif len(auths)>1:
+            status_bits.append("Ambiguous Auth")
+        else:
+            status_bits.append("Auth Not Available")
+
+        out.at[idx,"SalesDetails Source"]=" | ".join(info["sources"])
+        status="; ".join(status_bits)
+        out.at[idx,"SalesDetails Bridge Status"]=status
+        audit.append({
+            "D365 Row":r.get("D365 Row"),"Store Code":"613","Sales Order":so,
+            "Receipt ID":out.at[idx,"Receipt ID"],"Auth Code":out.at[idx,"Auth Code"],
+            "Bridge Status":status,"SalesDetails Rows":info["rows"],
+            "Invoices":" | ".join(info["invoices"]),
+            "SalesDetails Source":out.at[idx,"SalesDetails Source"],
+        })
+
+    # Recompute controls because identity fields may have changed.
+    out["D365 Match Key"]=out.apply(
+        lambda r: f"{str(r['Store Code']).strip()}|"
+                  f"{pd.to_datetime(r['Date'],errors='coerce').strftime('%Y-%m-%d') if pd.notna(pd.to_datetime(r['Date'],errors='coerce')) else ''}|"
+                  f"{auth(r['Auth Code'])}|{_norm_payment(r['D365 Payment'])}|"
+                  f"{float(r['D365 Amount']):.2f}",
+        axis=1
+    )
+    out["D365 Duplicate"]=out.duplicated(
+        ["Store Code","Auth Code","D365 Payment","D365 Amount"],keep=False
+    ) & out["Auth Code"].astype(str).str.strip().ne("")
+    out["Unique Transaction ID"]=out.apply(lambda r: hashlib.sha1(
+        f"{r['Store Code']}|{r['Date']}|{r['Receipt ID']}|{r['Auth Code']}|{r.get('Sales Order','')}|{r['D365 Payment']}|{r['D365 Amount']}".encode()
+    ).hexdigest()[:20],axis=1)
+
+    return out, pd.DataFrame(audit)
+
 
 def is_pos_summary_or_nontransaction(row, terminal_col=None, auth_col=None, date_col=None, payment_col=None):
     """
@@ -1104,6 +1278,10 @@ def reconcile(tender,pos,tolerance=1.0):
             "Date":s["Date"],
             "Receipt ID":s["Receipt ID"],
             "Auth Code":s["Auth Code"],
+            "Sales Order":s.get("Sales Order",""),
+            "SalesDetails Bridge Status":s.get("SalesDetails Bridge Status",""),
+            "SalesDetails Source":s.get("SalesDetails Source",""),
+            "StoreTender Reference":s.get("StoreTender Reference",""),
             "Provider Reference":sel["Auth Code"] if payment in {"TABBY","TAMARA"} else "",
             "Provider Reference Key":provider_ref_key(sel["Auth Code"]) if payment in {"TABBY","TAMARA"} else "",
             "Payment Type":payment,
