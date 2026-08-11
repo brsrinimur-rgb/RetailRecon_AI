@@ -490,7 +490,11 @@ def normalize_tender(df):
                   f"{float(r['D365 Amount']):.2f}",
         axis=1
     )
-    out["D365 Duplicate"]=out.duplicated(["Store Code","Auth Code","D365 Payment","D365 Amount"],keep=False)
+    # True D365 duplicate control:
+    # Auth codes can legitimately repeat across different dates/receipts.
+    # A row is only a duplicate when the business transaction identity repeats.
+    _dup_cols=["Store Code","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount"]
+    out["D365 Duplicate"]=out.duplicated(_dup_cols,keep=False)
     out["Unique Transaction ID"]=out.apply(lambda r: hashlib.sha1(
         f"{r['Store Code']}|{r['Date']}|{r['Receipt ID']}|{r['Auth Code']}|{r['D365 Payment']}|{r['D365 Amount']}".encode()
     ).hexdigest()[:20],axis=1)
@@ -644,9 +648,8 @@ def enrich_store613_from_sales_details(tender, sales_details):
                   f"{float(r['D365 Amount']):.2f}",
         axis=1
     )
-    out["D365 Duplicate"]=out.duplicated(
-        ["Store Code","Auth Code","D365 Payment","D365 Amount"],keep=False
-    ) & out["Auth Code"].astype(str).str.strip().ne("")
+    _dup_cols=["Store Code","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount"]
+    out["D365 Duplicate"]=out.duplicated(_dup_cols,keep=False)
     out["Unique Transaction ID"]=out.apply(lambda r: hashlib.sha1(
         f"{r['Store Code']}|{r['Date']}|{r['Receipt ID']}|{r['Auth Code']}|{r.get('Sales Order','')}|{r['D365 Payment']}|{r['D365 Amount']}".encode()
     ).hexdigest()[:20],axis=1)
@@ -1110,6 +1113,75 @@ def classify_unmatched_pos_row(r):
 
     return "Missing D365"
 
+
+def _auto_resolution_signature_candidates(s, pos_pool, tolerance=1.0):
+    """
+    Final deterministic candidate finder used before manual correction.
+
+    This NEVER changes D365 data. It only proves a one-to-one match using
+    strong transaction evidence that is already present:
+      A) Store + Payment + normalized Auth + exact amount
+      B) Store + Date + Payment + exact amount
+      C) Store + Date + Payment + amount within approved tolerance
+
+    It returns a candidate only when exactly one provider/POS row satisfies
+    the rule. Ambiguous cases remain exceptions for maker-checker review.
+    """
+    if pos_pool is None or pos_pool.empty:
+        return None,""
+
+    payment=_norm_payment(s.get("D365 Payment",""))
+    store=str(s.get("Store Code","")).strip()
+    ad=auth(s.get("Auth Code",""))
+    amt=float(s.get("D365 Amount",0) or 0)
+    ddate=pd.to_datetime(s.get("Date"),errors="coerce")
+
+    x=pos_pool.copy()
+    if "POS Payment" not in x.columns or "POS Amount" not in x.columns:
+        return None,""
+    x["POS Payment"]=x["POS Payment"].apply(_norm_payment)
+    x=x[x["POS Payment"]==payment].copy()
+    if x.empty:return None,""
+
+    # Store must be reliable and equal for auto-resolution.
+    if "POS Store" not in x.columns:
+        return None,""
+    reliable=x["POS Store"].astype(str).str.fullmatch(r"\d+")
+    if "Terminal Store Mapped" in x.columns:
+        reliable = reliable | x["Terminal Store Mapped"].fillna(False)
+    if "Merchant Store Mapped" in x.columns:
+        reliable = reliable | x["Merchant Store Mapped"].fillna(False)
+    x=x[reliable & (x["POS Store"].astype(str).str.strip()==store)].copy()
+    if x.empty:return None,""
+
+    # Never consume master-data/date-validation exceptions automatically.
+    for c in ["Terminal Mapping Required","Merchant Mapping Required"]:
+        if c in x.columns:
+            x=x[~x[c].fillna(False)].copy()
+    if x.empty:return None,""
+
+    x["_ABS"]=(pd.to_numeric(x["POS Amount"],errors="coerce")-amt).abs()
+
+    # A. Normalized Auth + exact amount.
+    if ad and "Auth Code" in x.columns:
+        xa=x[x["Auth Code"].apply(auth)==ad]
+        xa=xa[xa["_ABS"]<=0.005]
+        if len(xa)==1:
+            return xa.iloc[0],"AUTO: Store + Normalized Auth + Tender + Exact Amount"
+
+    # B/C. Same transaction date + amount.
+    if pd.notna(ddate) and "POS Date" in x.columns:
+        xd=x[pd.to_datetime(x["POS Date"],errors="coerce").dt.normalize()==ddate.normalize()].copy()
+        exact=xd[xd["_ABS"]<=0.005]
+        if len(exact)==1:
+            return exact.iloc[0],"AUTO: Store + Date + Tender + Exact Amount"
+        within=xd[xd["_ABS"]<=float(tolerance)]
+        if len(within)==1:
+            return within.iloc[0],"AUTO: Store + Date + Tender + Approved Tolerance"
+
+    return None,""
+
+
 def reconcile(tender,pos,tolerance=1.0):
     """
     Evidence-based reconciliation.
@@ -1136,10 +1208,12 @@ def reconcile(tender,pos,tolerance=1.0):
     uns=[]
 
     for _,s in tender.reset_index(drop=True).iterrows():
-        # Keep true D365 duplicates as exceptions.
-        if s.get("D365 Duplicate",False):
+        # Keep only transaction-identical D365 duplicates as exceptions.
+        # Same Auth Code on another date/receipt is NOT a duplicate.
+        if bool(s.get("D365 Duplicate",False)):
             rr=s.to_dict()
-            rr["Reason"]="Duplicate D365 - requires manual review"
+            rr["Reason"]="True duplicate D365 transaction - requires manual review"
+            rr["Auto Resolution Status"]="Manual Review - True Duplicate"
             uns.append(rr)
             continue
 
@@ -1264,8 +1338,22 @@ def reconcile(tender,pos,tolerance=1.0):
                         reason=f"Multiple {payment} candidates within SAR {tolerance:.2f} tolerance"
 
         if sel is None:
+            # Final deterministic auto-resolution pass. This is intentionally
+            # conservative: exactly one strong candidate is required.
+            remaining=pos[~pos.index.isin(used)].copy()
+            auto_sel,auto_rule=_auto_resolution_signature_candidates(
+                s,remaining,tolerance
+            )
+            if auto_sel is not None:
+                sel=auto_sel
+                rule=auto_rule
+                status="Matched"
+                reason=""
+
+        if sel is None:
             rr=s.to_dict()
             rr["Reason"]=reason or "Missing settlement"
+            rr["Auto Resolution Status"]="Manual Review Required"
             uns.append(rr)
             continue
 
@@ -1293,6 +1381,7 @@ def reconcile(tender,pos,tolerance=1.0):
             "Difference":diff,
             "Status":status,
             "Match Rule":rule,
+            "Auto Resolution Status":"Automatically Resolved" if str(rule).startswith("AUTO:") else "Primary Match Rule",
             "POS Date":sel["POS Date"],
             "Posting Date":sel["Posting Date"],
             "Settlement Delay Days":sel["Settlement Delay Days"],

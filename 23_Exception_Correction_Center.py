@@ -9,8 +9,10 @@ st.markdown(theme.global_css(),unsafe_allow_html=True)
 st.markdown(theme.top_banner("RETAIL CONTROL TOWER","Exception Correction Center"),unsafe_allow_html=True)
 st.title("Exception Correction Center")
 st.caption(
-    "Controlled Auth Code corrections: Maker submits → Checker/Finance Manager approves or rejects "
-    "→ approved value becomes effective in reconciliation. The maker cannot approve their own request."
+    "Only genuinely unresolved exceptions reach this page. Safe one-to-one matches are resolved "
+    "automatically by the reconciliation engine first. Manual Auth Code changes remain controlled: "
+    "Maker submits → Checker/Finance Manager approves or rejects → approved value becomes effective. "
+    "The maker cannot approve their own request."
 )
 
 user=st.session_state.user
@@ -25,6 +27,8 @@ if not r:
 # ------------------------------------------------------------- SUBMIT
 st.subheader("1. Submit Correction")
 u=r.get("unmatched_sales",pd.DataFrame()).copy()
+if not u.empty and "Auto Resolution Status" not in u.columns:
+    u["Auto Resolution Status"]="Manual Review Required"
 if u.empty:
     st.info("No unmatched D365 transactions are available for correction.")
 else:
