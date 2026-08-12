@@ -122,6 +122,25 @@ def init_db():
         updated_at TEXT,
         notes TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS gl_control_mapping (
+        main_account TEXT PRIMARY KEY,
+        gl_group TEXT,
+        payment_types TEXT,
+        account_name TEXT,
+        active TEXT,
+        notes TEXT,
+        updated_at TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS gl_verification_runs (
+        run_id TEXT PRIMARY KEY,
+        time TEXT,
+        user TEXT,
+        legal_entity TEXT,
+        status TEXT,
+        summary_json TEXT,
+        detail_json TEXT
+    )""")
+
     conn.execute("""CREATE TABLE IF NOT EXISTS accounting_period_audit (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         time TEXT,
@@ -270,6 +289,109 @@ def update_jv_posting(batch: str, voucher: str):
     )
     conn.commit()
     conn.close()
+
+
+
+# ------------------------------------------------------------- D365 GL Control
+_GL_CONTROL_DEFAULTS = [
+    ("11020907","CARD","MADA,VISA,MASTERCARD","POS Clearing - DC/CC","Yes","MADA + VISA + MASTERCARD"),
+    ("11020901","AMEX","AMEX","POS Clearing - AMEX","Yes","AMEX"),
+    ("11020902","CASH","CASH","POS Clearing - Cash/Cheques","Yes","Cash / Cheques"),
+    ("11020913","TABBY","TABBY","POS/Online Clearing - Tabby","Yes","Tabby"),
+    ("11020922","TAMARA","TAMARA","POS/Online Clearing - Tamara","Yes","Tamara"),
+    ("11020904","TAP","TAP","POS Clearing - Tap","Yes","TAP POS clearing"),
+    ("11020908","TAP_GATEWAY","TAP","Online Clearing - Tap Gateway","Yes","Store 613 / online TAP gateway observed in D365 GL"),
+]
+
+def _seed_gl_control_mapping():
+    conn=get_conn()
+    now=datetime.now().isoformat(timespec="seconds")
+    for row in _GL_CONTROL_DEFAULTS:
+        conn.execute(
+            """INSERT OR IGNORE INTO gl_control_mapping
+               (main_account,gl_group,payment_types,account_name,active,notes,updated_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (*row,now)
+        )
+    conn.commit();conn.close()
+
+def load_gl_control_mapping():
+    _seed_gl_control_mapping()
+    conn=get_conn()
+    d=pd.read_sql_query(
+        """SELECT main_account AS 'Main Account', gl_group AS 'GL Group',
+                  payment_types AS 'Payment Types', account_name AS 'Account Name',
+                  active AS 'Active', notes AS 'Notes', updated_at AS 'Updated At'
+           FROM gl_control_mapping ORDER BY main_account""",conn
+    )
+    conn.close()
+    return d
+
+def save_gl_control_mapping(df):
+    if df is None:
+        return
+    d=df.copy()
+    required=["Main Account","GL Group","Payment Types","Account Name","Active"]
+    missing=[c for c in required if c not in d.columns]
+    if missing:
+        raise ValueError("GL Control Mapping missing columns: "+", ".join(missing))
+    d["Main Account"]=d["Main Account"].astype(str).str.strip()
+    if d["Main Account"].eq("").any() or d["Main Account"].duplicated().any():
+        raise ValueError("Main Account must be populated and unique.")
+    conn=get_conn();now=datetime.now().isoformat(timespec="seconds")
+    conn.execute("DELETE FROM gl_control_mapping")
+    rows=[]
+    for _,r in d.iterrows():
+        rows.append((
+            str(r["Main Account"]).strip(),str(r["GL Group"]).strip(),
+            str(r["Payment Types"]).strip(),str(r["Account Name"]).strip(),
+            str(r["Active"]).strip(),str(r.get("Notes","")).strip(),now
+        ))
+    conn.executemany(
+        """INSERT INTO gl_control_mapping
+           (main_account,gl_group,payment_types,account_name,active,notes,updated_at)
+           VALUES (?,?,?,?,?,?,?)""",rows
+    )
+    conn.commit();conn.close()
+
+def save_gl_verification_run(summary:dict, detail:dict, user:str, legal_entity="ULC"):
+    payload=json.dumps(summary or {},default=str,sort_keys=True)
+    stamp=datetime.now().isoformat(timespec="seconds")
+    run_id="GL-"+datetime.now().strftime("%Y%m%d%H%M%S")+"-"+__import__("hashlib").sha1(payload.encode()).hexdigest()[:6]
+    status=str((summary or {}).get("Overall Status","REVIEW"))
+    # detail is stored as JSON records so the verification snapshot survives browser/session changes.
+    detail_clean={}
+    for k,v in (detail or {}).items():
+        if isinstance(v,pd.DataFrame):
+            detail_clean[k]=json.loads(v.to_json(orient="records",date_format="iso"))
+        else:
+            detail_clean[k]=v
+    conn=get_conn()
+    conn.execute(
+        """INSERT OR REPLACE INTO gl_verification_runs
+           (run_id,time,user,legal_entity,status,summary_json,detail_json)
+           VALUES (?,?,?,?,?,?,?)""",
+        (run_id,stamp,user,legal_entity,status,payload,json.dumps(detail_clean,default=str))
+    )
+    conn.commit();conn.close()
+    return run_id
+
+def load_gl_verification_runs(limit=50):
+    conn=get_conn()
+    rows=conn.execute(
+        """SELECT run_id,time,user,legal_entity,status,summary_json
+           FROM gl_verification_runs ORDER BY time DESC LIMIT ?""",(int(limit),)
+    ).fetchall()
+    conn.close()
+    out=[]
+    for run_id,time,user,entity,status,summary_json in rows:
+        rec={"Run ID":run_id,"Time":time,"User":user,"Legal Entity":entity,"Status":status}
+        try:
+            rec.update(json.loads(summary_json or "{}"))
+        except Exception:
+            pass
+        out.append(rec)
+    return pd.DataFrame(out)
 
 
 # ------------------------------------------------------------- approval log

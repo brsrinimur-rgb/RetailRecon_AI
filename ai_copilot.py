@@ -369,6 +369,12 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
     elif any(x in ql for x in ["missing d365","provider only"]):
         intent="missing_d365"
     elif any(x in ql for x in [
+        "gl status","gl verified","d365 gl","gl mismatch","gl exception","gl exceptions",
+        "unexplained gl","explain gl","gl balance","clearing balance","clearing movement",
+        "which stores gl","gl not found","jv to gl","source to gl"
+    ]):
+        intent="gl_control"
+    elif any(x in ql for x in [
         "biggest risk","highest risk","risk today","risks today","top risk","top risks",
         "priority exception","priority exceptions","what needs attention","needs attention",
         "anomaly","anomalies","control risk"
@@ -1278,6 +1284,61 @@ def _fc_help():
     ]
     return {"text":"I can answer application-grounded Finance Control questions across sales, reconciliation, settlement, providers, controls, close/JV and management reporting. I will say when the active application does not contain enough data.","table":pd.DataFrame(groups,columns=["Area","Examples"])}
 
+
+def _gl_control_answer(result,ctx,question=""):
+    trace=result.get("gl_source_trace",pd.DataFrame()) if result else pd.DataFrame()
+    jv=result.get("gl_jv_verification",pd.DataFrame()) if result else pd.DataFrame()
+    exc=result.get("gl_exceptions",pd.DataFrame()) if result else pd.DataFrame()
+    clearing=result.get("gl_clearing_control",pd.DataFrame()) if result else pd.DataFrame()
+    ql=str(question or "").lower()
+
+    if trace.empty and jv.empty and exc.empty and clearing.empty:
+        return {
+            "text":"I don't have an active D365 GL Control result yet. Open **D365 GL Reconciliation**, upload the General Journal Account Entry files and run the GL control first.",
+            "table":pd.DataFrame()
+        }
+
+    def scoped(df,store_col="Store Code"):
+        if df is None or df.empty:return pd.DataFrame()
+        x=df.copy()
+        if ctx.store_codes and store_col in x.columns:
+            x=x[x[store_col].map(_norm_store).isin(ctx.store_codes)]
+        return x
+
+    trace=scoped(trace)
+    jv=scoped(jv)
+    exc=scoped(exc)
+    clearing=scoped(clearing)
+
+    if "exception" in ql or "mismatch" in ql or "not found" in ql or "unexplained" in ql:
+        amount=float(pd.to_numeric(exc.get("Amount",0),errors="coerce").fillna(0).sum()) if not exc.empty else 0
+        return {
+            "text":f"For **{_scope_text(ctx)}**, I found **{len(exc):,} D365 GL control exception(s)** with gross reviewed exposure of **{_fmt_sar(amount)}**.",
+            "table":exc.head(500)
+        }
+
+    if "balance" in ql or "movement" in ql or "clearing" in ql:
+        net=float(pd.to_numeric(clearing.get("Net GL Movement",0),errors="coerce").fillna(0).sum()) if not clearing.empty else 0
+        return {
+            "text":f"For **{_scope_text(ctx)}**, the uploaded D365 clearing extracts show net signed GL movement of **{_fmt_sar(net)}**. This is a movement control, not a certified closing balance unless the uploaded population is complete.",
+            "table":clearing.head(500)
+        }
+
+    sm=int((trace.get("GL Trace Status",pd.Series(dtype=str))=="GL MATCHED").sum()) if not trace.empty else 0
+    sx=len(trace)
+    jm=int((jv.get("GL Verification Status",pd.Series(dtype=str))=="GL MATCHED").sum()) if not jv.empty else 0
+    jx=len(jv)
+    text=(
+        f"D365 GL control for **{_scope_text(ctx)}**: Source → GL **{sm:,}/{sx:,} matched**; "
+        f"JV → GL **{jm:,}/{jx:,} matched**; **{len(exc):,} GL exception(s)** remain."
+    )
+    if len(exc)==0 and (sx==0 or sm==sx) and (jx==0 or jm==jx):
+        text+=" Current uploaded scope is **D365 GL VERIFIED**."
+    else:
+        text+=" Status is **GL REVIEW REQUIRED**."
+    return {"text":text,"table":exc.head(100) if not exc.empty else trace.head(100)}
+
+
 def answer_question(question, result, db_module=None, prior_context=None, user_context=None):
     if not result:
         return {
@@ -1331,6 +1392,8 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
             payload=_cash_report(result,ctx,question,db_module)
         else:
             payload=_sales_answer(result,ctx,detail=True,db_module=db_module)
+    elif intent=="gl_control":
+        payload=_gl_control_answer(result,ctx,question)
     elif intent=="risk":
         payload=_risk_answer(result,ctx,question,db_module)
     elif intent=="store_performance":

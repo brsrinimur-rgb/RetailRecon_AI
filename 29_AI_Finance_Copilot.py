@@ -88,6 +88,16 @@ if r3.button("Provider performance",use_container_width=True):
 if r4.button("Top 10 risks",use_container_width=True):
     quick="show top 10 risks"
 
+g1,g2,g3,g4=st.columns(4)
+if g1.button("D365 GL status",use_container_width=True):
+    quick="show d365 gl status"
+if g2.button("GL exceptions",use_container_width=True):
+    quick="show gl exceptions"
+if g3.button("Clearing movement",use_container_width=True):
+    quick="show clearing movement"
+if g4.button("Unexplained GL",use_container_width=True):
+    quick="show unexplained gl"
+
 s1,s2,s3,s4=st.columns(4)
 if s1.button("Finance briefing",use_container_width=True):
     quick="give me a finance briefing"

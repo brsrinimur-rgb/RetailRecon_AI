@@ -53,6 +53,7 @@ card(c,"D365 Posting Center","Controlled posting queue with duplicate protection
 a,b,c=st.columns(3)
 card(a,"D365 Posting Verification","Capture voucher/status and verify successful posting.","pages/27_D365_Posting_Verification.py","🔎")
 card(b,"Late Transaction Adjustment JV","Create controlled adjustment/reversal JV for late transactions after close.","pages/28_Late_Transaction_Adjustment_JV.py","🔁")
+card(c,"D365 GL Reconciliation","Independently verify RetailRecon source/JVs against actual D365 clearing-account entries.","pages/30_D365_GL_Reconciliation.py","📚")
 
 st.divider()
 st.markdown(theme.section_title(4,"POS Reconciliation Functions"),unsafe_allow_html=True)

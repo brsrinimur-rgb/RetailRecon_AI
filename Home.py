@@ -16,3 +16,5 @@ c3.metric("Posting","Maker-Checker")
 
 st.page_link("pages/1_POS_Reconciliation.py",label="Open POS Reconciliation",icon="🧾")
 st.page_link("pages/29_AI_Finance_Copilot.py",label="Open AI Finance Copilot",icon="🤖")
+
+st.page_link("pages/30_D365_GL_Reconciliation.py",label="Open D365 GL Reconciliation",icon="📚")

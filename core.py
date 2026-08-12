@@ -1627,6 +1627,560 @@ def _d365_dimension(account, store_code, department=""):
         return f"{account}-{store_code}--{department}"
     return f"{account}-{store_code}---"
 
+
+# =====================================================================
+# D365 GENERAL LEDGER / CLEARING CONTROL
+# =====================================================================
+
+D365_CLEARING_ACCOUNT_MAP = {
+    "11020907": {"group":"CARD", "account_name":"POS Clearing - DC/CC", "payments":["MADA","VISA","MASTERCARD"]},
+    "11020901": {"group":"AMEX", "account_name":"POS Clearing - AMEX", "payments":["AMEX"]},
+    "11020902": {"group":"CASH", "account_name":"POS Clearing - Cash/Cheques", "payments":["CASH"]},
+    "11020913": {"group":"TABBY", "account_name":"POS/Online Clearing - Tabby", "payments":["TABBY"]},
+    "11020922": {"group":"TAMARA", "account_name":"POS/Online Clearing - Tamara", "payments":["TAMARA"]},
+    "11020904": {"group":"TAP", "account_name":"POS Clearing - Tap", "payments":["TAP"]},
+    "11020908": {"group":"TAP_GATEWAY", "account_name":"Online Clearing - Tap Gateway", "payments":["TAP"]},
+}
+
+def _gl_text(v):
+    if v is None or (isinstance(v,float) and pd.isna(v)):
+        return ""
+    return str(v).strip()
+
+def _gl_main_store_dimension(ledger_account):
+    """
+    Parse D365 dimension strings such as:
+        11020907-601--Sale-10415---
+        11020913-613------
+    Returns main account, store and the untouched ledger dimension.
+    """
+    raw=_gl_text(ledger_account)
+    parts=raw.split("-")
+    main=parts[0].strip() if parts else ""
+    store=""
+    if len(parts)>1:
+        p=parts[1].strip()
+        if re.fullmatch(r"\d{3}",p):
+            store=p
+    return main,store,raw
+
+def _gl_sales_order(description):
+    s=_gl_text(description).upper()
+    m=re.search(r"\b(SO[A-Z0-9]*-\d+)\b",s)
+    return m.group(1) if m else ""
+
+def _gl_event_type(description,amount_value):
+    s=_gl_text(description).upper()
+    if any(k in s for k in ["WRONG PUNCHED","REVERS","CORRECTION","CORRECTED","RECLASS"]):
+        return "REVERSAL / CORRECTION"
+    if "STATEMENT DIFFERENCE" in s:
+        return "STATEMENT DIFFERENCE"
+    try:
+        a=float(amount_value)
+    except Exception:
+        a=0.0
+    return "POSITIVE CLEARING MOVEMENT" if a>0 else ("NEGATIVE CLEARING MOVEMENT" if a<0 else "ZERO MOVEMENT")
+
+def normalize_d365_gl(df, source="D365 GL"):
+    """
+    Normalize Microsoft D365 General journal account entry exports.
+
+    Exact source columns observed in Finance samples:
+      Journal number, Voucher, Date, Year closed, Type, Ledger account,
+      Account name, Description, Currency, Amount in transaction currency,
+      Amount, Amount in reporting currency.
+
+    No accounting meaning is guessed from sign alone. Signed Amount is retained
+    exactly as exported and reversal/correction indicators come from evidence
+    such as Description and opposite-sign journal movements.
+    """
+    d=norm_cols(df)
+    journal=find(d,["journal number","journal no","journal"])
+    voucher=find(d,["voucher","voucher number"])
+    date=find(d,["date","accounting date"])
+    ledger=find(d,["ledger account","ledger dimension","account"])
+    account_name=find(d,["account name","main account name"])
+    desc=find(d,["description","text"])
+    currency=find(d,["currency","currency code"])
+    amt=find(d,["amount","accounting currency amount","amount in accounting currency"])
+    tx_amt=find(d,["amount in transaction currency","transaction currency amount"])
+    rpt_amt=find(d,["amount in reporting currency","reporting currency amount"])
+    year_closed=find(d,["year closed"])
+    typ=find(d,["type","posting type"])
+
+    required=[journal,voucher,date,ledger,amt]
+    if not all(required):
+        raise ValueError(
+            f"{source}: D365 GL export requires Journal number, Voucher, Date, Ledger account and Amount."
+        )
+
+    rows=[]
+    for i,r in d.iterrows():
+        main,store,dimension=_gl_main_store_dimension(r.get(ledger))
+        signed=amount(r.get(amt))
+        if pd.isna(signed):
+            continue
+        description=_gl_text(r.get(desc)) if desc else ""
+        info=D365_CLEARING_ACCOUNT_MAP.get(main,{})
+        rows.append({
+            "GL Row":i+1,
+            "Source File":source,
+            "Journal Number":_gl_text(r.get(journal)),
+            "Voucher":_gl_text(r.get(voucher)),
+            "GL Date":dt(r.get(date)),
+            "Year Closed":_gl_text(r.get(year_closed)) if year_closed else "",
+            "Posting Type":_gl_text(r.get(typ)) if typ else "",
+            "Ledger Account":dimension,
+            "Main Account":main,
+            "Store Code":store,
+            "Account Name":_gl_text(r.get(account_name)) if account_name else info.get("account_name",""),
+            "Description":description,
+            "Currency":_gl_text(r.get(currency)) if currency else "",
+            "Transaction Currency Amount":amount(r.get(tx_amt)) if tx_amt else np.nan,
+            "Signed Amount":float(signed),
+            "Absolute Amount":abs(float(signed)),
+            "Reporting Currency Amount":amount(r.get(rpt_amt)) if rpt_amt else np.nan,
+            "GL Group":info.get("group","UNMAPPED"),
+            "Expected Payments":" / ".join(info.get("payments",[])),
+            "Sales Order":_gl_sales_order(description),
+            "GL Event Type":_gl_event_type(description,signed),
+            "Controlled Clearing Account":main in D365_CLEARING_ACCOUNT_MAP,
+        })
+
+    out=pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out["GL Period"]=pd.to_datetime(out["GL Date"],errors="coerce").dt.to_period("M").astype(str)
+    out["GL Date Key"]=pd.to_datetime(out["GL Date"],errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    out["GL Fingerprint"]=out.apply(
+        lambda r: hashlib.sha1(
+            f"{r['Journal Number']}|{r['Voucher']}|{r['GL Date Key']}|{r['Ledger Account']}|"
+            f"{r['Signed Amount']:.3f}|{r['Description']}".encode()
+        ).hexdigest()[:20],axis=1
+    )
+    out["Duplicate GL Fingerprint"]=out.duplicated("GL Fingerprint",keep=False)
+
+    # Identify exact opposite-sign movements inside the same journal/account/store/amount.
+    keycols=["Journal Number","Main Account","Store Code","Absolute Amount"]
+    counts=out.groupby(keycols,dropna=False)["Signed Amount"].agg(
+        Pos=lambda s:int((s>0).sum()),
+        Neg=lambda s:int((s<0).sum())
+    ).reset_index()
+    counts["Opposite Sign Pair"]=(counts["Pos"]>0)&(counts["Neg"]>0)
+    out=out.merge(counts[keycols+["Opposite Sign Pair"]],on=keycols,how="left")
+    out["Opposite Sign Pair"]=out["Opposite Sign Pair"].fillna(False)
+    out.loc[
+        out["Opposite Sign Pair"] &
+        ~out["GL Event Type"].isin(["REVERSAL / CORRECTION","STATEMENT DIFFERENCE"]),
+        "GL Event Type"
+    ]="OFFSET / REVERSAL PAIR"
+    return out
+
+def _gl_expected_account_for_tender(payment_type,store_code=""):
+    p=_norm_payment(payment_type)
+    store=str(store_code).strip()
+    if p in {"MADA","VISA","MASTERCARD"}:
+        return {"11020907"}
+    if p=="AMEX":
+        return {"11020901"}
+    if p=="CASH":
+        return {"11020902"}
+    if p=="TABBY":
+        return {"11020913"}
+    if p=="TAMARA":
+        return {"11020922"}
+    if p=="TAP":
+        # Store 613 online orders are evidenced in the supplied D365 GL
+        # through Online Clearing - Tap Gateway (11020908); normal POS TAP
+        # continues to use the Finance-confirmed 11020904 clearing account.
+        return {"11020904","11020908"} if store=="613" else {"11020904"}
+    return set()
+
+def trace_d365_source_to_gl(tender,actual_gl,tolerance=1.0):
+    """
+    Independent source-to-GL evidence trace.
+
+    Store 613:
+      Sales Order is the strongest available key, because the supplied D365 GL
+      descriptions explicitly contain "Payment for order SO6-...".
+
+    Other stores:
+      Store + expected clearing account + source date + exact amount.
+      A unique same-period amount may be shown as REVIEW but never upgraded to
+      a deterministic GL match.
+
+    This function does not alter Store Tender or GL records.
+    """
+    if tender is None or tender.empty:
+        return pd.DataFrame(),actual_gl.copy() if actual_gl is not None else pd.DataFrame()
+    if actual_gl is None or actual_gl.empty:
+        out=tender.copy()
+        out["GL Trace Status"]="GL NOT FOUND"
+        out["GL Trace Rule"]="No D365 GL data uploaded"
+        return out,pd.DataFrame()
+
+    g=actual_gl[actual_gl["Controlled Clearing Account"].fillna(False)].copy()
+    used=set()
+    rows=[]
+
+    for _,s in tender.reset_index(drop=True).iterrows():
+        store=str(s.get("Store Code","")).strip()
+        pay=_norm_payment(s.get("D365 Payment",""))
+        so=str(s.get("Sales Order","")).strip().upper()
+        src_date=pd.to_datetime(s.get("Date"),errors="coerce")
+        src_amt=abs(float(pd.to_numeric(pd.Series([s.get("D365 Amount",0)]),errors="coerce").fillna(0).iloc[0]))
+        expected_accounts=_gl_expected_account_for_tender(pay,store)
+
+        pool=g[~g.index.isin(used)].copy()
+        if expected_accounts:
+            account_pool=pool[pool["Main Account"].isin(expected_accounts)].copy()
+        else:
+            account_pool=pool.copy()
+        if store:
+            store_pool=account_pool[account_pool["Store Code"].astype(str).eq(store)].copy()
+        else:
+            store_pool=account_pool.copy()
+
+        sel=None
+        status="GL NOT FOUND"
+        rule=""
+        reason=""
+
+        # Store 613: explicit Sales Order in D365 GL description is primary evidence.
+        if store=="613" and so:
+            x=pool[pool["Sales Order"].astype(str).str.upper().eq(so)].copy()
+            if len(x)==1:
+                candidate=x.iloc[0]
+                amount_diff=round(src_amt-float(candidate["Absolute Amount"]),2)
+                if expected_accounts and candidate["Main Account"] not in expected_accounts:
+                    sel=candidate
+                    status="GL ACCOUNT MISMATCH"
+                    rule="Store 613 Sales Order"
+                    reason=f"Sales Order found in GL {candidate['Main Account']}, expected {', '.join(sorted(expected_accounts))}"
+                elif abs(amount_diff)<=float(tolerance):
+                    sel=candidate
+                    status="GL MATCHED"
+                    rule="Store 613 Sales Order + Amount"
+                else:
+                    sel=candidate
+                    status="GL AMOUNT MISMATCH"
+                    rule="Store 613 Sales Order"
+                    reason=f"Source {src_amt:.2f} vs GL {float(candidate['Absolute Amount']):.2f}"
+            elif len(x)>1:
+                # If Sales Order repeats, amount can safely disambiguate only when unique.
+                x["_DIFF"]=(x["Absolute Amount"]-src_amt).abs()
+                exact=x[x["_DIFF"]<=float(tolerance)]
+                if len(exact)==1:
+                    sel=exact.iloc[0]
+                    status="GL MATCHED"
+                    rule="Store 613 Sales Order + Unique Amount"
+                else:
+                    status="GL REVIEW REQUIRED"
+                    rule="Store 613 Sales Order"
+                    reason="Multiple GL candidates for the same Sales Order"
+
+        # Other stores / fallback: store + account + date + amount.
+        if sel is None and status=="GL NOT FOUND" and not store_pool.empty:
+            x=store_pool.copy()
+            x["_DIFF"]=(x["Absolute Amount"]-src_amt).abs()
+            if pd.notna(src_date):
+                xd=x[pd.to_datetime(x["GL Date"],errors="coerce").dt.normalize()==src_date.normalize()].copy()
+            else:
+                xd=pd.DataFrame()
+
+            exact=xd[xd["_DIFF"]<=float(tolerance)] if not xd.empty else pd.DataFrame()
+            if len(exact)==1:
+                sel=exact.iloc[0]
+                status="GL MATCHED"
+                rule="Store + Clearing Account + Date + Amount"
+            elif len(exact)>1:
+                status="GL REVIEW REQUIRED"
+                rule="Store + Clearing Account + Date + Amount"
+                reason="Multiple exact GL candidates"
+            else:
+                # Period fallback is review only; never deterministic.
+                if pd.notna(src_date):
+                    xp=x[pd.to_datetime(x["GL Date"],errors="coerce").dt.to_period("M")==src_date.to_period("M")]
+                    xp=xp[xp["_DIFF"]<=float(tolerance)]
+                    if len(xp)==1:
+                        sel=xp.iloc[0]
+                        status="GL REVIEW REQUIRED"
+                        rule="Store + Clearing Account + Period + Amount"
+                        reason="Date differs; unique same-period amount candidate"
+
+        rec={
+            "Store Code":store,
+            "Source Date":src_date,
+            "Receipt ID":str(s.get("Receipt ID","")),
+            "Sales Order":str(s.get("Sales Order","")),
+            "Auth Code":str(s.get("Auth Code","")),
+            "Payment Type":pay,
+            "Source Amount":float(s.get("D365 Amount",0) or 0),
+            "Expected GL Accounts":" / ".join(sorted(expected_accounts)),
+            "GL Trace Status":status,
+            "GL Trace Rule":rule,
+            "GL Trace Reason":reason,
+            "GL Journal Number":"",
+            "GL Voucher":"",
+            "GL Date":pd.NaT,
+            "Actual Main Account":"",
+            "Actual Ledger Account":"",
+            "Actual GL Amount":np.nan,
+            "GL Description":"",
+            "GL Source File":"",
+            "GL Fingerprint":"",
+        }
+        if sel is not None:
+            used.add(sel.name)
+            rec.update({
+                "GL Journal Number":sel.get("Journal Number",""),
+                "GL Voucher":sel.get("Voucher",""),
+                "GL Date":sel.get("GL Date",pd.NaT),
+                "Actual Main Account":sel.get("Main Account",""),
+                "Actual Ledger Account":sel.get("Ledger Account",""),
+                "Actual GL Amount":sel.get("Signed Amount",np.nan),
+                "GL Description":sel.get("Description",""),
+                "GL Source File":sel.get("Source File",""),
+                "GL Fingerprint":sel.get("GL Fingerprint",""),
+            })
+        rows.append(rec)
+
+    trace=pd.DataFrame(rows)
+    gl_only=g[~g.index.isin(used)].copy()
+    if not gl_only.empty:
+        gl_only["GL Trace Status"]="D365 GL ONLY / SOURCE NOT TRACED"
+    return trace,gl_only
+
+def expected_clearing_from_jv(jv):
+    """Return only RetailRecon JV clearing lines that should be independently found in D365 GL."""
+    if jv is None or jv.empty:
+        return pd.DataFrame()
+    x=jv.copy()
+    main_col="Main Account" if "Main Account" in x.columns else ("Account" if "Account" in x.columns else None)
+    if not main_col:
+        return pd.DataFrame()
+    x["Main Account"]=x[main_col].astype(str).str.strip()
+    x=x[x["Main Account"].isin(D365_CLEARING_ACCOUNT_MAP)].copy()
+    if x.empty:
+        return x
+    debit=pd.to_numeric(x.get("Debit",0),errors="coerce").fillna(0.0)
+    credit=pd.to_numeric(x.get("Credit",0),errors="coerce").fillna(0.0)
+    x["Expected Signed Amount"]=debit-credit
+    x["Expected Absolute Amount"]=(debit-credit).abs()
+    x["Expected GL Date"]=pd.to_datetime(
+        x.get("JV Accounting Date",x.get("Date",pd.NaT)),errors="coerce"
+    )
+    x["Expected GL Period"]=x["Expected GL Date"].dt.to_period("M").astype(str)
+    return x
+
+def reconcile_jv_to_d365_gl(jv,actual_gl,tolerance=1.0):
+    """
+    Verify RetailRecon's approved/posted clearing lines against actual D365 GL.
+
+    Matching priority:
+      1. Captured Voucher + Main Account + Store + Amount
+      2. Main Account + Store + Accounting Date + Amount
+      3. Same period + amount -> REVIEW only
+    """
+    exp=expected_clearing_from_jv(jv)
+    if exp.empty:
+        return pd.DataFrame(),actual_gl.copy() if actual_gl is not None else pd.DataFrame()
+
+    g=actual_gl[actual_gl["Controlled Clearing Account"].fillna(False)].copy() if actual_gl is not None and not actual_gl.empty else pd.DataFrame()
+    used=set()
+    rows=[]
+    for _,e in exp.reset_index(drop=True).iterrows():
+        main=str(e.get("Main Account","")).strip()
+        store=str(e.get("Store Code",e.get("Default Dimension",""))).strip()
+        voucher=str(e.get("Voucher","")).strip()
+        d=pd.to_datetime(e.get("Expected GL Date"),errors="coerce")
+        a=float(e.get("Expected Absolute Amount",0) or 0)
+        pool=g[~g.index.isin(used)].copy() if not g.empty else pd.DataFrame()
+        x=pool[(pool["Main Account"]==main)&(pool["Store Code"].astype(str)==store)].copy() if not pool.empty else pd.DataFrame()
+        sel=None;status="GL NOT FOUND";rule="";reason=""
+
+        if voucher and not x.empty:
+            xv=x[x["Voucher"].astype(str).eq(voucher)].copy()
+            if not xv.empty:
+                xv["_DIFF"]=(xv["Absolute Amount"]-a).abs()
+                exact=xv[xv["_DIFF"]<=float(tolerance)]
+                if len(exact)==1:
+                    sel=exact.iloc[0];status="GL MATCHED";rule="Voucher + Account + Store + Amount"
+                elif len(exact)>1:
+                    status="DUPLICATE GL POSTING";rule="Voucher + Account + Store + Amount";reason="Multiple D365 GL lines satisfy the same RetailRecon voucher"
+
+        if sel is None and status=="GL NOT FOUND" and not x.empty and pd.notna(d):
+            xd=x[pd.to_datetime(x["GL Date"],errors="coerce").dt.normalize()==d.normalize()].copy()
+            xd["_DIFF"]=(xd["Absolute Amount"]-a).abs()
+            exact=xd[xd["_DIFF"]<=float(tolerance)]
+            if len(exact)==1:
+                sel=exact.iloc[0];status="GL MATCHED";rule="Account + Store + Accounting Date + Amount"
+            elif len(exact)>1:
+                status="GL REVIEW REQUIRED";rule="Account + Store + Accounting Date + Amount";reason="Multiple actual GL candidates"
+
+        if sel is None and status=="GL NOT FOUND" and not x.empty and pd.notna(d):
+            xp=x[pd.to_datetime(x["GL Date"],errors="coerce").dt.to_period("M")==d.to_period("M")].copy()
+            xp["_DIFF"]=(xp["Absolute Amount"]-a).abs()
+            exact=xp[xp["_DIFF"]<=float(tolerance)]
+            if len(exact)==1:
+                sel=exact.iloc[0];status="GL REVIEW REQUIRED";rule="Account + Store + Period + Amount";reason="Unique amount found but accounting date differs"
+
+        rec={
+            "Journal Batch":e.get("Journal Batch",e.get("Journal batch number","")),
+            "RetailRecon Voucher":voucher,
+            "Store Code":store,
+            "Group":e.get("Group",""),
+            "Expected Main Account":main,
+            "Expected GL Date":d,
+            "Expected Debit":float(pd.to_numeric(pd.Series([e.get("Debit",0)]),errors="coerce").fillna(0).iloc[0]),
+            "Expected Credit":float(pd.to_numeric(pd.Series([e.get("Credit",0)]),errors="coerce").fillna(0).iloc[0]),
+            "Expected Absolute Amount":a,
+            "GL Verification Status":status,
+            "GL Match Rule":rule,
+            "GL Verification Reason":reason,
+            "D365 Journal Number":"",
+            "D365 Voucher":"",
+            "Actual GL Date":pd.NaT,
+            "Actual Main Account":"",
+            "Actual Ledger Account":"",
+            "Actual Signed Amount":np.nan,
+            "Actual Absolute Amount":np.nan,
+            "Difference":np.nan,
+            "D365 Description":"",
+            "GL Source File":"",
+        }
+        if sel is not None:
+            used.add(sel.name)
+            rec.update({
+                "D365 Journal Number":sel.get("Journal Number",""),
+                "D365 Voucher":sel.get("Voucher",""),
+                "Actual GL Date":sel.get("GL Date",pd.NaT),
+                "Actual Main Account":sel.get("Main Account",""),
+                "Actual Ledger Account":sel.get("Ledger Account",""),
+                "Actual Signed Amount":sel.get("Signed Amount",np.nan),
+                "Actual Absolute Amount":sel.get("Absolute Amount",np.nan),
+                "Difference":round(a-float(sel.get("Absolute Amount",0)),2),
+                "D365 Description":sel.get("Description",""),
+                "GL Source File":sel.get("Source File",""),
+            })
+        rows.append(rec)
+
+    ver=pd.DataFrame(rows)
+    residual=g[~g.index.isin(used)].copy() if not g.empty else pd.DataFrame()
+    return ver,residual
+
+def d365_gl_clearing_control(actual_gl):
+    """
+    Clearing-account movement control for the uploaded GL period.
+
+    This is intentionally called 'Net GL Movement' rather than 'Closing Balance'
+    because a General Journal Account Entry extract may not contain an opening
+    balance or the full historical account population.
+    """
+    if actual_gl is None or actual_gl.empty:
+        return pd.DataFrame()
+    g=actual_gl[actual_gl["Controlled Clearing Account"].fillna(False)].copy()
+    if g.empty:
+        return pd.DataFrame()
+    g["GL Date"]=pd.to_datetime(g["GL Date"],errors="coerce")
+    g["Positive Movement"]=pd.to_numeric(g["Signed Amount"],errors="coerce").fillna(0).clip(lower=0)
+    g["Negative Movement"]=(-pd.to_numeric(g["Signed Amount"],errors="coerce").fillna(0).clip(upper=0))
+    today=pd.Timestamp.today().normalize()
+    rows=[]
+    for (main,store,name,group),x in g.groupby(["Main Account","Store Code","Account Name","GL Group"],dropna=False):
+        oldest=x["GL Date"].min()
+        newest=x["GL Date"].max()
+        rows.append({
+            "Main Account":main,
+            "Store Code":store,
+            "Account Name":name,
+            "GL Group":group,
+            "Rows":len(x),
+            "Positive Movement":round(float(x["Positive Movement"].sum()),2),
+            "Negative Movement":round(float(x["Negative Movement"].sum()),2),
+            "Net GL Movement":round(float(pd.to_numeric(x["Signed Amount"],errors="coerce").fillna(0).sum()),2),
+            "Absolute Activity":round(float(pd.to_numeric(x["Signed Amount"],errors="coerce").fillna(0).abs().sum()),2),
+            "Oldest GL Date":oldest,
+            "Newest GL Date":newest,
+            "Oldest Age Days":max(0,(today-oldest.normalize()).days) if pd.notna(oldest) else np.nan,
+            "Reversal / Offset Rows":int(x["GL Event Type"].isin(["REVERSAL / CORRECTION","OFFSET / REVERSAL PAIR","STATEMENT DIFFERENCE"]).sum()),
+            "Duplicate Fingerprint Rows":int(x["Duplicate GL Fingerprint"].fillna(False).sum()),
+        })
+    return pd.DataFrame(rows).sort_values(["Main Account","Store Code"]).reset_index(drop=True)
+
+def build_d365_gl_exceptions(source_trace,jv_verification,gl_only,actual_gl):
+    rows=[]
+    if source_trace is not None and not source_trace.empty:
+        x=source_trace[source_trace["GL Trace Status"]!="GL MATCHED"]
+        for _,r in x.iterrows():
+            rows.append({
+                "Exception Type":r.get("GL Trace Status",""),
+                "Control Layer":"SOURCE → GL",
+                "Store Code":r.get("Store Code",""),
+                "Reference":r.get("Sales Order") or r.get("Receipt ID") or r.get("Auth Code"),
+                "Main Account":r.get("Actual Main Account") or r.get("Expected GL Accounts"),
+                "Amount":abs(float(r.get("Source Amount",0) or 0)),
+                "Date":r.get("Source Date"),
+                "Reason":r.get("GL Trace Reason") or r.get("GL Trace Rule"),
+                "Voucher":r.get("GL Voucher",""),
+            })
+    if jv_verification is not None and not jv_verification.empty:
+        x=jv_verification[jv_verification["GL Verification Status"]!="GL MATCHED"]
+        for _,r in x.iterrows():
+            rows.append({
+                "Exception Type":r.get("GL Verification Status",""),
+                "Control Layer":"JV → GL",
+                "Store Code":r.get("Store Code",""),
+                "Reference":r.get("Journal Batch",""),
+                "Main Account":r.get("Expected Main Account",""),
+                "Amount":abs(float(r.get("Expected Absolute Amount",0) or 0)),
+                "Date":r.get("Expected GL Date"),
+                "Reason":r.get("GL Verification Reason") or r.get("GL Match Rule"),
+                "Voucher":r.get("RetailRecon Voucher",""),
+            })
+    if gl_only is not None and not gl_only.empty:
+        for _,r in gl_only.iterrows():
+            rows.append({
+                "Exception Type":"UNEXPECTED / UNTRACED D365 GL ENTRY",
+                "Control Layer":"GL → SOURCE",
+                "Store Code":r.get("Store Code",""),
+                "Reference":r.get("Sales Order") or r.get("GL Fingerprint"),
+                "Main Account":r.get("Main Account",""),
+                "Amount":abs(float(r.get("Signed Amount",0) or 0)),
+                "Date":r.get("GL Date"),
+                "Reason":"Controlled clearing-account entry was not consumed by the current source trace.",
+                "Voucher":r.get("Voucher",""),
+            })
+    if actual_gl is not None and not actual_gl.empty:
+        dup=actual_gl[actual_gl["Duplicate GL Fingerprint"].fillna(False)]
+        for _,r in dup.iterrows():
+            rows.append({
+                "Exception Type":"DUPLICATE GL FINGERPRINT",
+                "Control Layer":"D365 GL",
+                "Store Code":r.get("Store Code",""),
+                "Reference":r.get("GL Fingerprint",""),
+                "Main Account":r.get("Main Account",""),
+                "Amount":abs(float(r.get("Signed Amount",0) or 0)),
+                "Date":r.get("GL Date"),
+                "Reason":"Same journal/voucher/date/dimension/amount/description fingerprint appears more than once.",
+                "Voucher":r.get("Voucher",""),
+            })
+    out=pd.DataFrame(rows)
+    if not out.empty:
+        out["Age Days"]=(pd.Timestamp.today().normalize()-pd.to_datetime(out["Date"],errors="coerce").dt.normalize()).dt.days.clip(lower=0)
+        out["Priority"]=np.select(
+            [
+                out["Exception Type"].astype(str).str.contains("DUPLICATE|ACCOUNT MISMATCH",case=False,na=False),
+                (pd.to_numeric(out["Amount"],errors="coerce").fillna(0)>=10000) | (out["Age Days"].fillna(0)>7),
+            ],
+            ["CRITICAL","HIGH"],
+            default="REVIEW"
+        )
+        out=out.sort_values(["Priority","Amount"],ascending=[True,False]).reset_index(drop=True)
+    return out
+
+
 def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None):
     """
     Final D365 JV logic confirmed with Finance.
