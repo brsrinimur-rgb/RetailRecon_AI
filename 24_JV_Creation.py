@@ -43,16 +43,71 @@ if from_date>to_date:
     st.error("From Date cannot be later than To Date.")
     st.stop()
 
-# Preview uses the same hard eligibility gates as core.create_jv().
-preview=matched.copy()
-preview["_Date"]=pd.to_datetime(preview["Date"],errors="coerce").dt.date
-preview=preview[
-    (preview["Status"]=="Matched")
-    & (pd.to_numeric(preview["Difference"],errors="coerce").abs()<=1.0)
-    & (preview["Bank Settled"]==True)
-    & (preview["_Date"]>=from_date)
-    & (preview["_Date"]<=to_date)
-].copy()
+# ---------------------------------------------------------------
+# JV Eligibility Breakdown
+# ---------------------------------------------------------------
+scope=matched.copy()
+scope["_Date"]=pd.to_datetime(scope["Date"],errors="coerce").dt.date
+scope=scope[(scope["_Date"]>=from_date)&(scope["_Date"]<=to_date)].copy()
+
+scope["_Matched"]=scope.get("Status","").astype(str).eq("Matched")
+scope["_Difference"]=pd.to_numeric(scope.get("Difference",0),errors="coerce")
+scope["_Tolerance_OK"]=scope["_Difference"].abs().le(1.0)
+scope["_Bank_Settled"]=scope.get("Bank Settled",False).fillna(False).astype(bool)
+scope["_Ready"]=scope["_Matched"] & scope["_Tolerance_OK"] & scope["_Bank_Settled"]
+
+def _block_reason(row):
+    reasons=[]
+    if not bool(row["_Matched"]):
+        reasons.append("Not Matched")
+    if not bool(row["_Tolerance_OK"]):
+        reasons.append("Difference > SAR 1")
+    if not bool(row["_Bank_Settled"]):
+        reasons.append("Bank Settlement Pending")
+    return "Ready" if not reasons else "; ".join(reasons)
+
+scope["_Block Reason"]=scope.apply(_block_reason,axis=1)
+
+if not scope.empty:
+    elig_rows=[]
+    for store,g in scope.groupby("Store Code",dropna=False):
+        matched_count=int(g["_Matched"].sum())
+        settled_count=int((g["_Matched"] & g["_Tolerance_OK"] & g["_Bank_Settled"]).sum())
+        ready_count=int(g["_Ready"].sum())
+        blocked_count=int(len(g)-ready_count)
+
+        reasons=(
+            g.loc[~g["_Ready"],"_Block Reason"]
+             .astype(str)
+             .value_counts()
+             .to_dict()
+        )
+        reason_text=" | ".join(f"{k}: {v}" for k,v in reasons.items()) if reasons else "Ready"
+
+        store_name=""
+        if "Store Name" in g.columns:
+            vals=[str(x).strip() for x in g["Store Name"].dropna().astype(str) if str(x).strip() and str(x).strip()!=str(store)]
+            if vals:
+                store_name=vals[0]
+
+        elig_rows.append({
+            "Store Code":str(store),
+            "Store Name":store_name,
+            "Transactions in Period":len(g),
+            "Matched in Period":matched_count,
+            "Bank Settled & Within Tolerance":settled_count,
+            "Ready for JV":ready_count,
+            "Blocked":blocked_count,
+            "Reason":reason_text,
+        })
+    eligibility=pd.DataFrame(elig_rows).sort_values(["Ready for JV","Blocked","Store Code"],ascending=[False,False,True])
+else:
+    eligibility=pd.DataFrame(columns=[
+        "Store Code","Store Name","Transactions in Period","Matched in Period",
+        "Bank Settled & Within Tolerance","Ready for JV","Blocked","Reason"
+    ])
+
+preview=scope[scope["_Ready"]].copy()
 
 if not preview.empty:
     preview["Payment Type"]=preview["Payment Type"].apply(core._norm_payment)
@@ -74,13 +129,29 @@ if not preview.empty:
 else:
     summary=pd.DataFrame()
 
+st.markdown("### 2. JV Eligibility Breakdown — All Locations")
+st.caption(
+    "This table shows every store present in the selected period, including stores that are blocked. "
+    "Only Ready rows can move into JV Creation."
+)
+if eligibility.empty:
+    st.info("No transactions exist in the selected period.")
+else:
+    st.dataframe(eligibility,use_container_width=True,hide_index=True)
+
 m1,m2,m3,m4=st.columns(4)
 m1.metric("Selected Period",f"{from_date:%d-%b-%Y} → {to_date:%d-%b-%Y}")
 m2.metric("Eligible Matched Transactions",f"{len(preview):,}")
 m3.metric("Locations",f"{preview['Store Code'].nunique() if not preview.empty else 0:,}")
 m4.metric("JV Batches to Create",f"{len(summary):,}")
 
-st.markdown("### 2. All-Location JV Preview")
+b1,b2,b3,b4=st.columns(4)
+b1.metric("Stores in Period",f"{eligibility['Store Code'].nunique() if not eligibility.empty else 0:,}")
+b2.metric("Stores Ready",f"{int((eligibility['Ready for JV']>0).sum()) if not eligibility.empty else 0:,}")
+b3.metric("Stores Fully Blocked",f"{int((eligibility['Ready for JV']==0).sum()) if not eligibility.empty else 0:,}")
+b4.metric("Blocked Transactions",f"{int(eligibility['Blocked'].sum()) if not eligibility.empty else 0:,}")
+
+st.markdown("### 3. All-Location JV Preview")
 st.caption(
     "One batch is created for each Store + JV Group. "
     "MADA, VISA and MASTERCARD are combined into CC before batch creation."
@@ -90,7 +161,7 @@ if summary.empty:
 else:
     st.dataframe(summary,use_container_width=True,hide_index=True)
 
-st.markdown("### 3. D365 Accounting Date")
+st.markdown("### 4. D365 Accounting Date")
 period_ctrl=db.load_accounting_period_control("ULC")
 p1,p2,p3=st.columns(3)
 p1.metric("Closed Through",period_ctrl.get("Closed Through Date") or "Not set")
