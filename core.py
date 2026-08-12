@@ -1500,7 +1500,7 @@ def make_carry_forward(unmatched_sales,unmatched_pos,previous=None):
     return pd.concat(fs,ignore_index=True,sort=False) if fs else pd.DataFrame()
 
 def jv_group(payment):
-    return "CARD" if payment in {"MADA","VISA","MASTERCARD"} else payment
+    return "CC" if payment in {"MADA","VISA","MASTERCARD"} else payment
 
 def _commission_master_maps(commission_master):
     rate_map={}
@@ -2181,7 +2181,7 @@ def build_d365_gl_exceptions(source_trace,jv_verification,gl_only,actual_gl):
     return out
 
 
-def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None):
+def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None,from_date=None,to_date=None):
     """
     Final D365 JV logic confirmed with Finance.
 
@@ -2220,11 +2220,34 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
     if e.empty:
         return pd.DataFrame()
 
+    # Finance-selected JV source period. The filter is inclusive and applies
+    # to the Matched report before any store/payment grouping is performed.
+    e["_SourceDate"]=pd.to_datetime(e["Date"],errors="coerce").dt.normalize()
+    fd=pd.to_datetime(from_date,errors="coerce") if from_date is not None else pd.NaT
+    td=pd.to_datetime(to_date,errors="coerce") if to_date is not None else pd.NaT
+    if pd.notna(fd):
+        e=e[e["_SourceDate"]>=fd.normalize()].copy()
+    if pd.notna(td):
+        e=e[e["_SourceDate"]<=td.normalize()].copy()
+    if pd.notna(fd) and pd.notna(td) and fd.normalize()>td.normalize():
+        raise ValueError("JV From Date cannot be later than JV To Date.")
+    if e.empty:
+        return pd.DataFrame()
+
     rate_map,vat_map,method_map=_commission_master_maps(commission_master)
 
     e["Payment Type"]=e["Payment Type"].apply(_norm_payment)
-    e["Week"]=pd.to_datetime(e["Date"],errors="coerce").dt.to_period("W-SUN").astype(str)
     e["Group"]=e["Payment Type"].apply(jv_group)
+
+    # One JV per Store + Finance Group for the selected From/To period.
+    # If no range was supplied (backward compatibility), use the actual
+    # eligible minimum/maximum source dates.
+    actual_from=e["_SourceDate"].min()
+    actual_to=e["_SourceDate"].max()
+    period_from=fd.normalize() if pd.notna(fd) else actual_from
+    period_to=td.normalize() if pd.notna(td) else actual_to
+    period_label=f"{period_from:%d-%b-%Y} to {period_to:%d-%b-%Y}"
+    e["Week"]=period_label  # legacy DB/display column retained for compatibility
     e["_Gross"]=pd.to_numeric(e["D365 Amount"],errors="coerce").fillna(0.0).round(2)
     e["_POSBase"]=pd.to_numeric(e["POS Amount"],errors="coerce").fillna(e["_Gross"]).abs()
 
@@ -2255,7 +2278,8 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
     rows=[]
     batch_no=1
 
-    for (store,week,gp),g in e.groupby(["Store Code","Week","Group"],dropna=False):
+    for (store,gp),g in e.groupby(["Store Code","Group"],dropna=False):
+        week=period_label
         gross=round(g["_Gross"].sum(),2)
         comm=round(g["_Approved Commission"].sum(),2)
         vat=round(g["_Approved VAT"].sum(),2)
@@ -2270,7 +2294,7 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
         first_date=pd.to_datetime(g["Date"],errors="coerce").dropna()
         month,year=_d365_month_year(first_date.iloc[0] if not first_date.empty else None)
 
-        batch=f"RR-{store_code}-{week[-5:].replace('-','')}-{batch_no:03d}"
+        batch=f"RR-{store_code}-{gp}-{period_from:%Y%m%d}-{period_to:%Y%m%d}-{batch_no:03d}"
         rate_values=sorted(set(round(float(x),4) for x in g["_Rate %"].dropna().tolist()))
         rate_text=", ".join(f"{x:.2f}%" for x in rate_values)
         fee_basis=" + ".join(sorted(set(g["_Fee Basis"].astype(str))))
@@ -2278,7 +2302,8 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
         # Final confirmed payment clearing / sales GL mapping.
         # MADA + VISA + MASTERCARD are one CC weekly JV.
         sale_gl_by_group = {
-            "CARD": gl_effective["CC_GL"],
+            "CC": gl_effective["CC_GL"],
+            "CARD": gl_effective["CC_GL"],  # legacy batches
             "AMEX": gl_effective["AMEX_GL"],
             "TABBY": gl_effective["TABBY_GL"],
             "TAMARA": gl_effective["TAMARA_GL"],
@@ -2314,6 +2339,9 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
             "Store Name":store_name,
             "Brand":store_name.split()[0] if store_name else "",
             "Week":week,
+            "JV From Date":period_from,
+            "JV To Date":period_to,
+            "JV Source Period":period_label,
             "Group":gp,
             "Fee Basis":fee_basis,
             "Rate %":rate_text,
@@ -2339,7 +2367,7 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
                 "Brand Dimension":"",
                 "Department":"",
                 "Debit":net,"Credit":0.0,
-                "Description":_d365_description("BANK",store_name,month,year),
+                "Description":f"{gp}-Deposited- {store_name} - {period_label}",
             },
             {
                 **common,
@@ -2351,7 +2379,7 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
                 "Brand Dimension":"",
                 "Department":"Sale",
                 "Debit":comm,"Credit":0.0,
-                "Description":_d365_description("COMMISSION",store_name,month,year),
+                "Description":f"{gp}-Commission- {store_name} - {period_label}",
             },
             {
                 **common,
@@ -2363,7 +2391,7 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
                 "Brand Dimension":"",
                 "Department":"Sale",
                 "Debit":vat,"Credit":0.0,
-                "Description":_d365_description("VAT",store_name,month,year),
+                "Description":f"{gp}-VAT- {store_name} - {period_label}",
             },
             {
                 **common,
@@ -2375,7 +2403,7 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
                 "Brand Dimension":"",
                 "Department":"",
                 "Debit":0.0,"Credit":gross,
-                "Description":_d365_description("SALE",store_name,month,year),
+                "Description":f"{gp}-Sale- {store_name} - {period_label}",
             }
         ]
         batch_no += 1
@@ -2475,7 +2503,8 @@ def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)"):
         ).hexdigest()[:12]
 
         sale_gl_by_group={
-            "CARD": gl_effective["CC_GL"],
+            "CC": gl_effective["CC_GL"],
+            "CARD": gl_effective["CC_GL"],  # legacy batches
             "AMEX": gl_effective["AMEX_GL"],
             "TABBY": gl_effective["TABBY_GL"],
             "TAMARA": gl_effective["TAMARA_GL"],
