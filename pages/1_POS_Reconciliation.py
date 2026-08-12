@@ -37,6 +37,7 @@ card(b,"Store Mapping Master","Upload/change Provider Store Name → D365 Store 
 card(c,"POS Terminal Master","Upload/change Terminal ID → Store Code mappings without changing code.","pages/16_POS_Terminal_Master.py","🖥️")
 card(a,"Merchant ID Master","Upload/change Merchant ID → Store Code mappings for provider files with no Terminal ID.","pages/17_Merchant_ID_Master.py","🏷️")
 card(b,"Bank Claim Follow Up","Track missing/delayed settlements, claims, ownership, aging and follow-up.","pages/15_Bank_Claim_Follow_Up.py","📨")
+card(c,"AI Finance Copilot","Ask natural-language questions across sales, tenders, exceptions, settlement, corrections and JV status.","pages/29_AI_Finance_Copilot.py","🤖")
 
 st.subheader("2. Close, Configuration & Exception Control")
 a,b,c=st.columns(3)
@@ -52,6 +53,7 @@ card(c,"D365 Posting Center","Controlled posting queue with duplicate protection
 a,b,c=st.columns(3)
 card(a,"D365 Posting Verification","Capture voucher/status and verify successful posting.","pages/27_D365_Posting_Verification.py","🔎")
 card(b,"Late Transaction Adjustment JV","Create controlled adjustment/reversal JV for late transactions after close.","pages/28_Late_Transaction_Adjustment_JV.py","🔁")
+card(c,"D365 GL Reconciliation","Independently verify RetailRecon source/JVs against actual D365 clearing-account entries.","pages/30_D365_GL_Reconciliation.py","📚")
 
 st.divider()
 st.markdown(theme.section_title(4,"POS Reconciliation Functions"),unsafe_allow_html=True)
@@ -60,18 +62,23 @@ with st.sidebar:
     tolerance=st.number_input("Tolerance (SAR)",0.0,10.0,1.0,0.25)
     st.caption("Matched within approved SAR 1 tolerance can proceed only after bank settlement and Finance approval.")
 
-uploads=st.file_uploader("Upload D365 Store Tender + POS/AMEX/Tabby/Tamara/Tap files",type=["xlsx","xls","csv"],accept_multiple_files=True)
+uploads=st.file_uploader("Upload D365 Store Tender + D365 Sales Details + POS/AMEX/Tabby/Tamara/Tap files",type=["xlsx","xls","csv"],accept_multiple_files=True)
 bank_uploads=st.file_uploader("Upload Bank Statements (ANB / Al Rajhi)",type=["xlsx","xls","csv"],accept_multiple_files=True)
 prev_cf=st.file_uploader("Previous Carry Forward (optional)",type=["xlsx","xls","csv"],key="cf")
 
 if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
     try:
-        tender_parts=[];pos_parts=[];quarantine=[]
+        tender_parts=[];sales_details_parts=[];pos_parts=[];quarantine=[]
         for f in uploads or []:
             for sheet,df in core.read_upload(f).items():
                 typ=core.classify(f"{f.name}-{sheet}",df)
                 if typ=="D365 STORE TENDER":
                     tender_parts.append(core.normalize_tender(df))
+                elif typ=="D365 SALES DETAILS":
+                    try:
+                        sales_details_parts.append(core.normalize_sales_details(df,f.name))
+                    except Exception as e:
+                        quarantine.append({"File":f.name,"Sheet":sheet,"Reason":f"Sales Details: {e}"})
                 elif typ in {"POS","AMEX","TABBY","TAMARA","TAP"}:
                     forced=typ if typ in {"AMEX","TABBY","TAMARA","TAP"} else None
                     try: pos_parts.append(core.normalize_pos(df,f.name,forced))
@@ -104,6 +111,13 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
             )
 
         tender=pd.concat(tender_parts,ignore_index=True)
+        sales_details=pd.concat(sales_details_parts,ignore_index=True) if sales_details_parts else pd.DataFrame()
+
+        # Store 613 special D365 bridge:
+        # StoreTender Sales Order -> SalesDetails Sales Order -> Receipt ID / Auth Code (only if unique).
+        # This happens before corrections and POS/provider matching.
+        tender,store613_bridge=core.enrich_store613_from_sales_details(tender,sales_details)
+
         pos=pd.concat(pos_parts,ignore_index=True) if pos_parts else pd.DataFrame()
         # Apply editable store-resolution masters before matching, strictly in
         # priority order: Provider Store Name (weakest signal) -> Merchant ID ->
@@ -120,7 +134,15 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         if not pos.empty:
             pos=core.apply_terminal_master(pos,terminal_master)
 
-        matched,us,up=core.reconcile(tender,pos,tolerance)
+        # Apply maker-checker approved Auth Code corrections before matching.
+        # Original Auth Code remains preserved in the tender audit columns.
+        tender=db.apply_approved_corrections(tender)
+
+        # Cash comes directly from D365 Store Tender and never requires a POS/provider settlement.
+        cash_transactions=tender[tender["D365 Payment"].astype(str).str.upper()=="CASH"].copy() if not tender.empty else pd.DataFrame()
+        tender_for_pos=tender[tender["D365 Payment"].astype(str).str.upper()!="CASH"].copy() if not tender.empty else tender.copy()
+
+        matched,us,up=core.reconcile(tender_for_pos,pos,tolerance)
         banks=[]
         bank_skipped=[]
         for f in bank_uploads or []:
@@ -160,7 +182,9 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
             qdf=pd.concat([qdf,bqdf],ignore_index=True,sort=False)
 
         st.session_state.ct_result={"matched":matched,"unmatched_sales":us,"unmatched_pos":up,"carry_forward":cf,
-                                    "tender":tender,"pos":pos,"bank":bank,"quarantine":qdf}
+                                    "cash_transactions":cash_transactions,
+                                    "tender":tender,"sales_details":sales_details,"store613_bridge":store613_bridge,
+                                    "pos":pos,"bank":bank,"quarantine":qdf}
         st.success("Reconciliation completed and saved to the current control-tower session.")
     except Exception as e:
         st.exception(e)
@@ -168,16 +192,35 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
 r=st.session_state.get("ct_result")
 if r:
     m=r["matched"];us=r["unmatched_sales"];up=r["unmatched_pos"]
-    k1,k2,k3,k4,k5=st.columns(5)
+    cash_tx=r.get("cash_transactions",pd.DataFrame())
+    k1,k2,k3,k4,k5,k6=st.columns(6)
     k1.metric("Matched / Review",len(m));k2.metric("Unmatched D365",len(us));k3.metric("Unmatched POS",len(up))
-    k4.metric("Bank Settled",int(m["Bank Settled"].sum()) if not m.empty else 0)
-    k5.metric("Max Diff",f"SAR {m['Difference'].abs().max():,.2f}" if not m.empty else "SAR 0.00")
-    tabs=st.tabs(["Matched","Unmatched D365","Unmatched POS","Carry Forward","Quarantine"])
-    with tabs[0]:st.dataframe(m,use_container_width=True,hide_index=True)
-    with tabs[1]:st.dataframe(us,use_container_width=True,hide_index=True)
-    with tabs[2]:st.dataframe(up,use_container_width=True,hide_index=True)
-    with tabs[3]:st.dataframe(r["carry_forward"],use_container_width=True,hide_index=True)
-    with tabs[4]:st.dataframe(r["quarantine"],use_container_width=True,hide_index=True)
+    k4.metric("Cash Transactions",len(cash_tx))
+    k5.metric("Bank Settled",int(m["Bank Settled"].sum()) if not m.empty else 0)
+    k6.metric("Max Diff",f"SAR {m['Difference'].abs().max():,.2f}" if not m.empty else "SAR 0.00")
+    bridge613=r.get("store613_bridge",pd.DataFrame())
+    tabs=st.tabs(["Matched","Cash Sales / Refunds","Store 613 SalesDetails Bridge","Unmatched D365","Unmatched POS","Carry Forward","Quarantine"])
+    with tabs[0]:
+        st.dataframe(m,use_container_width=True,hide_index=True)
+    with tabs[1]:
+        if cash_tx.empty:
+            st.info("No Cash Sales / Cash Refund transactions in the uploaded Store Tender.")
+        else:
+            cash_view_cols=[c for c in [
+                "Store Code","Date","Receipt ID","Auth Code","Cash Classification","Cash Amount",
+                "D365 Raw Auth Code","D365 Row"
+            ] if c in cash_tx.columns]
+            st.dataframe(cash_tx[cash_view_cols],use_container_width=True,hide_index=True)
+    with tabs[2]:
+        if bridge613.empty:
+            st.info("No Store 613 SalesDetails bridge rows. Upload D365 Sales Details together with Store Tender when Store 613 is included.")
+        else:
+            st.caption("Store 613 bridge uses Store Code + Sales Order. Receipt ID/Auth Code are populated only when unique in Sales Details.")
+            st.dataframe(bridge613,use_container_width=True,hide_index=True)
+    with tabs[3]:st.dataframe(us,use_container_width=True,hide_index=True)
+    with tabs[4]:st.dataframe(up,use_container_width=True,hide_index=True)
+    with tabs[5]:st.dataframe(r["carry_forward"],use_container_width=True,hide_index=True)
+    with tabs[6]:st.dataframe(r["quarantine"],use_container_width=True,hide_index=True)
     blob=report_export.create_reconciliation_pack(r,tolerance)
     st.download_button(
         "DOWNLOAD RECONCILIATION PACK",
