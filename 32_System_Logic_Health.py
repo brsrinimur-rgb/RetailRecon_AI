@@ -1,5 +1,15 @@
 import streamlit as st
 import pandas as pd
+import sys
+from pathlib import Path
+
+# Streamlit executes page files independently. Add the application root
+# explicitly so top-level additive packages such as `logic` resolve reliably
+# on Streamlit Cloud and local deployments.
+APP_ROOT=Path(__file__).resolve().parents[1]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0,str(APP_ROOT))
+
 import auth,theme
 from logic.release_guard import run_release_health
 from logic.database_logic import health as db_health
