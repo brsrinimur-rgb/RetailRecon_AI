@@ -36,6 +36,43 @@ def get_conn():
     return conn
 
 
+
+def ensure_correction_log_schema(conn=None):
+    """
+    Self-healing migration for legacy correction_log tables.
+    Safe to run repeatedly. Existing records are preserved.
+    """
+    owns_conn = conn is None
+    if conn is None:
+        conn = get_conn()
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS correction_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT,
+        d365_row INTEGER,
+        new_auth TEXT,
+        reason TEXT,
+        user TEXT,
+        status TEXT
+    )""")
+
+    existing={r[1] for r in conn.execute("PRAGMA table_info(correction_log)").fetchall()}
+    for name,ctype in [
+        ("original_auth","TEXT"),
+        ("store_code","TEXT"),
+        ("receipt_id","TEXT"),
+        ("approver","TEXT"),
+        ("approval_time","TEXT"),
+        ("approval_comment","TEXT"),
+    ]:
+        if name not in existing:
+            conn.execute(f'ALTER TABLE correction_log ADD COLUMN "{name}" {ctype}')
+
+    conn.commit()
+    if owns_conn:
+        conn.close()
+
+
 def init_db():
     conn = get_conn()
     conn.execute("""CREATE TABLE IF NOT EXISTS jv_batches (
@@ -58,18 +95,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         time TEXT, d365_row INTEGER, new_auth TEXT, reason TEXT, user TEXT, status TEXT
     )""")
-    # Correction approval audit columns (backward-compatible migration).
-    _corr_cols={r[1] for r in conn.execute("PRAGMA table_info(correction_log)").fetchall()}
-    for _name,_type in [
-        ("original_auth","TEXT"),
-        ("store_code","TEXT"),
-        ("receipt_id","TEXT"),
-        ("approver","TEXT"),
-        ("approval_time","TEXT"),
-        ("approval_comment","TEXT"),
-    ]:
-        if _name not in _corr_cols:
-            conn.execute(f"ALTER TABLE correction_log ADD COLUMN {_name} {_type}")
+    ensure_correction_log_schema(conn)
     conn.execute("""CREATE TABLE IF NOT EXISTS adjustments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT, store TEXT, provider TEXT, amount REAL, reason TEXT, status TEXT, user TEXT
@@ -428,6 +454,7 @@ def append_correction_log(
     be safely reapplied on reconciliation reruns.
     """
     conn=get_conn()
+    ensure_correction_log_schema(conn)
     conn.execute(
         """INSERT INTO correction_log
            (time,d365_row,new_auth,reason,user,status,original_auth,store_code,receipt_id,
@@ -454,6 +481,7 @@ def append_correction_log(
 
 def load_correction_log(status=None) -> pd.DataFrame:
     conn=get_conn()
+    ensure_correction_log_schema(conn)
     sql="""SELECT id AS "ID", time AS "Submitted At", d365_row AS "D365 Row",
                   store_code AS "Store Code", receipt_id AS "Receipt ID",
                   original_auth AS "Original Auth", new_auth AS "New Auth",
@@ -482,6 +510,7 @@ def decide_correction(correction_id, decision, approver, comment=""):
         return False,"Decision must be APPROVED or REJECTED."
 
     conn=get_conn()
+    ensure_correction_log_schema(conn)
     row=conn.execute(
         "SELECT user,status,new_auth FROM correction_log WHERE id=?",
         (int(correction_id),)
