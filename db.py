@@ -1236,3 +1236,13 @@ def resolve_accounting_date(source_date, requested_accounting_date=None, legal_e
     if pd.notna(next_open):
         return next_open.normalize()
     return pd.Timestamp.today().normalize()
+
+# ---------------------------------------------------------------------------
+# Runtime schema initialization / migration
+# ---------------------------------------------------------------------------
+# Streamlit pages can import db.py directly without visiting Home.py first.
+# Therefore the schema migration must execute when the module is imported.
+# CREATE TABLE IF NOT EXISTS + PRAGMA/ALTER migrations inside init_db() are
+# idempotent and preserve existing production data.
+init_db()
+
