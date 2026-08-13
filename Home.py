@@ -20,3 +20,7 @@ st.page_link("pages/29_AI_Finance_Copilot.py",label="Open AI Finance Copilot",ic
 st.page_link("pages/30_D365_GL_Reconciliation.py",label="Open D365 GL Reconciliation",icon="📚")
 
 st.page_link("pages/18_Settlement_Batch_Engine.py",label="Open Settlement Batch Engine",icon="💰")
+
+st.page_link("pages/31_Database_Health.py",label="Database Health & Migration",icon="🩺")
+
+st.page_link("pages/32_System_Logic_Health.py",label="System Logic Health",icon="🧩")

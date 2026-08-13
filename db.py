@@ -73,6 +73,252 @@ def ensure_correction_log_schema(conn=None):
         conn.close()
 
 
+
+CURRENT_DB_SCHEMA_VERSION = 21
+
+def _table_columns(conn, table_name):
+    return {r[1] for r in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()}
+
+def _ensure_columns(conn, table_name, required_columns):
+    """
+    Add missing columns to an existing SQLite table without deleting data.
+    required_columns: iterable of (column_name, sqlite_type)
+    """
+    existing=_table_columns(conn,table_name)
+    for name,ctype in required_columns:
+        if name not in existing:
+            conn.execute(f'ALTER TABLE "{table_name}" ADD COLUMN "{name}" {ctype}')
+
+def migrate_database(conn=None):
+    """
+    Central, idempotent migration entry point.
+
+    Safe to run repeatedly and before every database-backed page.
+    Existing data is preserved; missing tables/columns are created or added.
+    """
+    owns_conn=conn is None
+    if conn is None:
+        conn=get_conn()
+
+    # Schema version / migration audit.
+    conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        version INTEGER NOT NULL,
+        updated_at TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS schema_migration_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT,
+        from_version INTEGER,
+        to_version INTEGER,
+        status TEXT,
+        notes TEXT
+    )""")
+
+    row=conn.execute("SELECT version FROM schema_version WHERE id=1").fetchone()
+    old_version=int(row[0]) if row else 0
+
+    # Core tables that have evolved over releases.
+    conn.execute("""CREATE TABLE IF NOT EXISTS correction_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT,
+        d365_row INTEGER,
+        new_auth TEXT,
+        reason TEXT,
+        user TEXT,
+        status TEXT
+    )""")
+    _ensure_columns(conn,"correction_log",[
+        ("original_auth","TEXT"),
+        ("store_code","TEXT"),
+        ("receipt_id","TEXT"),
+        ("approver","TEXT"),
+        ("approval_time","TEXT"),
+        ("approval_comment","TEXT"),
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS gl_control_mapping (
+        main_account TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"gl_control_mapping",[
+        ("gl_group","TEXT"),
+        ("payment_types","TEXT"),
+        ("account_name","TEXT"),
+        ("active","TEXT"),
+        ("notes","TEXT"),
+        ("updated_at","TEXT"),
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS gl_verification_runs (
+        run_id TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"gl_verification_runs",[
+        ("time","TEXT"),
+        ("user","TEXT"),
+        ("legal_entity","TEXT"),
+        ("status","TEXT"),
+        ("summary_json","TEXT"),
+        ("detail_json","TEXT"),
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS jv_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT
+    )""")
+    _ensure_columns(conn,"jv_batches",[
+        ("journal_batch","TEXT"),
+        ("line_number","INTEGER"),
+        ("approval_status","TEXT"),
+        ("d365_status","TEXT"),
+        ("voucher","TEXT"),
+        ("balanced","INTEGER"),
+        ("validation_passed","INTEGER"),
+        ("row_json","TEXT"),
+        ("created_at","TEXT"),
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS accounting_period_control (
+        legal_entity TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"accounting_period_control",[
+        ("closed_through_date","TEXT"),
+        ("next_open_date","TEXT"),
+        ("status","TEXT"),
+        ("updated_by","TEXT"),
+        ("updated_at","TEXT"),
+        ("reason","TEXT"),
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS accounting_period_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT
+    )""")
+    _ensure_columns(conn,"accounting_period_audit",[
+        ("time","TEXT"),
+        ("user","TEXT"),
+        ("legal_entity","TEXT"),
+        ("action","TEXT"),
+        ("old_closed_through_date","TEXT"),
+        ("new_closed_through_date","TEXT"),
+        ("old_next_open_date","TEXT"),
+        ("new_next_open_date","TEXT"),
+        ("reason","TEXT"),
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS merchant_master (
+        merchant_id TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"merchant_master",[
+        ("store_code","TEXT"),("store_name","TEXT"),("notes","TEXT"),("updated_at","TEXT")
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS terminal_master (
+        terminal_id TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"terminal_master",[
+        ("store_code","TEXT"),("store_name","TEXT"),("notes","TEXT"),("updated_at","TEXT")
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS store_mapping_master (
+        provider_store_name TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"store_mapping_master",[
+        ("store_code","TEXT"),("active","TEXT"),("notes","TEXT"),("updated_at","TEXT")
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS commission_rate_master (
+        payment_type TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"commission_rate_master",[
+        ("commission_rate","REAL"),("vat_rate","REAL"),("validation_method","TEXT"),
+        ("effective_from","TEXT"),("effective_to","TEXT"),("active","TEXT"),
+        ("notes","TEXT"),("updated_at","TEXT")
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS gl_config (
+        key TEXT PRIMARY KEY
+    )""")
+    _ensure_columns(conn,"gl_config",[("gl_account","TEXT")])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS approval_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT
+    )""")
+    _ensure_columns(conn,"approval_log",[
+        ("time","TEXT"),("user","TEXT"),("decision","TEXT"),("batches","TEXT"),("comment","TEXT")
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS adjustments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT
+    )""")
+    _ensure_columns(conn,"adjustments",[
+        ("date","TEXT"),("store","TEXT"),("provider","TEXT"),("amount","REAL"),
+        ("reason","TEXT"),("status","TEXT"),("user","TEXT")
+    ])
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS close_calendar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT
+    )""")
+    _ensure_columns(conn,"close_calendar",[
+        ("task","TEXT"),("owner","TEXT"),("due_date","TEXT"),("status","TEXT")
+    ])
+
+    conn.execute(
+        """INSERT INTO schema_version(id,version,updated_at)
+           VALUES (1,?,?)
+           ON CONFLICT(id) DO UPDATE SET version=excluded.version, updated_at=excluded.updated_at""",
+        (CURRENT_DB_SCHEMA_VERSION, datetime.now().isoformat(timespec="seconds"))
+    )
+
+    if old_version != CURRENT_DB_SCHEMA_VERSION:
+        conn.execute(
+            """INSERT INTO schema_migration_log
+               (time,from_version,to_version,status,notes)
+               VALUES (?,?,?,?,?)""",
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                old_version,CURRENT_DB_SCHEMA_VERSION,"SUCCESS",
+                "Automatic idempotent schema migration"
+            )
+        )
+
+    conn.commit()
+    if owns_conn:
+        conn.close()
+
+def get_database_health():
+    conn=get_conn()
+    try:
+        migrate_database(conn)
+        required={
+            "correction_log":{"store_code","receipt_id","original_auth","approver","approval_time","approval_comment"},
+            "gl_control_mapping":{"main_account","gl_group","payment_types","account_name","active","notes","updated_at"},
+            "gl_verification_runs":{"run_id","time","user","legal_entity","status","summary_json","detail_json"},
+            "jv_batches":{"journal_batch","row_json","approval_status","d365_status","voucher","validation_passed"},
+            "accounting_period_control":{"legal_entity","closed_through_date","next_open_date","status"},
+        }
+        rows=[]
+        healthy=True
+        for table,cols in required.items():
+            actual=_table_columns(conn,table)
+            missing=sorted(cols-actual)
+            ok=not missing
+            healthy=healthy and ok
+            rows.append({
+                "Table":table,
+                "Status":"HEALTHY" if ok else "MISSING COLUMNS",
+                "Missing Columns":", ".join(missing),
+                "Column Count":len(actual),
+            })
+        ver=conn.execute("SELECT version,updated_at FROM schema_version WHERE id=1").fetchone()
+        return {
+            "Healthy":healthy,
+            "Schema Version":int(ver[0]) if ver else 0,
+            "Required Version":CURRENT_DB_SCHEMA_VERSION,
+            "Updated At":ver[1] if ver else "",
+            "Tables":pd.DataFrame(rows),
+        }
+    finally:
+        conn.close()
+
+
 def init_db():
     conn = get_conn()
     conn.execute("""CREATE TABLE IF NOT EXISTS jv_batches (
@@ -179,6 +425,7 @@ def init_db():
         new_next_open_date TEXT,
         reason TEXT
     )""")
+    migrate_database(conn)
     conn.commit()
     conn.close()
 
@@ -331,6 +578,7 @@ _GL_CONTROL_DEFAULTS = [
 
 def _seed_gl_control_mapping():
     conn=get_conn()
+    migrate_database(conn)
     now=datetime.now().isoformat(timespec="seconds")
     for row in _GL_CONTROL_DEFAULTS:
         conn.execute(
@@ -393,6 +641,7 @@ def save_gl_verification_run(summary:dict, detail:dict, user:str, legal_entity="
         else:
             detail_clean[k]=v
     conn=get_conn()
+    migrate_database(conn)
     conn.execute(
         """INSERT OR REPLACE INTO gl_verification_runs
            (run_id,time,user,legal_entity,status,summary_json,detail_json)
@@ -404,6 +653,7 @@ def save_gl_verification_run(summary:dict, detail:dict, user:str, legal_entity="
 
 def load_gl_verification_runs(limit=50):
     conn=get_conn()
+    migrate_database(conn)
     rows=conn.execute(
         """SELECT run_id,time,user,legal_entity,status,summary_json
            FROM gl_verification_runs ORDER BY time DESC LIMIT ?""",(int(limit),)
