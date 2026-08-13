@@ -369,6 +369,11 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
     elif any(x in ql for x in ["missing d365","provider only"]):
         intent="missing_d365"
     elif any(x in ql for x in [
+        "settlement batch","settlement batches","bank receipt pending","provider settled",
+        "which settlements","bank received batches","payout pending","settlement propagation"
+    ]):
+        intent="settlement_batch"
+    elif any(x in ql for x in [
         "gl status","gl verified","d365 gl","gl mismatch","gl exception","gl exceptions",
         "unexplained gl","explain gl","gl balance","clearing balance","clearing movement",
         "which stores gl","gl not found","jv to gl","source to gl"
@@ -1339,6 +1344,42 @@ def _gl_control_answer(result,ctx,question=""):
     return {"text":text,"table":exc.head(100) if not exc.empty else trace.head(100)}
 
 
+
+def _settlement_batch_answer(result,ctx,question=""):
+    batches=result.get("settlement_batches",pd.DataFrame()) if result else pd.DataFrame()
+    matched=result.get("matched",pd.DataFrame()) if result else pd.DataFrame()
+
+    if batches.empty:
+        return {
+            "text":"I don't have an active Settlement Batch Engine result yet. Open **Settlement Batch Engine**, upload payout/bank evidence and run settlement control first.",
+            "table":pd.DataFrame()
+        }
+
+    x=batches.copy()
+    if ctx.store_codes and "Store Code" in x.columns:
+        x=x[x["Store Code"].map(_norm_store).isin(ctx.store_codes)]
+    ql=str(question or "").lower()
+
+    if "pending" in ql or "not received" in ql:
+        y=x[x["Settlement Status"]!="BANK RECEIVED"].copy()
+        amt=float(pd.to_numeric(y.get("Expected Bank Amount",0),errors="coerce").fillna(0).sum()) if not y.empty else 0
+        return {
+            "text":f"For **{_scope_text(ctx)}**, **{len(y):,} settlement batch(es)** are not yet verified as BANK RECEIVED, representing expected receipts of **{_fmt_sar(amt)}**.",
+            "table":y.head(500)
+        }
+
+    received=x[x["Settlement Status"]=="BANK RECEIVED"].copy()
+    expected=float(pd.to_numeric(x.get("Expected Bank Amount",0),errors="coerce").fillna(0).sum())
+    actual=float(pd.to_numeric(received.get("Actual Bank Amount",0),errors="coerce").fillna(0).sum()) if not received.empty else 0
+    return {
+        "text":(
+            f"Settlement Batch Engine for **{_scope_text(ctx)}**: **{len(received):,}/{len(x):,} batch(es)** are BANK RECEIVED. "
+            f"Expected settlement population is **{_fmt_sar(expected)}** and verified bank receipts total **{_fmt_sar(actual)}**."
+        ),
+        "table":x.head(500)
+    }
+
+
 def answer_question(question, result, db_module=None, prior_context=None, user_context=None):
     if not result:
         return {
@@ -1392,6 +1433,8 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
             payload=_cash_report(result,ctx,question,db_module)
         else:
             payload=_sales_answer(result,ctx,detail=True,db_module=db_module)
+    elif intent=="settlement_batch":
+        payload=_settlement_batch_answer(result,ctx,question)
     elif intent=="gl_control":
         payload=_gl_control_answer(result,ctx,question)
     elif intent=="risk":

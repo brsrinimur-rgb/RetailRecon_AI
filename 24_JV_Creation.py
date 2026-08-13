@@ -54,6 +54,7 @@ scope["_Matched"]=scope.get("Status","").astype(str).eq("Matched")
 scope["_Difference"]=pd.to_numeric(scope.get("Difference",0),errors="coerce")
 scope["_Tolerance_OK"]=scope["_Difference"].abs().le(1.0)
 scope["_Bank_Settled"]=scope.get("Bank Settled",False).fillna(False).astype(bool)
+scope["_Settlement_Stage"]=scope.get("Settlement Stage","").fillna("").astype(str)
 scope["_Ready"]=scope["_Matched"] & scope["_Tolerance_OK"] & scope["_Bank_Settled"]
 
 def _block_reason(row):
@@ -63,7 +64,8 @@ def _block_reason(row):
     if not bool(row["_Tolerance_OK"]):
         reasons.append("Difference > SAR 1")
     if not bool(row["_Bank_Settled"]):
-        reasons.append("Bank Settlement Pending")
+        stage=str(row.get("_Settlement_Stage","")).strip()
+        reasons.append(stage if stage and stage!="TRANSACTION MATCHED" else "Bank Settlement Pending")
     return "Ready" if not reasons else "; ".join(reasons)
 
 scope["_Block Reason"]=scope.apply(_block_reason,axis=1)

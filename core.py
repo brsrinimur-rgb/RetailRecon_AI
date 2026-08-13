@@ -474,6 +474,9 @@ def normalize_tender(df):
                     rr=base.copy();rr["D365 Payment"]="UNKNOWN";rr["D365 Amount"]=a;rows.append(rr)
     out=pd.DataFrame(rows)
     if out.empty:return out
+    if "Narration" in out.columns:
+        narr=out["Narration"].apply(parse_bank_narration).apply(pd.Series)
+        out=pd.concat([out,narr],axis=1)
     if "Cash Classification" not in out.columns:
         out["Cash Classification"]=""
     else:
@@ -1422,6 +1425,95 @@ def reconcile(tender,pos,tolerance=1.0):
 
     return matched,unmatched_sales,unmatched_pos
 
+
+def parse_bank_narration(text):
+    """
+    Extract settlement evidence from bank narration without changing the raw text.
+    Evidence may include provider, terminal, merchant, scheme, payout/batch ID and
+    transaction count. Missing fields remain blank; nothing is invented.
+    """
+    raw="" if text is None or (isinstance(text,float) and pd.isna(text)) else str(text)
+    s=raw.upper()
+
+    provider=""
+    for p in ["TABBY","TAMARA","AMEX","TAP"]:
+        if p in s:
+            provider=p
+            break
+    if not provider and any(k in s for k in ["MADA","VISA","MASTER","MC ","VC "]):
+        provider="ANB POS"
+
+    scheme=""
+    if "MADA" in s: scheme="MADA"
+    elif re.search(r"\b(VISA|VC)\b",s): scheme="VISA"
+    elif re.search(r"\b(MASTER|MASTERCARD|MC)\b",s): scheme="MASTERCARD"
+    elif "AMEX" in s: scheme="AMEX"
+
+    terminal=""
+    for pat in [
+        r"\b(?:TID|TERMINAL(?:\s*ID)?)\s*[:#\-]?\s*([A-Z0-9]{5,20})\b",
+        r"\bPOS\s*[:#\-]?\s*([0-9]{5,20})\b",
+    ]:
+        m=re.search(pat,s)
+        if m:
+            terminal=m.group(1); break
+
+    merchant=""
+    for pat in [
+        r"\b(?:MID|MERCHANT(?:\s*ID)?)\s*[:#\-]?\s*([A-Z0-9]{5,30})\b",
+        r"\bRETAILER\s*ID\s*[:#\-]?\s*([A-Z0-9]{5,30})\b",
+    ]:
+        m=re.search(pat,s)
+        if m:
+            merchant=m.group(1); break
+
+    payout_id=""
+    for pat in [
+        r"\bPAYOUT[_\s:#\-]*([A-Z0-9\-]{6,})\b",
+        r"\bSETTLEMENT[_\s:#\-]*([A-Z0-9\-]{6,})\b",
+    ]:
+        m=re.search(pat,s)
+        if m:
+            payout_id=m.group(1); break
+
+    tx_count=np.nan
+    m=re.search(r"\b(?:TX|TRX|TRANSACTIONS?)\s*[_:#\-]?\s*(\d{1,6})\b",s)
+    if m:
+        try: tx_count=int(m.group(1))
+        except Exception: pass
+
+    return {
+        "Narration Provider":provider,
+        "Narration Scheme":scheme,
+        "Narration Terminal ID":terminal,
+        "Narration Merchant ID":merchant,
+        "Narration Payout ID":payout_id,
+        "Narration Transaction Count":tx_count,
+    }
+
+def detect_bank_name(source,df=None):
+    """
+    Detect bank from statement evidence. Filename is only a fallback.
+    """
+    s=str(source or "").upper()
+    if "RAJHI" in s or "ALRAJHI" in s:
+        return "AL RAJHI"
+    if "ANB" in s or "ARAB NATIONAL" in s:
+        return "ANB"
+
+    # Known statement/account text can be used when available.
+    if df is not None and not df.empty:
+        txt=" ".join(
+            " ".join(map(str,row))
+            for row in df.astype(str).head(25).values.tolist()
+        ).upper()
+        if "AL RAJHI" in txt or "ALRAJHI" in txt:
+            return "AL RAJHI"
+        if "ARAB NATIONAL BANK" in txt or "ANB" in txt:
+            return "ANB"
+    return "UNKNOWN"
+
+
 def normalize_bank(df,bank):
     d=norm_cols(df)
 
@@ -1680,6 +1772,405 @@ def _gl_event_type(description,amount_value):
     except Exception:
         a=0.0
     return "POSITIVE CLEARING MOVEMENT" if a>0 else ("NEGATIVE CLEARING MOVEMENT" if a<0 else "ZERO MOVEMENT")
+
+
+# =====================================================================
+# SETTLEMENT BATCH ENGINE
+# =====================================================================
+
+def classify_settlement_source(name,df):
+    d=norm_cols(df)
+    cols=set(d.columns)
+    n=str(name or "").upper()
+
+    # Tamara merchant statement / invoice payout file.
+    if (
+        ("payable to merchant" in cols or "statement id" in cols or "statement period" in cols)
+        and any("tamara" in c for c in cols | {n.lower()})
+    ) or ("TAMARA_" in n and any(c in cols for c in ["captured amount","refund amount","payable to merchant","statement id"])):
+        return "TAMARA_PAYOUT"
+
+    # Tabby bulk settlement / merchant payout file.
+    if (
+        "transferred amount" in cols or "total deduction" in cols or "transfer date" in cols
+    ) and any(c in cols for c in ["order number","merchant","merchant name","store"]):
+        return "TABBY_PAYOUT"
+
+    # TAP payout/charge file: payout_id and settlement_id are critical.
+    if "payout_id" in cols and "settlement_id" in cols:
+        return "TAP_PAYOUT"
+
+    # Generic AMEX settlement file can be extended here if payout-level columns exist.
+    if "AMEX" in n and any(c in cols for c in ["settlement amount","net amount","merchant id"]):
+        return "AMEX_PAYOUT"
+
+    return ""
+
+def normalize_tamara_payout(df,source="Tamara Payout"):
+    d=norm_cols(df)
+    statement=find(d,["statement id","statement_id","invoice id","invoice"])
+    period=find(d,["statement period","period"])
+    merchant=find(d,["merchant","merchant name","store","store name"])
+    captured=find(d,["captured amount","gross captured","captured"])
+    refunded=find(d,["refund amount","refunded amount","refunds"])
+    fees=find(d,["fees","commission","fee amount","merchant fees"])
+    vat=find(d,["vat","tax","vat amount"])
+    payable=find(d,["payable to merchant","payable amount","net payable","settlement amount","amount payable"])
+    date=find(d,["payment date","payout date","transfer date","date"])
+    rows=[]
+    for i,r in d.iterrows():
+        pay=amount(r.get(payable)) if payable else np.nan
+        if pd.isna(pay): continue
+        rows.append({
+            "Settlement Source":"TAMARA",
+            "Settlement Batch ID":_gl_text(r.get(statement)) if statement else f"TAMARA-{source}-{i+1}",
+            "Provider":"TAMARA",
+            "Merchant":_gl_text(r.get(merchant)) if merchant else "",
+            "Settlement Period":_gl_text(r.get(period)) if period else "",
+            "Settlement Date":dt(r.get(date)) if date else pd.NaT,
+            "Gross Amount":amount(r.get(captured)) if captured else np.nan,
+            "Refund Amount":amount(r.get(refunded)) if refunded else 0.0,
+            "Fee Amount":amount(r.get(fees)) if fees else np.nan,
+            "VAT Amount":amount(r.get(vat)) if vat else np.nan,
+            "Expected Bank Amount":float(pay),
+            "Source File":source,
+            "Source Row":i+1,
+        })
+    return pd.DataFrame(rows)
+
+def normalize_tabby_payout(df,source="Tabby Payout"):
+    d=norm_cols(df)
+    batch=find(d,["payout id","settlement id","bulk settlement id","batch id"])
+    merchant=find(d,["merchant","merchant name","store","store name"])
+    order=find(d,["order number","order no","order id"])
+    transfer=find(d,["transferred amount","transfer amount","net amount","settlement amount"])
+    deduction=find(d,["total deduction","deduction","fees","fee amount"])
+    date=find(d,["transfer date","payout date","settlement date","date"])
+    rows=[]
+    # Row-level payout details are rolled into one batch per merchant/date when no explicit batch id exists.
+    temp=[]
+    for i,r in d.iterrows():
+        a=amount(r.get(transfer)) if transfer else np.nan
+        if pd.isna(a): continue
+        temp.append({
+            "_batch":_gl_text(r.get(batch)) if batch else "",
+            "Merchant":_gl_text(r.get(merchant)) if merchant else "",
+            "Order Number":_gl_text(r.get(order)) if order else "",
+            "Settlement Date":dt(r.get(date)) if date else pd.NaT,
+            "Transferred Amount":float(a),
+            "Deduction":amount(r.get(deduction)) if deduction else 0.0,
+            "Source File":source,
+            "Source Row":i+1,
+        })
+    if not temp:return pd.DataFrame()
+    t=pd.DataFrame(temp)
+    t["_DateKey"]=pd.to_datetime(t["Settlement Date"],errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    t["_GroupKey"]=t.apply(lambda r:r["_batch"] or f"{r['Merchant']}|{r['_DateKey']}",axis=1)
+    rows=[]
+    for key,g in t.groupby("_GroupKey",dropna=False):
+        rows.append({
+            "Settlement Source":"TABBY",
+            "Settlement Batch ID":str(key),
+            "Provider":"TABBY",
+            "Merchant":" / ".join(sorted(set(x for x in g["Merchant"].astype(str) if x))),
+            "Settlement Period":"",
+            "Settlement Date":pd.to_datetime(g["Settlement Date"],errors="coerce").max(),
+            "Gross Amount":np.nan,
+            "Refund Amount":0.0,
+            "Fee Amount":float(pd.to_numeric(g["Deduction"],errors="coerce").fillna(0).sum()),
+            "VAT Amount":np.nan,
+            "Expected Bank Amount":float(pd.to_numeric(g["Transferred Amount"],errors="coerce").fillna(0).sum()),
+            "Order Count":int(g["Order Number"].astype(str).ne("").sum()),
+            "Source File":source,
+            "Source Row":int(g["Source Row"].min()),
+        })
+    return pd.DataFrame(rows)
+
+def normalize_tap_payout(df,source="TAP Payout"):
+    d=norm_cols(df)
+    payout=find(d,["payout_id","payout id"])
+    settlement=find(d,["settlement_id","settlement id"])
+    amount_col=find(d,["amount","transaction amount","settlement amount"])
+    status=find(d,["status"])
+    payout_date=find(d,["payout_date","payout date"])
+    settlement_date=find(d,["settlement_date","settlement date"])
+    auth_col=find(d,["authorization_id","authorization id","auth code"])
+    if not payout or not settlement or not amount_col:
+        return pd.DataFrame()
+    temp=[]
+    for i,r in d.iterrows():
+        a=amount(r.get(amount_col))
+        if pd.isna(a): continue
+        pdte=dt(r.get(payout_date)) if payout_date else pd.NaT
+        sdte=dt(r.get(settlement_date)) if settlement_date else pd.NaT
+        # Defensive preference: if settlement_id carries YYYYMMDD and source date is implausible,
+        # derive date from the identifier as audit-supported evidence.
+        sid=_gl_text(r.get(settlement))
+        m=re.search(r"(20\d{6})",sid)
+        id_date=pd.NaT
+        if m:
+            try:id_date=pd.to_datetime(m.group(1),format="%Y%m%d",errors="coerce")
+            except Exception:pass
+        if pd.notna(id_date) and (pd.isna(sdte) or abs((sdte-id_date).days)>31):
+            sdte=id_date
+        temp.append({
+            "Payout ID":_gl_text(r.get(payout)),
+            "Settlement ID":sid,
+            "Settlement Date":sdte,
+            "Payout Date":pdte,
+            "Amount":float(a),
+            "Status":_gl_text(r.get(status)) if status else "",
+            "Auth Code":auth(r.get(auth_col)) if auth_col else "",
+            "Source File":source,
+            "Source Row":i+1,
+        })
+    if not temp:return pd.DataFrame()
+    t=pd.DataFrame(temp)
+    rows=[]
+    for pid,g in t.groupby("Payout ID",dropna=False):
+        rows.append({
+            "Settlement Source":"TAP",
+            "Settlement Batch ID":str(pid),
+            "Provider":"TAP",
+            "Merchant":"",
+            "Settlement Period":"",
+            "Settlement Date":pd.to_datetime(g["Settlement Date"],errors="coerce").max(),
+            "Gross Amount":float(pd.to_numeric(g["Amount"],errors="coerce").fillna(0).sum()),
+            "Refund Amount":0.0,
+            "Fee Amount":np.nan,
+            "VAT Amount":np.nan,
+            "Expected Bank Amount":float(pd.to_numeric(g["Amount"],errors="coerce").fillna(0).sum()),
+            "Charge Count":len(g),
+            "Source File":source,
+            "Source Row":int(g["Source Row"].min()),
+        })
+    return pd.DataFrame(rows)
+
+def build_card_settlement_batches(matched):
+    """
+    Build ANB card settlement batches from already POS-matched transactions.
+    Batch evidence is Store + Terminal + POS Date + Scheme.
+    """
+    if matched is None or matched.empty:return pd.DataFrame()
+    x=matched.copy()
+    x=x[x["Payment Type"].apply(_norm_payment).isin(["MADA","VISA","MASTERCARD","AMEX"])].copy()
+    if x.empty:return pd.DataFrame()
+    x["Payment Type"]=x["Payment Type"].apply(_norm_payment)
+    x["Settlement Date"]=pd.to_datetime(x.get("POS Date",x.get("Date")),errors="coerce").dt.normalize()
+    x["Terminal ID"]=x.get("Terminal ID","").fillna("").astype(str).str.strip()
+    x["Merchant ID"]=x.get("Merchant ID","").fillna("").astype(str).str.strip() if "Merchant ID" in x.columns else ""
+    x["Expected Net"]=pd.to_numeric(x.get("Net Amount",x.get("POS Amount",0)),errors="coerce").fillna(0.0)
+    rows=[]
+    for (store,terminal,dtv,pay),g in x.groupby(["Store Code","Terminal ID","Settlement Date","Payment Type"],dropna=False):
+        if pd.isna(dtv): continue
+        key=f"ANB|{store}|{terminal}|{dtv:%Y-%m-%d}|{pay}"
+        rows.append({
+            "Settlement Source":"ANB POS" if pay!="AMEX" else "AMEX",
+            "Settlement Batch ID":hashlib.sha1(key.encode()).hexdigest()[:20],
+            "Provider":"ANB POS" if pay!="AMEX" else "AMEX",
+            "Store Code":str(store),
+            "Merchant":"",
+            "Terminal ID":str(terminal),
+            "Payment Type":pay,
+            "Settlement Date":dtv,
+            "Gross Amount":float(pd.to_numeric(g.get("POS Amount",0),errors="coerce").fillna(0).sum()),
+            "Refund Amount":0.0,
+            "Fee Amount":float(pd.to_numeric(g.get("Commission",0),errors="coerce").fillna(0).sum()),
+            "VAT Amount":float(pd.to_numeric(g.get("VAT",0),errors="coerce").fillna(0).sum()),
+            "Expected Bank Amount":float(pd.to_numeric(g["Expected Net"],errors="coerce").fillna(0).sum()),
+            "Transaction Count":len(g),
+            "Underlying IDs":"|".join(g.get("Unique Transaction ID",pd.Series(dtype=str)).astype(str)),
+            "Source File":"Matched Reconciliation",
+        })
+    return pd.DataFrame(rows)
+
+def reconcile_settlement_batches_to_bank(batches,bank,tolerance=1.0,tabby_fixed_fee=5.0):
+    """
+    Match settlement batches to bank credits. Deterministic evidence only.
+
+    Rules:
+      - Exact/approved tolerance amount and plausible bank date.
+      - ANB POS prefers narration terminal/scheme evidence when available.
+      - Tabby allows a configurable settlement-level fixed fee difference.
+      - One bank credit may satisfy one settlement batch; ambiguous candidates stay REVIEW.
+    """
+    if batches is None or batches.empty:
+        return pd.DataFrame(),bank.copy() if bank is not None else pd.DataFrame()
+    if bank is None or bank.empty:
+        x=batches.copy()
+        x["Settlement Status"]="BANK RECEIPT PENDING"
+        return x,pd.DataFrame()
+
+    b=bank.copy()
+    # Support common normalized names.
+    if "Credit" in b.columns:
+        b["_Credit"]=pd.to_numeric(b["Credit"],errors="coerce").fillna(0.0)
+    elif "Bank Amount" in b.columns:
+        b["_Credit"]=pd.to_numeric(b["Bank Amount"],errors="coerce").fillna(0.0)
+    else:
+        num=find(norm_cols(b),["credit","credit amount","amount cr","amount cr.","bank amount","amount"])
+        b["_Credit"]=pd.to_numeric(b[num],errors="coerce").fillna(0.0) if num else 0.0
+
+    if "Bank Date" in b.columns:
+        b["_Date"]=pd.to_datetime(b["Bank Date"],errors="coerce")
+    elif "Date" in b.columns:
+        b["_Date"]=pd.to_datetime(b["Date"],errors="coerce")
+    else:
+        b["_Date"]=pd.NaT
+
+    used=set();rows=[]
+    for _,r in batches.reset_index(drop=True).iterrows():
+        exp=float(r.get("Expected Bank Amount",0) or 0)
+        provider=str(r.get("Provider","")).upper()
+        sdate=pd.to_datetime(r.get("Settlement Date"),errors="coerce")
+        terminal=str(r.get("Terminal ID","")).strip()
+        pay=_norm_payment(r.get("Payment Type",""))
+
+        pool=b[~b.index.isin(used)].copy()
+        if pool.empty:
+            cand=pd.DataFrame()
+        else:
+            # Bank receipt can reasonably arrive from same day to +10 days for batch reconciliation.
+            cand=pool.copy()
+            if pd.notna(sdate):
+                dd=(pd.to_datetime(cand["_Date"],errors="coerce").dt.normalize()-sdate.normalize()).dt.days
+                cand=cand[(dd>=0)&(dd<=10)].copy()
+
+            cand["_DIFF"]=(pd.to_numeric(cand["_Credit"],errors="coerce")-exp).abs()
+
+            # Provider-level expected fee pattern. Tabby observed sample has SAR 5 deduction.
+            if provider=="TABBY":
+                cand["_DIFF_FEE"]=(pd.to_numeric(cand["_Credit"],errors="coerce")-(exp-tabby_fixed_fee)).abs()
+                cand["_BEST_DIFF"]=cand[["_DIFF","_DIFF_FEE"]].min(axis=1)
+            else:
+                cand["_BEST_DIFF"]=cand["_DIFF"]
+
+            # Narration evidence improves confidence but is not required if the amount/date is unique.
+            if terminal and "Narration Terminal ID" in cand.columns:
+                term_match=cand["Narration Terminal ID"].astype(str).eq(terminal)
+            else:
+                term_match=pd.Series(False,index=cand.index)
+            if pay and "Narration Scheme" in cand.columns:
+                scheme_match=cand["Narration Scheme"].apply(_norm_payment).eq(pay)
+            else:
+                scheme_match=pd.Series(False,index=cand.index)
+            cand["_EvidenceScore"]=term_match.astype(int)*2 + scheme_match.astype(int)
+
+        sel=None;status="BANK RECEIPT PENDING";rule="";diff=np.nan
+        if not cand.empty:
+            within=cand[cand["_BEST_DIFF"]<=float(tolerance)].copy()
+            if len(within)>1:
+                mx=within["_EvidenceScore"].max()
+                best=within[within["_EvidenceScore"]==mx]
+                if len(best)==1 and mx>0:
+                    sel=best.iloc[0]
+            elif len(within)==1:
+                sel=within.iloc[0]
+
+            if sel is not None:
+                used.add(sel.name)
+                actual=float(sel["_Credit"])
+                raw_diff=round(actual-exp,2)
+                if provider=="TABBY" and abs(actual-(exp-tabby_fixed_fee))<=float(tolerance):
+                    status="BANK RECEIVED"
+                    rule=f"TABBY Payout - Fixed Fee SAR {tabby_fixed_fee:.2f} - Bank Credit"
+                    diff=round(actual-(exp-tabby_fixed_fee),2)
+                else:
+                    status="BANK RECEIVED"
+                    rule="Settlement Batch + Bank Credit"
+                    diff=raw_diff
+            elif len(within)>1:
+                status="BANK REVIEW REQUIRED";rule="Multiple bank credits satisfy settlement batch"
+
+        rec=r.to_dict()
+        rec.update({
+            "Settlement Status":status,
+            "Bank Match Rule":rule,
+            "Actual Bank Amount":float(sel["_Credit"]) if sel is not None else np.nan,
+            "Bank Date":sel["_Date"] if sel is not None else pd.NaT,
+            "Bank Difference":diff,
+            "Bank Reference":(
+                str(sel.get("Narration",sel.get("Reference",""))) if sel is not None else ""
+            ),
+        })
+        rows.append(rec)
+    result=pd.DataFrame(rows)
+    bank_unmatched=b[~b.index.isin(used)].copy()
+    return result,bank_unmatched
+
+def propagate_batch_settlement_to_matched(matched,batch_results):
+    """
+    Propagate verified batch settlement back to all constituent matched transactions.
+    Existing transaction identity and reconciliation evidence are preserved.
+    """
+    if matched is None or matched.empty:return matched
+    out=matched.copy()
+    for c,default in [
+        ("Settlement Batch ID",""),("Settlement Stage","TRANSACTION MATCHED"),
+        ("Provider Settled",False),("Bank Settled",False),("Settlement Match Rule",""),
+        ("Settlement Bank Amount",np.nan),("Settlement Bank Date",pd.NaT),
+        ("Settlement Bank Reference","")
+    ]:
+        if c not in out.columns: out[c]=default
+
+    if batch_results is None or batch_results.empty:
+        return out
+
+    # ANB/AMEX propagation via Store+Terminal+Date+Payment.
+    for _,b in batch_results.iterrows():
+        if str(b.get("Settlement Status",""))!="BANK RECEIVED":
+            continue
+        provider=str(b.get("Provider","")).upper()
+        batch_id=str(b.get("Settlement Batch ID",""))
+        bank_amt=b.get("Actual Bank Amount",np.nan)
+        bank_date=b.get("Bank Date",pd.NaT)
+        bank_ref=str(b.get("Bank Reference",""))
+        rule=str(b.get("Bank Match Rule",""))
+
+        mask=pd.Series(False,index=out.index)
+        if provider in {"ANB POS","AMEX"}:
+            d=pd.to_datetime(out.get("POS Date",out.get("Date")),errors="coerce").dt.normalize()
+            mask=(
+                out["Store Code"].astype(str).eq(str(b.get("Store Code","")))
+                & out["Payment Type"].apply(_norm_payment).eq(_norm_payment(b.get("Payment Type","")))
+                & d.eq(pd.to_datetime(b.get("Settlement Date"),errors="coerce").normalize())
+            )
+            if "Terminal ID" in out.columns and str(b.get("Terminal ID","")).strip():
+                mask=mask & out["Terminal ID"].astype(str).eq(str(b.get("Terminal ID","")).strip())
+        else:
+            # Provider payout batches can propagate by provider if the batch contains explicit
+            # Underlying IDs; otherwise keep transaction-level settlement unchanged until a
+            # stronger linkage is supplied.
+            ids=str(b.get("Underlying IDs","")).split("|") if b.get("Underlying IDs") else []
+            if ids and "Unique Transaction ID" in out.columns:
+                mask=out["Unique Transaction ID"].astype(str).isin(ids)
+
+        if mask.any():
+            out.loc[mask,"Settlement Batch ID"]=batch_id
+            out.loc[mask,"Settlement Stage"]="BANK RECEIVED"
+            out.loc[mask,"Provider Settled"]=True
+            out.loc[mask,"Bank Settled"]=True
+            out.loc[mask,"Settlement Match Rule"]=rule
+            out.loc[mask,"Settlement Bank Amount"]=bank_amt
+            out.loc[mask,"Settlement Bank Date"]=bank_date
+            out.loc[mask,"Settlement Bank Reference"]=bank_ref
+    return out
+
+def settlement_stage_summary(matched):
+    if matched is None or matched.empty:return pd.DataFrame()
+    x=matched.copy()
+    if "Settlement Stage" not in x.columns:
+        x["Settlement Stage"]=np.where(x.get("Bank Settled",False),"BANK RECEIVED","TRANSACTION MATCHED")
+    rows=[]
+    for (store,pay,stage),g in x.groupby(["Store Code","Payment Type","Settlement Stage"],dropna=False):
+        rows.append({
+            "Store Code":store,"Payment Type":pay,"Settlement Stage":stage,
+            "Transactions":len(g),
+            "D365 Amount":float(pd.to_numeric(g.get("D365 Amount",0),errors="coerce").fillna(0).sum()),
+            "Net Amount":float(pd.to_numeric(g.get("Net Amount",0),errors="coerce").fillna(0).sum()),
+        })
+    return pd.DataFrame(rows)
+
 
 def normalize_d365_gl(df, source="D365 GL"):
     """
