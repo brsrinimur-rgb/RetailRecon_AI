@@ -14,6 +14,16 @@ REQUIRED_LEGACY_FILES=[
     "pages/1_POS_Reconciliation.py",
     "pages/24_JV_Creation.py",
     "pages/30_D365_GL_Reconciliation.py",
+    # Added: flagged as a gap in the V26 review ("a deployment missing
+    # bank_settlement_extension.py would fail at runtime rather than at
+    # this explicit gate") and never actually added until now. Settlement
+    # matching and provider payout routing depend entirely on this module;
+    # a deployment missing it fails with a NameError deep inside a page
+    # click instead of failing loudly here, at the one page built
+    # specifically to catch exactly that kind of gap.
+    "logic/bank_settlement_extension.py",
+    "pages/18_Settlement_Batch_Engine.py",
+    "pages/14_Store_Mapping_Master.py",
 ]
 
 LOGIC_MODULES=[

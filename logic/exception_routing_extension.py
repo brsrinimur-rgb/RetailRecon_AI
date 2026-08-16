@@ -67,6 +67,25 @@ def route_auth_correction_candidates(unmatched_sales, unmatched_pos, sales_detai
 
             if store_col:
                 pc=pc[pc[store_col].astype(str).str.strip().eq(store)]
+                # Store-reliability gate, aligned with core.reconcile()'s own
+                # auto-resolution rule (flagged as a gap in the V25 code
+                # review, fixed here): a bare textual match on the store
+                # column is not trusted on its own. A generic merchant/company
+                # name (e.g. "UNITED LUXURY CORP") could coincidentally equal
+                # the D365 store string without actually being a reliable
+                # store identification. Only trust the match when the POS
+                # Store value is itself a pure numeric code, OR the row
+                # carries confirmed Terminal/Merchant mapping evidence --
+                # identical three-part condition to core.reconcile()'s
+                # "reliable" mask, so this candidate matcher can never
+                # suggest a correction the main deterministic engine would
+                # have refused to auto-match on the same store evidence.
+                reliable=pc[store_col].astype(str).str.fullmatch(r"\d+")
+                if "Terminal Store Mapped" in pc.columns:
+                    reliable=reliable | pc["Terminal Store Mapped"].fillna(False)
+                if "Merchant Store Mapped" in pc.columns:
+                    reliable=reliable | pc["Merchant Store Mapped"].fillna(False)
+                pc=pc[reliable].copy()
             d365_pay=_norm_payment(r.get("D365 Payment",r.get("Payment Type","")))
             if pay_col and d365_pay:
                 pc=pc[pc[pay_col].apply(_norm_payment).eq(d365_pay)]

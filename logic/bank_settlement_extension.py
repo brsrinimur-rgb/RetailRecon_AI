@@ -226,7 +226,9 @@ def reconcile_card_batches_to_anb(batches, bank, tolerance=1.0):
         y=x.copy(); y["Settlement Status"]="BANK RECEIPT PENDING"
         return y,b
 
-    b=b[(b.get("Bank","").astype(str)=="ANB") & (pd.to_numeric(b.get("Credit",0),errors="coerce").fillna(0)>0)].copy()
+    b=b.copy()
+    b["Bank"]=b.get("Bank","").apply(_canonical_bank)
+    b=b[(b["Bank"]=="ANB") & (pd.to_numeric(b.get("Credit",0),errors="coerce").fillna(0)>0)].copy()
     used=set(); rows=[]
 
     for _,r in x.iterrows():
