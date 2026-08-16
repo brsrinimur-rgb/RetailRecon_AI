@@ -2,17 +2,19 @@
 pages/34_AI_Settlement_Explainer.py
 V32 — read-only page. Explains Review Required / Receipt Pending batches
 using logic.ai_settlement_explainer. Never writes Settlement Status, Bank
-Settled, Underlying IDs, or a JV. See that module's docstring for the
-verification-status caveat before trusting this against production numbers.
+Settled, Underlying IDs, or a JV.
 
-NOTE ON INTEGRATION: this page assumes st.session_state.ct_result exists
-with the dataset names documented across V25-V28 ("Settlement Batches",
-"Settlement Bank Unmatched", "Provider Payout Batches"). It also assumes
-`auth`, `theme`, `core` modules exist per every other page in this
-codebase, matching the import pattern already confirmed in the V25/V26
-reviews. These have not been independently re-confirmed against a live
-app in this engagement -- adjust imports/column names against the real
-app before relying on this.
+NOTE ON INTEGRATION: this page reads st.session_state.ct_result using the
+CONFIRMED real, lowercase/snake_case keys ("settlement_batches",
+"settlement_bank_unmatched", "provider_payout_batches") as actually written
+by pages/1_POS_Reconciliation.py -- verified directly against that source,
+not assumed. The `auth`/`theme`/`core` import pattern matches every other
+page in the real codebase, also confirmed directly. Remaining open items are
+functional, not schema-related: the model endpoint in call_model_stub()
+below is still not wired (see that function), and this has not yet been run
+against a live production ct_result end-to-end -- see
+logic/ai_settlement_explainer.py's module docstring for the current
+verification status.
 """
 
 import json
@@ -44,9 +46,12 @@ if not ct_result:
             "run from the Reconciliation Run History page.")
     st.stop()
 
-settlement_batches = ct_result.get("Settlement Batches")
-settlement_bank_unmatched = ct_result.get("Settlement Bank Unmatched")
-provider_payout_batches = ct_result.get("Provider Payout Batches")
+# CONFIRMED against the real pages/1_POS_Reconciliation.py source: ct_result
+# keys are lowercase/snake_case, not title-case. The earlier title-case keys
+# here were wrong and would silently find nothing on real data.
+settlement_batches = ct_result.get("settlement_batches")
+settlement_bank_unmatched = ct_result.get("settlement_bank_unmatched")
+provider_payout_batches = ct_result.get("provider_payout_batches")
 
 if settlement_batches is None or (hasattr(settlement_batches, "empty") and settlement_batches.empty):
     st.info("No Settlement Batches found in the current session result.")

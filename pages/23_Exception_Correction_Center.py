@@ -1,6 +1,8 @@
 import pandas as pd
 import streamlit as st
 import auth, theme, db, core
+from logic import exception_routing_extension as exc_route
+from logic import bank_settlement_extension as bank_ext
 
 st.set_page_config(page_title="Exception Correction Center",layout="wide",page_icon="🛠️")
 auth.require_login({"Admin","Finance Manager","Finance Maker","Finance Checker"})
@@ -26,13 +28,27 @@ if not r:
 
 # ------------------------------------------------------------- SUBMIT
 st.subheader("1. Submit Correction")
-u=r.get("unmatched_sales",pd.DataFrame()).copy()
-if not u.empty and "Auto Resolution Status" not in u.columns:
-    u["Auto Resolution Status"]="Manual Review Required"
+all_unmatched=r.get("unmatched_sales",pd.DataFrame()).copy()
+u=exc_route.route_auth_correction_candidates(
+    all_unmatched,
+    r.get("unmatched_pos",pd.DataFrame()),
+    r.get("sales_details",pd.DataFrame()),
+    1.0
+)
+other_exceptions=exc_route.unresolved_non_auth_exceptions(all_unmatched,u)
+
 if u.empty:
-    st.info("No unmatched D365 transactions are available for correction.")
+    st.success(
+        "No D365 rows currently have evidence for an Auth Code correction. "
+        "Unmatched rows without a proven replacement Auth remain reconciliation exceptions."
+    )
 else:
-    st.dataframe(u,use_container_width=True,hide_index=True)
+    show_cols=[c for c in [
+        "D365 Row","Store Code","Date","Receipt ID","Auth Code","Suggested Auth Code",
+        "D365 Payment","D365 Amount","Correction Evidence","Evidence Source",
+        "Correction Confidence","Candidate Amount Difference","Sales Order","SalesDetails Bridge Status"
+    ] if c in u.columns]
+    st.dataframe(u[show_cols],use_container_width=True,hide_index=True)
 
     available_rows=sorted(
         pd.to_numeric(u.get("D365 Row",pd.Series(dtype=float)),errors="coerce")
@@ -48,7 +64,13 @@ else:
         c3.metric("Current Auth",str(selected.get("Auth Code","")))
         c4.metric("D365 Tender",str(selected.get("D365 Tender",selected.get("Payment Type",""))))
 
-        new_auth=st.text_input("Corrected Auth Code")
+        suggested=str(selected.get("Suggested Auth Code","")).strip()
+        new_auth=st.text_input("Corrected Auth Code",value=suggested)
+        st.caption(
+            f"Evidence: {selected.get('Correction Evidence','')} | "
+            f"Source: {selected.get('Evidence Source','')} | "
+            f"Confidence: {selected.get('Correction Confidence','')}"
+        )
         reason=st.text_area("Reason / Evidence Reference")
 
         if st.button("SUBMIT CORRECTION",type="primary"):
@@ -70,6 +92,16 @@ else:
                 )
                 st.success("Correction submitted for maker-checker approval.")
                 st.rerun()
+
+st.markdown("### Reconciliation Exceptions — Not Auth Corrections")
+st.caption(
+    "These unmatched D365 rows do not have sufficient evidence for a different Auth Code. "
+    "They remain reconciliation/master-data/provider exceptions and cannot be manually changed here."
+)
+if other_exceptions.empty:
+    st.info("No additional non-Auth reconciliation exceptions.")
+else:
+    st.dataframe(other_exceptions,use_container_width=True,hide_index=True)
 
 st.divider()
 
@@ -138,6 +170,13 @@ else:
                     r.get("bank",pd.DataFrame()),
                     1.0
                 )
+                settlement_batches=core.build_card_settlement_batches(matched)
+                batch_result,bank_unmatched=bank_ext.reconcile_card_batches_advanced(
+                    settlement_batches,r.get("bank",pd.DataFrame()),1.0
+                )
+                matched=bank_ext.propagate_verified_batches(matched,batch_result)
+                r["settlement_batches"]=batch_result
+                r["settlement_bank_unmatched"]=bank_unmatched
                 r["matched"]=matched
                 r["unmatched_sales"]=us
                 r["unmatched_pos"]=up

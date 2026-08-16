@@ -2,6 +2,44 @@ import streamlit as st
 import pandas as pd
 import auth, theme, core, db
 
+# ------------------------------------------------------------------
+# V29 Additive JV grouping configuration
+# ------------------------------------------------------------------
+DEFAULT_JV_PROVIDER_GROUPS = {
+    "MADA": "CC",
+    "VISA": "CC",
+    "MASTERCARD": "CC",
+    "AMEX": "AMEX",
+    "TABBY": "TABBY",
+    "TAMARA": "TAMARA",
+    "TAP": "TAP",
+}
+
+def _norm_payment_v29(v):
+    s=str(v or "").strip().upper().replace(" ","")
+    aliases={
+        "P":"MADA","P1":"MADA","MADA":"MADA",
+        "VC":"VISA","VISA":"VISA","VISACARD":"VISA",
+        "MC":"MASTERCARD","MASTER":"MASTERCARD","MASTERCARD":"MASTERCARD",
+        "AX":"AMEX","AMEX":"AMEX",
+        "TABBY":"TABBY","TAMARA":"TAMARA","TAP":"TAP",
+    }
+    return aliases.get(s,str(v or "").strip().upper())
+
+def _apply_provider_grouping(df, mapping):
+    if df is None or df.empty:
+        return df
+    out=df.copy()
+    if "Payment Type" not in out.columns:
+        out["Payment Type"]=""
+    out["JV Group"]=out["Payment Type"].apply(_norm_payment_v29).map(mapping)
+    # Unknown providers remain separate by their normalized payment/provider name.
+    out["JV Group"]=out["JV Group"].fillna(
+        out["Payment Type"].apply(_norm_payment_v29)
+    )
+    return out
+
+
 st.set_page_config(page_title="JV Creation", layout="wide")
 auth.require_login({"Admin", "Finance Manager", "Finance Maker"})
 auth.render_user_sidebar()
@@ -11,9 +49,10 @@ st.markdown(theme.top_banner("RETAIL CONTROL TOWER", "JV Creation"), unsafe_allo
 st.title("JV Creation — All Locations by Date Range")
 
 st.info(
-    "Confirmed Finance grouping: CC = MADA + VISA + MASTERCARD. "
-    "AMEX, TABBY, TAMARA and TAP remain separate JVs. "
-    "The selected From/To dates are applied to the Matched report for ALL locations."
+    "Confirmed Finance control: for the selected full period, only transactions whose "
+    "settlement amount has actually been received and verified in the bank account can enter the normal JV. "
+    "Pending/unreceived amounts are excluded only for themselves and carried forward; they do not block the rest of the month. "
+    "Default grouping is CC = MADA + VISA + MASTERCARD, while AMEX, TABBY, TAMARA and TAP remain separate unless Finance edits the grouping."
 )
 
 r=st.session_state.get("ct_result")
@@ -43,6 +82,64 @@ if from_date>to_date:
     st.error("From Date cannot be later than To Date.")
     st.stop()
 
+st.markdown("### JV Basis & Provider Grouping")
+st.caption(
+    "Choose how JVs are grouped before creation. Default Finance rule remains "
+    "CC = MADA + VISA + MASTERCARD. AMEX, TABBY, TAMARA and TAP remain separate. "
+    "Changes on this screen affect only the current JV creation run unless saved later to a master."
+)
+
+basis=st.radio(
+    "Create JV based on",
+    ["Service Provider / Payment Type","Default Finance Grouping"],
+    horizontal=True,
+    index=0,
+)
+
+_current_map=DEFAULT_JV_PROVIDER_GROUPS.copy()
+
+if basis=="Service Provider / Payment Type":
+    with st.expander("Edit JV Provider Grouping",expanded=True):
+        st.caption(
+            "Edit the JV Group value if Finance wants a different grouping. "
+            "Example: keep MADA/VISA/MASTERCARD as CC, or split them into separate JVs."
+        )
+        _rows=[]
+        for _provider in ["MADA","VISA","MASTERCARD","AMEX","TABBY","TAMARA","TAP"]:
+            _rows.append({
+                "Service Provider / Payment Type":_provider,
+                "JV Group":_current_map[_provider],
+                "Active":True,
+            })
+        _cfg=pd.DataFrame(_rows)
+        _edited=st.data_editor(
+            _cfg,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key="jv_provider_grouping_editor",
+            column_config={
+                "Service Provider / Payment Type":st.column_config.TextColumn(disabled=True),
+                "JV Group":st.column_config.TextColumn(
+                    help="Transactions with the same JV Group are combined within each Store and selected date range."
+                ),
+                "Active":st.column_config.CheckboxColumn(
+                    help="Uncheck to exclude this provider/payment type from the current JV creation run."
+                ),
+            }
+        )
+        _active_providers=set()
+        for _,_r in _edited.iterrows():
+            _p=_norm_payment_v29(_r["Service Provider / Payment Type"])
+            _g=str(_r["JV Group"]).strip().upper()
+            if bool(_r["Active"]):
+                _active_providers.add(_p)
+                _current_map[_p]=_g or _p
+else:
+    _active_providers=set(DEFAULT_JV_PROVIDER_GROUPS.keys())
+
+st.session_state["jv_provider_grouping_current"]=_current_map.copy()
+
 # ---------------------------------------------------------------
 # JV Eligibility Breakdown
 # ---------------------------------------------------------------
@@ -50,12 +147,49 @@ scope=matched.copy()
 scope["_Date"]=pd.to_datetime(scope["Date"],errors="coerce").dt.date
 scope=scope[(scope["_Date"]>=from_date)&(scope["_Date"]<=to_date)].copy()
 
+# V29: provider/payment grouping is configurable for the current JV run.
+if "Payment Type" in scope.columns:
+    scope["Payment Type"]=scope["Payment Type"].apply(_norm_payment_v29)
+    scope=scope[scope["Payment Type"].isin(_active_providers)].copy()
+scope=_apply_provider_grouping(scope,_current_map)
+
 scope["_Matched"]=scope.get("Status","").astype(str).eq("Matched")
 scope["_Difference"]=pd.to_numeric(scope.get("Difference",0),errors="coerce")
 scope["_Tolerance_OK"]=scope["_Difference"].abs().le(1.0)
-scope["_Bank_Settled"]=scope.get("Bank Settled",False).fillna(False).astype(bool)
-scope["_Settlement_Stage"]=scope.get("Settlement Stage","").fillna("").astype(str)
-scope["_Ready"]=scope["_Matched"] & scope["_Tolerance_OK"] & scope["_Bank_Settled"]
+# Backward-compatible settlement fields:
+# Older reconciliation runs may not contain V24/V25 settlement columns.
+if "Bank Settled" in scope.columns:
+    scope["_Bank_Settled"]=scope["Bank Settled"].fillna(False).astype(bool)
+else:
+    scope["_Bank_Settled"]=pd.Series(False,index=scope.index,dtype=bool)
+
+if "Settlement Stage" in scope.columns:
+    scope["_Settlement_Stage"]=scope["Settlement Stage"].fillna("").astype(str)
+else:
+    scope["_Settlement_Stage"]=pd.Series("",index=scope.index,dtype="object")
+
+# Normal full-period JV requires the money to have reached the bank by the
+# selected To Date. A July transaction settled in August is a July carry-forward
+# item, not a normal July JV item.
+if "Settlement Bank Date" in scope.columns:
+    scope["_Bank_Receipt_Date"]=pd.to_datetime(scope["Settlement Bank Date"],errors="coerce")
+elif "Bank Date" in scope.columns:
+    scope["_Bank_Receipt_Date"]=pd.to_datetime(scope["Bank Date"],errors="coerce")
+else:
+    scope["_Bank_Receipt_Date"]=pd.NaT
+
+scope["_Received_By_Period_End"]=(
+    scope["_Bank_Settled"]
+    & scope["_Bank_Receipt_Date"].notna()
+    & (scope["_Bank_Receipt_Date"].dt.date<=to_date)
+)
+
+scope["_Ready"]=(
+    scope["_Matched"]
+    & scope["_Tolerance_OK"]
+    & scope["_Bank_Settled"]
+    & scope["_Received_By_Period_End"]
+)
 
 def _block_reason(row):
     reasons=[]
@@ -66,6 +200,11 @@ def _block_reason(row):
     if not bool(row["_Bank_Settled"]):
         stage=str(row.get("_Settlement_Stage","")).strip()
         reasons.append(stage if stage and stage!="TRANSACTION MATCHED" else "Bank Settlement Pending")
+    elif not bool(row["_Received_By_Period_End"]):
+        if pd.isna(row.get("_Bank_Receipt_Date")):
+            reasons.append("Bank Settlement Date Missing")
+        else:
+            reasons.append("Settled After Period End - Carry Forward")
     return "Ready" if not reasons else "; ".join(reasons)
 
 scope["_Block Reason"]=scope.apply(_block_reason,axis=1)
@@ -92,6 +231,9 @@ if not scope.empty:
             if vals:
                 store_name=vals[0]
 
+        _amt=pd.to_numeric(g.get("D365 Amount",0),errors="coerce").fillna(0.0)
+        _ready_amt=float(_amt[g["_Ready"]].sum())
+        _blocked_amt=float(_amt[~g["_Ready"]].sum())
         elig_rows.append({
             "Store Code":str(store),
             "Store Name":store_name,
@@ -99,6 +241,8 @@ if not scope.empty:
             "Matched in Period":matched_count,
             "Bank Settled & Within Tolerance":settled_count,
             "Ready for JV":ready_count,
+            "Eligible / Received Amount":_ready_amt,
+            "Blocked / Carry Forward Amount":_blocked_amt,
             "Blocked":blocked_count,
             "Reason":reason_text,
         })
@@ -113,7 +257,7 @@ preview=scope[scope["_Ready"]].copy()
 
 if not preview.empty:
     preview["Payment Type"]=preview["Payment Type"].apply(core._norm_payment)
-    preview["JV Group"]=preview["Payment Type"].apply(core.jv_group)
+    preview=_apply_provider_grouping(preview,_current_map)
     preview["_Amount"]=pd.to_numeric(preview["D365 Amount"],errors="coerce").fillna(0.0)
     summary=(
         preview.groupby(["Store Code","JV Group"],dropna=False)
@@ -130,6 +274,8 @@ if not preview.empty:
     summary=summary.drop(columns=["Gross_Amount"])
 else:
     summary=pd.DataFrame()
+
+
 
 st.markdown("### 2. JV Eligibility Breakdown — All Locations")
 st.caption(
@@ -162,6 +308,21 @@ if summary.empty:
     st.warning("No bank-settled Matched transactions are eligible in the selected date range.")
 else:
     st.dataframe(summary,use_container_width=True,hide_index=True)
+
+st.markdown("### Full-Period Received vs Carry Forward Control")
+_total_period_amt=float(pd.to_numeric(scope.get("D365 Amount",0),errors="coerce").fillna(0).sum()) if not scope.empty else 0.0
+_received_jv_amt=float(pd.to_numeric(scope.loc[scope["_Ready"],"D365 Amount"],errors="coerce").fillna(0).sum()) if not scope.empty else 0.0
+_carry_forward_amt=float(pd.to_numeric(scope.loc[~scope["_Ready"],"D365 Amount"],errors="coerce").fillna(0).sum()) if not scope.empty else 0.0
+_cf_count=int((~scope["_Ready"]).sum()) if not scope.empty else 0
+_fc1,_fc2,_fc3,_fc4=st.columns(4)
+_fc1.metric("Period Amount",f"SAR {_total_period_amt:,.2f}")
+_fc2.metric("Bank Received & JV Eligible",f"SAR {_received_jv_amt:,.2f}")
+_fc3.metric("Carry Forward / Not Yet Eligible",f"SAR {_carry_forward_amt:,.2f}")
+_fc4.metric("Carry Forward Transactions",f"{_cf_count:,}")
+st.caption(
+    "Normal JV creation includes only the bank-received eligible amount. "
+    "Pending amounts remain linked to their original transaction period and carry forward until settlement is verified."
+)
 
 st.markdown("### 4. D365 Accounting Date")
 period_ctrl=db.load_accounting_period_control("ULC")
@@ -201,6 +362,8 @@ if st.button(
         period_control=period_ctrl,
         from_date=from_date,
         to_date=to_date,
+        grouping_map=_current_map,
+        active_payment_types=_active_providers,
     )
     j=core.validate_jv(j,gl_config)
     db.replace_jv(j)

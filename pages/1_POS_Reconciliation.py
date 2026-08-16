@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import importlib
 import auth, theme, core, db
+from logic import bank_settlement_extension as bank_ext
 import report_export
 
 # Reload current core.py from disk on each page run to avoid stale Streamlit module state.
@@ -61,6 +62,12 @@ with st.sidebar:
     st.header("Reconciliation Settings")
     tolerance=st.number_input("Tolerance (SAR)",0.0,10.0,1.0,0.25)
     st.caption("Matched within approved SAR 1 tolerance can proceed only after bank settlement and Finance approval.")
+    settlement_lag_days=st.number_input(
+        "Extra ANB settlement lag (days, on top of existing 0-3 day window)",
+        0,10,0,1,
+        help="Widens how many additional days beyond the standard 0-3 day window a bank "
+             "credit is still considered for a POS batch. 0 leaves matching exactly as before."
+    )
 
 uploads=st.file_uploader("Upload D365 Store Tender + D365 Sales Details + POS/AMEX/Tabby/Tamara/Tap files",type=["xlsx","xls","csv"],accept_multiple_files=True)
 bank_uploads=st.file_uploader("Upload Bank Statements (ANB / Al Rajhi)",type=["xlsx","xls","csv"],accept_multiple_files=True)
@@ -69,8 +76,15 @@ prev_cf=st.file_uploader("Previous Carry Forward (optional)",type=["xlsx","xls",
 if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
     try:
         tender_parts=[];sales_details_parts=[];pos_parts=[];quarantine=[]
+        payout_sheets=set()
         for f in uploads or []:
             for sheet,df in core.read_upload(f).items():
+                payout_type=core.classify_settlement_source(f.name,df)
+                if payout_type in {"TABBY_PAYOUT","TAMARA_PAYOUT","TAP_PAYOUT","AMEX_PAYOUT"}:
+                    payout_sheets.add((f.name,sheet))
+                    # A payout/settlement sheet must never also be normalized as
+                    # a transaction source. It will be picked up by the payout scan below.
+                    continue
                 typ=core.classify(f"{f.name}-{sheet}",df)
                 if typ=="D365 STORE TENDER":
                     tender_parts.append(core.normalize_tender(df))
@@ -145,14 +159,24 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         matched,us,up=core.reconcile(tender_for_pos,pos,tolerance)
         banks=[]
         bank_skipped=[]
+        provider_payout_parts=[]
         for f in bank_uploads or []:
             for sheet,df in core.read_upload(f).items():
                 bank="Al Rajhi Bank" if "rajhi" in f.name.lower() else "ANB Bank"
                 try:
-                    b=core.normalize_bank(df,bank)
+                    # V24 additive parser first: recognizes the Finance-supplied
+                    # ANB and Al Rajhi statement structures and preserves narration evidence.
+                    b=bank_ext.normalize_bank_statement(df,f.name)
+                    if b is None or b.empty:
+                        # Legacy parser remains as fallback.
+                        b=core.normalize_bank(
+                            df,bank,source_file=f.name,source_sheet=sheet
+                        )
                     if b is not None and not b.empty:
                         b["Bank Source File"]=f.name
                         b["Bank Source Sheet"]=sheet
+                        if "Bank Source Row" not in b.columns:
+                            b["Bank Source Row"]=range(1,len(b)+1)
                         banks.append(b)
                     else:
                         bank_skipped.append({
@@ -169,12 +193,127 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
                         "Reason":str(e)
                     })
 
+        # V26 additive provider-payout scan from the files already supplied to POS Reconciliation.
+        # It does not replace the normal provider transaction parser.
+        _all_for_payout=[]
+        for _v in ["uploads","files","provider_uploads","pos_uploads"]:
+            _obj=locals().get(_v)
+            if _obj:
+                try:
+                    _all_for_payout.extend(list(_obj) if isinstance(_obj,(list,tuple)) else [_obj])
+                except Exception:
+                    pass
+        _seen=set()
+        for _f in _all_for_payout:
+            _name=getattr(_f,"name",str(_f))
+            if _name in _seen:
+                continue
+            _seen.add(_name)
+            try:
+                for _sheet,_df in core.read_upload(_f).items():
+                    _typ=core.classify_settlement_source(_name,_df)
+                    _pb=pd.DataFrame()
+                    if _typ=="TAMARA_PAYOUT":
+                        _pb=core.normalize_tamara_payout(_df,_name)
+                    elif _typ=="TABBY_PAYOUT":
+                        _pb=core.normalize_tabby_payout(_df,_name)
+                    elif _typ=="TAP_PAYOUT":
+                        _pb=core.normalize_tap_payout(_df,_name)
+                    if _pb is not None and not _pb.empty:
+                        provider_payout_parts.append(_pb)
+            except Exception:
+                # Payout discovery must not break the proven reconciliation parser.
+                pass
+        r_provider_batches=pd.concat(provider_payout_parts,ignore_index=True) if provider_payout_parts else pd.DataFrame()
+        if r_provider_batches is not None and not r_provider_batches.empty:
+            # TABBY only: link payout Order Numbers to the already-trusted
+            # matched Provider Reference. Tamara/TAP remain unlinked until a
+            # trusted transaction-level key is proven.
+            r_provider_batches=core.link_tabby_payout_underlying_ids(r_provider_batches,matched)
+
         bank=pd.concat(banks,ignore_index=True) if banks else pd.DataFrame()
+
+        # Preserve the proven legacy transaction-level bank matching first.
         matched=core.apply_bank_settlement(matched,bank,tolerance)
+
+        # V24 additive settlement-batch pass:
+        # ANB card settlements are verified by terminal + source date + scheme + net amount,
+        # then BANK RECEIVED is propagated to all underlying matched transactions.
+        settlement_batches=core.build_card_settlement_batches(matched)
+        card_batch_result,card_bank_unmatched=bank_ext.reconcile_card_batches_advanced(
+            settlement_batches,bank,tolerance,settlement_lag_days
+        )
+        matched=bank_ext.propagate_verified_batches(matched,card_batch_result)
+
+        # V26: provider payout settlement is also part of the main reconciliation path
+        # when provider payout batches are available. This removes the undocumented
+        # requirement to visit Settlement Batch Engine separately just to release
+        # Tabby/Tamara/TAP transactions to bank-settled status.
+        provider_batches=r_provider_batches if "r_provider_batches" in locals() else pd.DataFrame()
+        provider_batch_result=pd.DataFrame()
+        provider_bank_unmatched=pd.DataFrame()
+        if provider_batches is not None and not provider_batches.empty:
+            provider_batch_result,provider_bank_unmatched=bank_ext.reconcile_provider_batches_to_rajhi(
+                provider_batches,bank,tolerance,5.0
+            )
+            matched=bank_ext.propagate_verified_batches(matched,provider_batch_result)
+
         previous=None
         if prev_cf:
             previous=list(core.read_upload(prev_cf).values())[0]
-        cf=core.make_carry_forward(us,up,previous)
+
+        # Split the uploaded previous-period carry-forward file by which kind
+        # of row it actually is BEFORE feeding it to either function. Without
+        # this split, the whole `previous` file was passed into both
+        # make_carry_forward() and build_settlement_carry_forward()
+        # unconditionally -- and both functions re-attach every row they're
+        # given, tagged "Carry Forward Source"="Prior Period", with no
+        # filtering of their own. Since the file this page itself produces is
+        # exactly cf = concat([cf_legacy, cf_settlement]), re-uploading a
+        # prior export meant every row appeared twice in the new cf: once via
+        # cf_legacy, once via cf_settlement.
+        previous_legacy=None
+        previous_settlement=None
+        if previous is not None and not previous.empty:
+            if "Carry Forward Type" in previous.columns:
+                _leg=previous[
+                    previous["Carry Forward Type"].notna()
+                    & previous["Carry Forward Type"].astype(str).str.strip().ne("")
+                ]
+                previous_legacy=_leg if not _leg.empty else None
+            if "Carry Forward Status" in previous.columns:
+                _settle=previous[
+                    previous["Carry Forward Status"].notna()
+                    & previous["Carry Forward Status"].astype(str).str.strip().ne("")
+                ]
+                previous_settlement=_settle if not _settle.empty else None
+            # Backward compatible: an older uploaded file that predates this
+            # split (has neither discriminating column) is treated exactly as
+            # before settlement carry-forward existed -- legacy-only, never
+            # duplicated into both paths.
+            if previous_legacy is None and previous_settlement is None:
+                previous_legacy=previous
+
+        # Legacy unmatched carry-forward remains intact.
+        cf_legacy=core.make_carry_forward(us,up,previous_legacy)
+
+        # Settlement carry-forward adds matched transactions whose bank receipt
+        # is still pending at the selected period end. Original transaction date
+        # is preserved and later settlement is tracked in the resolution period.
+        from logic.carry_forward_extension import build_settlement_carry_forward
+        _period_end=pd.to_datetime(tender["Date"],errors="coerce").max()
+        cf_settlement=build_settlement_carry_forward(
+            matched,
+            period_end=_period_end,
+            previous=previous_settlement
+        )
+        cf=pd.concat(
+            [x for x in [cf_legacy,cf_settlement] if x is not None and not x.empty],
+            ignore_index=True,sort=False
+        ) if (
+            (cf_legacy is not None and not cf_legacy.empty)
+            or (cf_settlement is not None and not cf_settlement.empty)
+        ) else pd.DataFrame()
         qdf=pd.DataFrame(quarantine)
         bqdf=pd.DataFrame(bank_skipped)
         if not bqdf.empty:
@@ -184,7 +323,40 @@ if st.button("RUN RECONCILIATION",type="primary",use_container_width=True):
         st.session_state.ct_result={"matched":matched,"unmatched_sales":us,"unmatched_pos":up,"carry_forward":cf,
                                     "cash_transactions":cash_transactions,
                                     "tender":tender,"sales_details":sales_details,"store613_bridge":store613_bridge,
-                                    "pos":pos,"bank":bank,"quarantine":qdf}
+                                    "pos":pos,"bank":bank,"quarantine":qdf,
+                                    "settlement_batches":pd.concat(
+                                        [x for x in [card_batch_result,provider_batch_result]
+                                         if x is not None and not x.empty],
+                                        ignore_index=True
+                                    ) if (
+                                        (card_batch_result is not None and not card_batch_result.empty)
+                                        or (provider_batch_result is not None and not provider_batch_result.empty)
+                                    ) else pd.DataFrame(),
+                                    "settlement_bank_unmatched":pd.concat(
+                                        [x for x in [card_bank_unmatched,provider_bank_unmatched]
+                                         if x is not None and not x.empty],
+                                        ignore_index=True
+                                    ) if (
+                                        (card_bank_unmatched is not None and not card_bank_unmatched.empty)
+                                        or (provider_bank_unmatched is not None and not provider_bank_unmatched.empty)
+                                    ) else pd.DataFrame(),
+                                    "provider_payout_batches":r_provider_batches,
+                                    "settlement_blocker_summary":bank_ext.settlement_blocker_summary(matched)}
+        # Persist an auditable run snapshot so a later reconciliation does not
+        # erase access to the previous reports.
+        try:
+            _u=st.session_state.get("user",{})
+            _run_id=db.save_reconciliation_run(
+                st.session_state.ct_result,
+                user=str(_u.get("username","system")),
+                period_from=pd.to_datetime(tender["Date"],errors="coerce").min(),
+                period_to=pd.to_datetime(tender["Date"],errors="coerce").max(),
+            )
+            st.session_state["current_reconciliation_run_id"]=_run_id
+            st.caption(f"Saved reconciliation run: {_run_id}")
+        except Exception as _hist_err:
+            quarantine.append({"File":"","Sheet":"","Reason":f"Run history save warning: {_hist_err}"})
+
         st.success("Reconciliation completed and saved to the current control-tower session.")
     except Exception as e:
         st.exception(e)
