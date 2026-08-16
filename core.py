@@ -1777,6 +1777,16 @@ D365_JV_DEFAULTS = {
     "COMPANY": "ULC",
     "CURRENCY": "SAR",
     "BANK_ACCOUNT": "1015",
+
+    # Provider-specific bank GL overrides. Defaults deliberately equal the
+    # existing BANK_ACCOUNT so V44 is fully backward-compatible. Finance can
+    # edit these independently on GL Configuration (page 22) without changing
+    # Python. Only TABBY/TAMARA/TAP use these keys; all other groups continue
+    # to use BANK_ACCOUNT unless separately changed in a future controlled release.
+    "TABBY_BANK_ACCOUNT": "1015",
+    "TAMARA_BANK_ACCOUNT": "1015",
+    "TAP_BANK_ACCOUNT": "1015",
+
     "COMMISSION_GL": "7231",
     "VAT_VENDOR": "P0672",
 
@@ -2899,6 +2909,31 @@ def build_d365_gl_exceptions(source_trace,jv_verification,gl_only,actual_gl):
     return out
 
 
+def _bank_gl_for_group(gl_effective, group):
+    """
+    Return the D365 Bank main account for a JV payment group.
+
+    V44 provider-specific overrides:
+      TABBY  -> TABBY_BANK_ACCOUNT
+      TAMARA -> TAMARA_BANK_ACCOUNT
+      TAP    -> TAP_BANK_ACCOUNT
+
+    Every provider-specific key falls back to BANK_ACCOUNT, preserving the
+    pre-V44 behavior and keeping old GL snapshots/configurations valid.
+    """
+    gp=str(group or "").strip().upper()
+    provider_key={
+        "TABBY":"TABBY_BANK_ACCOUNT",
+        "TAMARA":"TAMARA_BANK_ACCOUNT",
+        "TAP":"TAP_BANK_ACCOUNT",
+    }.get(gp)
+    if provider_key:
+        val=str(gl_effective.get(provider_key,"") or "").strip()
+        if val:
+            return val
+    return str(gl_effective.get("BANK_ACCOUNT","") or "").strip()
+
+
 def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None,from_date=None,to_date=None,grouping_map=None,active_payment_types=None,store_master=None):
     """
     Final D365 JV logic confirmed with Finance.
@@ -2910,7 +2945,8 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
       Uses Commission Rate Master transaction-by-transaction.
 
     Confirmed D365 mapping for MADA:
-      Bank       : account type Bank   / 1015
+      Bank       : account type Bank   / BANK_ACCOUNT (default 1015);
+                   TABBY/TAMARA/TAP may use their own editable provider Bank GL override
       Commission : account type Ledger / 7231-{store}--Sale
       VAT        : account type Vendor / P0672
       CC Sale    : Ledger / 11020907-{store}---  (MADA + VISA + MASTERCARD)
@@ -3099,12 +3135,14 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
             "Bank Settlement Verified":True,
         }
 
+        bank_main = _bank_gl_for_group(gl_effective, gp)
+
         rows += [
             {
                 **common,
                 "Account type":"Bank",
-                "Main Account":gl_effective["BANK_ACCOUNT"],
-                "Ledger Dimension":gl_effective["BANK_ACCOUNT"],
+                "Main Account":bank_main,
+                "Ledger Dimension":bank_main,
                 "Default Dimension":store_code,
                 "Location":location,
                 "Brand Dimension":"",
@@ -3198,7 +3236,8 @@ def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)", store_mast
     be approved or posted.
 
     Confirmed baseline (Finance, this engagement):
-      Bank 1015 | Commission 7231 | VAT Vendor P0672 |
+      Bank 1015 default (with editable TABBY/TAMARA/TAP Bank GL overrides) |
+      Commission 7231 | VAT Vendor P0672 |
       CC (MADA+VISA+MASTERCARD) 11020907 | AMEX 11020901 |
       TABBY 11020913 | TAMARA 11020922 | TAP 11020904
       Dimensions: "{account}-{store}--Sale" (Commission), "{account}-{store}---" (Sale)
@@ -3282,11 +3321,12 @@ def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)", store_mast
                 return g.iloc[0:0]
             return g[kind_check(g[acct_type_col].astype(str), g[main_col].astype(str))]
 
-        bank=_lines(lambda t,m: (t=="Bank") & (m==gl_effective["BANK_ACCOUNT"]))
+        expected_bank_account=_bank_gl_for_group(gl_effective,group)
+        bank=_lines(lambda t,m: (t=="Bank") & (m==expected_bank_account))
         if len(bank)!=1:
-            errs.append(f"Expected exactly 1 Bank line on Main Account {gl_effective['BANK_ACCOUNT']}, found {len(bank)}")
-        elif dim_col and bank.iloc[0][dim_col]!=gl_effective["BANK_ACCOUNT"]:
-            errs.append(f"Bank line Ledger Dimension must be {gl_effective['BANK_ACCOUNT']!r}, found {bank.iloc[0][dim_col]!r}")
+            errs.append(f"Expected exactly 1 Bank line on Main Account {expected_bank_account}, found {len(bank)}")
+        elif dim_col and bank.iloc[0][dim_col]!=expected_bank_account:
+            errs.append(f"Bank line Ledger Dimension must be {expected_bank_account!r}, found {bank.iloc[0][dim_col]!r}")
 
         comm=_lines(lambda t,m: (t=="Ledger") & (m==gl_effective["COMMISSION_GL"]))
         if len(comm)!=1:
