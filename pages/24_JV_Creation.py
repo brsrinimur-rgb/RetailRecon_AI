@@ -354,6 +354,7 @@ if st.button(
     disabled=create_disabled
 ):
     gl_config=db.load_gl_config()
+    store_master=db.load_store_mapping_master()
     j=core.create_jv(
         matched,
         gl_config,
@@ -364,8 +365,9 @@ if st.button(
         to_date=to_date,
         grouping_map=_current_map,
         active_payment_types=_active_providers,
+        store_master=store_master,
     )
-    j=core.validate_jv(j,gl_config)
+    j=core.validate_jv(j,gl_config,store_master=store_master)
     db.replace_jv(j)
 
     n_batches=j["Journal Batch"].nunique() if not j.empty else 0
