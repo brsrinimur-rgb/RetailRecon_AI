@@ -221,7 +221,17 @@ def migrate_database(conn=None):
         provider_store_name TEXT PRIMARY KEY
     )""")
     _ensure_columns(conn,"store_mapping_master",[
-        ("store_code","TEXT"),("active","TEXT"),("notes","TEXT"),("updated_at","TEXT")
+        ("store_code","TEXT"),("active","TEXT"),("notes","TEXT"),("updated_at","TEXT"),
+        # Distinct from provider_store_name: provider_store_name is one of
+        # potentially many valid ALIASES for a store (Tabby/Tamara/POS/
+        # payment-link naming can all differ for the same physical
+        # location). d365_store_display_name is the single canonical name
+        # D365 should show for that Store Code -- many alias rows can
+        # legitimately share the same Store Code, as long as they agree on
+        # this value. Added via the same additive/self-healing migration
+        # pattern as every other column here -- existing rows get this
+        # column as NULL/blank, nothing is deleted or renamed.
+        ("d365_store_display_name","TEXT"),
     ])
 
     conn.execute("""CREATE TABLE IF NOT EXISTS commission_rate_master (
@@ -462,7 +472,8 @@ def init_db():
         store_code TEXT,
         active TEXT,
         notes TEXT,
-        updated_at TEXT
+        updated_at TEXT,
+        d365_store_display_name TEXT
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS commission_rate_master (
         payment_type TEXT PRIMARY KEY,
@@ -1299,6 +1310,7 @@ def load_store_mapping_master():
     df=pd.read_sql_query(
         """SELECT provider_store_name AS "Provider Store Name",
                   store_code AS "Store Code",
+                  d365_store_display_name AS "D365 Store Display Name",
                   active AS "Active",
                   notes AS "Notes",
                   updated_at AS "Updated At"
@@ -1309,12 +1321,45 @@ def load_store_mapping_master():
     conn.close()
     return df
 
+def _norm_store_code_value(v):
+    """Single source of truth for Store Code normalization -- used
+    identically by the merge-state validation simulation and the actual
+    write loop below, so what gets validated is exactly what gets
+    persisted. Trims and converts a trailing '.0' (Excel float-coercion
+    artifact, e.g. '628.0' -> '628')."""
+    if v is None or (isinstance(v,float) and pd.isna(v)):
+        return ""
+    s=str(v).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s=s[:-2]
+    return s
+
+def _norm_active_value(v):
+    """Single source of truth for Active normalization. Blank/NaN defaults
+    to 'Yes' -- matching the actual persistence default -- so a row with a
+    blank Active column is treated as active in BOTH the pre-save
+    validation and the eventual write, never differently."""
+    if v is None or (isinstance(v,float) and pd.isna(v)):
+        return "Yes"
+    s=str(v).strip()
+    return s if s else "Yes"
+
+def _is_active_value(v):
+    return _norm_active_value(v).upper() in ("YES","Y","TRUE","1")
+
+def _norm_display_value(v):
+    if v is None or (isinstance(v,float) and pd.isna(v)):
+        return ""
+    s=str(v).strip()
+    return "" if s.lower()=="nan" else s
+
 def save_store_mapping_master(df,mode="merge",user=None):
     if df is None:
         return
     cols={str(c).strip().lower():c for c in df.columns}
     nc=cols.get("provider store name") or cols.get("store name") or cols.get("provider_store_name")
     sc=cols.get("store code") or cols.get("store_code")
+    dc=cols.get("d365 store display name") or cols.get("d365_store_display_name")
     ac=cols.get("active")
     xc=cols.get("notes") or cols.get("note")
     if nc is None or sc is None:
@@ -1326,6 +1371,70 @@ def save_store_mapping_master(df,mode="merge",user=None):
 
     before=load_store_mapping_master()
 
+    # Uploads/edits are never rejected for omitting D365 Store Display Name
+    # (older uploads predating this column, or a row that's alias-only and
+    # not yet confirmed) -- it's optional, matching every other master's
+    # backward-compatible column pattern in this codebase. But if it IS
+    # provided, every ACTIVE row sharing a Store Code in the RESULTING
+    # FINAL STATE must agree on it -- this is the one thing that must never
+    # be ambiguous, since it's the value core.py actually posts to D365.
+    #
+    # Checking only the incoming upload in isolation is not enough in
+    # "merge" mode: a merge upsert only touches rows whose Provider Store
+    # Name matches a row in the upload (store_mapping_master's primary key)
+    # -- every other existing alias row for the same Store Code stays in
+    # the table untouched. Build the actual resulting state (existing rows
+    # NOT being overwritten by this upload, unioned with the incoming rows)
+    # and validate THAT -- for "replace" mode the existing table is wiped
+    # first, so the incoming df already IS the resulting state.
+    #
+    # CRITICAL: this simulation must apply the EXACT SAME normalization the
+    # write loop below applies (_norm_store_code_value / _norm_active_value)
+    # -- otherwise a row that normalizes into a conflict at write time
+    # (e.g. Store Code "628.0" -> "628", or a blank Active defaulting to
+    # "Yes") could slip past validation looking conflict-free, then
+    # persist as the exact conflict the check exists to prevent.
+    if dc is not None:
+        if mode=="replace" or before is None or before.empty:
+            final=df.copy()
+            final_display_col=dc
+            final_active_col=ac
+            final_code_col=sc
+        else:
+            incoming_keys=set(df[nc].astype(str).str.strip())
+            survivors=before[~before["Provider Store Name"].astype(str).str.strip().isin(incoming_keys)].copy()
+            survivors=survivors.rename(columns={
+                "Store Code":"_merged_store_code",
+                "D365 Store Display Name":"_merged_display",
+                "Active":"_merged_active",
+            })[["_merged_store_code","_merged_display","_merged_active"]]
+            incoming=pd.DataFrame({
+                "_merged_store_code":df[sc],
+                "_merged_display":df[dc] if dc in df.columns else "",
+                "_merged_active":df[ac] if ac is not None and ac in df.columns else "Yes",
+            })
+            final=pd.concat([survivors,incoming],ignore_index=True,sort=False)
+            final_display_col="_merged_display"
+            final_active_col="_merged_active"
+            final_code_col="_merged_store_code"
+
+        chk=final.copy()
+        chk["_code"]=chk[final_code_col].apply(_norm_store_code_value)
+        chk["_active"]=chk[final_active_col].apply(_is_active_value) if final_active_col is not None else True
+        chk["_display"]=chk[final_display_col].apply(_norm_display_value) if final_display_col else ""
+        active_named=chk[chk["_active"] & chk["_display"].ne("")]
+        conflicts=active_named.groupby("_code")["_display"].nunique()
+        bad=conflicts[conflicts>1]
+        if not bad.empty:
+            raise ValueError(
+                "Upload rejected - the following Store Code(s) would have more than one distinct "
+                "active D365 Store Display Name AFTER this save (checked against the resulting "
+                "final state, including existing rows this upload does not touch, with the same "
+                "Store Code/.0 and blank-Active normalization actually used at write time), which "
+                "is not allowed (every active alias row for a Store Code must agree on the same "
+                "D365 Store Display Name): " + ", ".join(bad.index.tolist())
+            )
+
     conn=get_conn()
     if mode=="replace":
         conn.execute("DELETE FROM store_mapping_master")
@@ -1333,22 +1442,22 @@ def save_store_mapping_master(df,mode="merge",user=None):
 
     for _,r in df.iterrows():
         name="" if pd.isna(r.get(nc)) else str(r.get(nc)).strip()
-        code="" if pd.isna(r.get(sc)) else str(r.get(sc)).strip()
-        if code.endswith(".0") and code[:-2].isdigit():
-            code=code[:-2]
+        code=_norm_store_code_value(r.get(sc))
         if not name:
             continue
-        active="Yes" if ac is None or pd.isna(r.get(ac)) else str(r.get(ac)).strip()
-        notes="" if xc is None or pd.isna(r.get(xc)) else str(r.get(xc)).strip()
+        display=_norm_display_value(r.get(dc)) if dc is not None else ""
+        active=_norm_active_value(r.get(ac)) if ac is not None else "Yes"
+        notes=_norm_display_value(r.get(xc)) if xc is not None else ""
         conn.execute(
-            """INSERT INTO store_mapping_master(provider_store_name,store_code,active,notes,updated_at)
-               VALUES (?,?,?,?,?)
+            """INSERT INTO store_mapping_master(provider_store_name,store_code,d365_store_display_name,active,notes,updated_at)
+               VALUES (?,?,?,?,?,?)
                ON CONFLICT(provider_store_name) DO UPDATE SET
                  store_code=excluded.store_code,
+                 d365_store_display_name=excluded.d365_store_display_name,
                  active=excluded.active,
                  notes=excluded.notes,
                  updated_at=excluded.updated_at""",
-            (name,code,active,notes,now)
+            (name,code,display,active,notes,now)
         )
     conn.commit()
     conn.close()

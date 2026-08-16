@@ -1813,15 +1813,70 @@ D365_STORE_DISPLAY = {
     "658": {"store_name": "Options Al Andalus Mall", "location": "658"},
 }
 
-def _d365_store_info(store_code):
+def _d365_store_info(store_code, store_master=None):
     s = str(store_code).strip()
     if s.endswith(".0"):
         s = s[:-2]
     info = D365_STORE_DISPLAY.get(s, {})
+    if info:
+        return {
+            "store_code": s,
+            "store_name": info.get("store_name", s),
+            "location": info.get("location", s),
+        }
+
+    # Not in the hardcoded confirmed list -- fall back to the Store Mapping
+    # Master (db.load_store_mapping_master(), maintained by Finance via
+    # pages/14_Store_Mapping_Master.py with NO code change required), if the
+    # caller supplied it. Real schema confirmed against db.py.
+    #
+    # IMPORTANT: Store Mapping Master is an ALIAS table, not a one-row-per-
+    # store master -- a single Store Code can legitimately have several
+    # provider-name alias rows (different POS/Tabby/Tamara/payment-link
+    # naming for the same physical location). Requiring exactly one row per
+    # store code would falsely reject a perfectly valid store the moment a
+    # second alias is added. What must be unique is the dedicated
+    # "D365 Store Display Name" field -- the value that actually posts to
+    # D365 -- not the count of alias rows. Only ACTIVE rows are considered;
+    # an inactive historical alias must never contribute to the resolution
+    # or the ambiguity check.
+    if store_master is not None and not store_master.empty:
+        sm = store_master.copy()
+        code_col = None
+        display_col = None
+        active_col = None
+        for c in sm.columns:
+            cl = str(c).strip().lower()
+            if cl == "store code":
+                code_col = c
+            elif cl in ("d365 store display name", "d365_store_display_name"):
+                display_col = c
+            elif cl == "active":
+                active_col = c
+        if code_col is not None and display_col is not None:
+            rows = sm[sm[code_col].astype(str).str.strip() == s]
+            if active_col is not None:
+                active_mask = (
+                    rows[active_col].astype(str).str.strip().str.upper()
+                    .isin(["YES", "Y", "TRUE", "1"])
+                )
+                rows = rows[active_mask]
+            names = {
+                str(v).strip()
+                for v in rows[display_col]
+                if str(v).strip() and str(v).strip().lower() not in ("nan", "none")
+            }
+            if len(names) == 1:
+                return {"store_code": s, "store_name": names.pop(), "location": s}
+            # len(names) == 0 (no active row has a confirmed display name
+            # yet) or > 1 (active rows genuinely disagree on the D365 name --
+            # real ambiguity, not just multiple aliases) -- never guess,
+            # fall through to the bare-code return below exactly as before.
+
     return {
         "store_code": s,
-        "store_name": info.get("store_name", s),
-        "location": info.get("location", s),
+        "store_name": s,
+        "location": s,
     }
 
 def _d365_month_year(date_value):
@@ -2844,7 +2899,7 @@ def build_d365_gl_exceptions(source_trace,jv_verification,gl_only,actual_gl):
     return out
 
 
-def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None,from_date=None,to_date=None,grouping_map=None,active_payment_types=None):
+def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None,from_date=None,to_date=None,grouping_map=None,active_payment_types=None,store_master=None):
     """
     Final D365 JV logic confirmed with Finance.
 
@@ -2972,7 +3027,7 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
         if min(gross,comm,vat,net) < 0:
             continue
 
-        info=_d365_store_info(store)
+        info=_d365_store_info(store,store_master=store_master)
         store_code=info["store_code"]
         store_name=info["store_name"]
         location=info["location"]
@@ -3136,7 +3191,7 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
 
     return j
 
-def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)"):
+def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)", store_master=None):
     """
     Hard control gate: validate generated JV lines against the Finance-
     confirmed D365 chart of accounts and dimension format before they may
@@ -3147,6 +3202,12 @@ def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)"):
       CC (MADA+VISA+MASTERCARD) 11020907 | AMEX 11020901 |
       TABBY 11020913 | TAMARA 11020922 | TAP 11020904
       Dimensions: "{account}-{store}--Sale" (Commission), "{account}-{store}---" (Sale)
+
+    store_master: optional DataFrame (db.load_store_mapping_master()'s real
+      shape: "Store Code" / "D365 Store Display Name" / "Active" columns --
+      fallback store-display-name source for stores not in the hardcoded
+      D365_STORE_DISPLAY list -- see _d365_store_info(). Not required;
+      omitting it preserves the exact prior behavior (hardcoded list only).
 
     This recomputes the *expected* account/dimension for every line from
     scratch (from gl_effective + Store Code + Group) and compares it against
@@ -3267,9 +3328,9 @@ def validate_jv(j, gl=None, validated_by="SYSTEM (core.validate_jv)"):
         # Store display name must be a real name, not the bare numeric code -
         # otherwise D365 descriptions post with a code instead of a store name.
         if store:
-            info=_d365_store_info(store)
+            info=_d365_store_info(store,store_master=store_master)
             if info["store_name"]==store:
-                errs.append(f"No Store display name configured for store {store} (D365_STORE_DISPLAY)")
+                errs.append(f"No Store display name configured for store {store} (D365_STORE_DISPLAY / Store Mapping Master)")
 
         errors_by_batch[batch]="; ".join(errs)
 

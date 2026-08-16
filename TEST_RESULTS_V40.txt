@@ -1,0 +1,30 @@
+RetailRecon AI V40 final package test run
+Date: 2026-08-16
+
+Compile check: PASS
+Python files compile successfully.
+
+Regression execution against the assembled V40 package:
+- 39 regression scripts discovered
+- 36 PASS
+- 3 could not execute because their real financial evidence files are not included in the application source package:
+  * REGRESSION_V37_AMEX_STATEMENT_PARSER.py -> requires SE-2026_07_31-9710107967.xlsx
+  * REGRESSION_V38_AMEX_WIRE_TO_BANK.py -> requires SE-2026_07_31-9710107967.xlsx
+  * REGRESSION_V39_REAL_ANB_FULL_STATEMENT.py -> requires ACC_0108095820370014_2026-08-02-084639231 - Final.xlsx
+
+V40-specific tests executed and PASS:
+- REGRESSION_V40_STORE_MASTER_FALLBACK.py
+- REGRESSION_V40B_STORE_MASTER_SCHEMA_MIGRATION.py
+
+V40B covers:
+- additive schema migration
+- multiple active aliases with one canonical D365 display name
+- genuine canonical-name conflict rejection
+- inactive-row handling
+- merge final-state validation
+- no partial write on rejected merge
+- Store Code 628.0 -> 628 validation/persistence parity
+- blank Active -> Yes validation/persistence parity
+
+Production master data still not guessed:
+Store Codes 628, 633, 636, 637, 638, 639, 640, 641 require real D365 Store Display Names before those JV batches can validate.
