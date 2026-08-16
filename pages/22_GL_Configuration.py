@@ -7,6 +7,12 @@ auth.render_user_sidebar()
 st.markdown(theme.global_css(), unsafe_allow_html=True)
 st.markdown(theme.top_banner("RETAIL CONTROL TOWER", "GL Configuration"), unsafe_allow_html=True)
 st.title("GL Configuration")
+st.info(
+    "V44: TABBY, TAMARA and TAP can now have independent editable Bank GL accounts. "
+    "Use TABBY_BANK_ACCOUNT, TAMARA_BANK_ACCOUNT and TAP_BANK_ACCOUNT below. "
+    "If left at the default 1015, behavior is unchanged. Their clearing/sales GLs "
+    "(TABBY_GL / TAMARA_GL / TAP_GL) remain separate settings."
+)
 st.caption(
     "Shared across all logins. Keys are fixed to match posting logic; only the GL account values can be "
     "changed. These values feed core.create_jv() directly - JV Creation now validates every batch against "
