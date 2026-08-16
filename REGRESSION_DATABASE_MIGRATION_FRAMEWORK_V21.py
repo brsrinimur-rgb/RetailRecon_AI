@@ -39,7 +39,7 @@ assert len(c)==1 and "Store Code" in c.columns
 
 h=mod.get_database_health()
 assert h["Healthy"] is True,h
-assert h["Schema Version"]==21
+assert h["Schema Version"]==mod.CURRENT_DB_SCHEMA_VERSION
 
 # Existing legacy records preserved.
 conn=sqlite3.connect(path)

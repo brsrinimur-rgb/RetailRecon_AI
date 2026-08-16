@@ -24,3 +24,7 @@ st.page_link("pages/18_Settlement_Batch_Engine.py",label="Open Settlement Batch 
 st.page_link("pages/31_Database_Health.py",label="Database Health & Migration",icon="🩺")
 
 st.page_link("pages/32_System_Logic_Health.py",label="System Logic Health",icon="🧩")
+
+st.page_link("pages/33_Settlement_Carry_Forward.py",label="Settlement Carry Forward",icon="↪️")
+
+st.page_link("pages/34_Reconciliation_Run_History.py",label="Reconciliation Run History",icon="🗂️")

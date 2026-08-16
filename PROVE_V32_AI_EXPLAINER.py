@@ -38,27 +38,29 @@ def test_structural_no_write():
 
 def test_known_good_replay():
     """Modeled on the SD1173489 / terminal 55610694 example worked through
-    by hand earlier in this conversation."""
+    by hand earlier in this conversation. Field names below are the
+    CONFIRMED real schema from core.py/bank_settlement_extension.py (Payment
+    Type, not Scheme; Narration Terminal ID on bank rows, not Terminal ID;
+    Description as the primary narration text) -- deliberately NOT the
+    earlier guessed names, so this test actually exercises the real alias
+    fix rather than just re-confirming its own prior wrong assumption."""
     batch_row = {
         "Settlement Status": "BANK REVIEW REQUIRED",
-        "Unique Transaction ID": "BATCH-55610694-20260707",
+        "Settlement Batch ID": "BATCH-55610694-20260707",
         "Terminal ID": "55610694",
-        "Source Date": "2026-07-07",
-        "Scheme": "Mada",
+        "Settlement Date": "2026-07-07",
+        "Payment Type": "MADA",
         "Provider": "ANB POS",
         "Gross Amount": 13052.02,
     }
     bank_row = {
-        "Terminal ID": "55610694",
+        "Narration Terminal ID": "55610694",
         "Bank Source File": "anb_statement_jul2026.xlsx",
         "Bank Source Sheet": "Sheet1",
         "Bank Source Row": 42,
         "Bank Date": "2026-07-08",
         "Bank Amount": 13052.02,
-        "Narration": "POS MD_88077230_UNITED LUXURY",
-        "Narration 1": "301128607314_55610694_080726",
-        "Narration 2": "Mada_10.76_71.80_TX_17",
-        "Narration 3": "",
+        "Description": "POS MD_88077230_UNITED LUXURY | 301128607314_55610694_080726 | Mada_10.76_71.80_TX_17",
     }
 
     requests = explainer.build_candidates(
@@ -95,27 +97,26 @@ def test_known_good_replay():
 def test_known_ambiguous_replay():
     """Two same-day, same-narration bank credits — the V26 §3(a) scenario
     _bank_row_key() hardening was meant to address at the identity level;
-    this tests that the EXPLAINER layer also refuses to silently pick one."""
+    this tests that the EXPLAINER layer also refuses to silently pick one.
+    Uses the CONFIRMED real field names, same reasoning as the known-good
+    test above."""
     batch_row = {
         "Settlement Status": "BANK REVIEW REQUIRED",
-        "Unique Transaction ID": "BATCH-99999999-20260710",
+        "Settlement Batch ID": "BATCH-99999999-20260710",
         "Terminal ID": "99999999",
-        "Source Date": "2026-07-10",
-        "Scheme": "Visa",
+        "Settlement Date": "2026-07-10",
+        "Payment Type": "VISA",
         "Provider": "ANB POS",
         "Gross Amount": 5000.00,
     }
     bank_row_1 = {
-        "Terminal ID": "99999999",
+        "Narration Terminal ID": "99999999",
         "Bank Source File": "anb_statement_jul2026.xlsx",
         "Bank Source Sheet": "Sheet1",
         "Bank Source Row": 10,
         "Bank Date": "2026-07-11",
         "Bank Amount": 5000.00,
-        "Narration": "POS VC_GENERIC",
-        "Narration 1": "SAMETEXT",
-        "Narration 2": "",
-        "Narration 3": "",
+        "Description": "POS VC_GENERIC | SAMETEXT",
     }
     bank_row_2 = dict(bank_row_1)
     bank_row_2["Bank Source Row"] = 11  # different row, identical narration/amount/date
@@ -183,6 +184,67 @@ def test_unparseable_response_fails_closed():
     print("[PASS] Unparseable model response fails closed (Low confidence, no candidate), not silently dropped.")
 
 
+def test_schema_bug_confirmed_fixed():
+    """
+    Directly proves the schema bug flagged in review: on REAL field names
+    (Narration Terminal ID on bank rows, not a bare Terminal ID), the OLD
+    alias ("terminal_id" only mapping to "Terminal ID"/"Terminal") would
+    have found zero candidates for every batch. The FIXED alias
+    ("bank_terminal_id" -> "Narration Terminal ID") must find the real
+    candidate.
+    """
+    batch_row = {
+        "Settlement Status": "BANK REVIEW REQUIRED",
+        "Settlement Batch ID": "BATCH-1",
+        "Terminal ID": "12345678",
+        "Provider": "ANB POS",
+        "Gross Amount": 500.0,
+    }
+    # Bank row with ONLY the real field name -- no "Terminal ID" at all,
+    # exactly as core.py/bank_settlement_extension.py actually produce it.
+    bank_row_real_shape = {
+        "Narration Terminal ID": "12345678",
+        "Bank Source File": "f.xlsx", "Bank Source Sheet": "s", "Bank Source Row": 1,
+        "Bank Date": "2026-07-01", "Bank Amount": 500.0,
+        "Description": "some narration text",
+    }
+
+    reqs = explainer.build_candidates(
+        settlement_batches_rows=[batch_row],
+        settlement_bank_unmatched_rows=[bank_row_real_shape],
+    )
+    assert len(reqs) == 1
+    # This is the assertion that would have FAILED before the fix (0
+    # candidates, because the old code looked for "terminal_id" -> "Terminal
+    # ID"/"Terminal", neither of which exists on a real bank row).
+    assert len(reqs[0].candidates) == 1, (
+        "REGRESSION: real-shaped bank row (Narration Terminal ID only) produced "
+        "zero candidates -- the schema-alias bug is back."
+    )
+    assert reqs[0].candidates[0].narration == "some narration text", (
+        "narration should read from 'Description' (confirmed real field), not a missing Narration/1/2/3"
+    )
+    print("[PASS] Schema bug confirmed fixed: real-shaped bank rows (Narration Terminal ID, Description) "
+          "now produce correct candidates end-to-end.")
+
+
+def test_prompt_matches_real_accounting_rule():
+    """The prompt must state gross_pos_amount == candidate_bank_amount as the
+    tie criterion, and must explicitly warn against the old, incorrect
+    gross-fee-vat=net assumption -- otherwise the AI explainer can contradict
+    the deterministic engine's actual rule."""
+    req = explainer.ExplainerRequest(
+        batch_id="X", provider="ANB POS", terminal_id="1", source_date="2026-07-01",
+        scheme="MADA", gross_pos_amount=100.0, settlement_lag_days=0, candidates=[],
+    )
+    prompt = explainer.build_prompt(req)
+    assert "gross_pos_amount == candidate_bank_amount" in prompt
+    assert "since-corrected assumption" in prompt or "does not match how this engine actually" in prompt
+    assert "not the tie criterion" in prompt
+    print("[PASS] Prompt states the confirmed real accounting rule (gross == bank credit, "
+          "fee/VAT informational only) and explicitly warns against the old wrong assumption.")
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("PROVE_V32_AI_EXPLAINER.py")
@@ -192,13 +254,15 @@ if __name__ == "__main__":
     test_known_ambiguous_replay()
     test_missing_cited_rows_guardrail()
     test_unparseable_response_fails_closed()
+    test_schema_bug_confirmed_fixed()
+    test_prompt_matches_real_accounting_rule()
     print("=" * 70)
-    print("All runnable checks passed.")
+    print("All runnable checks passed, including schema-fix and prompt-correction proofs.")
+    print("COLUMN_ALIASES is now CONFIRMED against the real core.py /")
+    print("bank_settlement_extension.py source -- that step is done.")
     print("STILL NEEDED before production use (per V32 spec §7, NOT covered by this script):")
     print("  - Step 3: run against the REAL Review Required queue from a live")
-    print("    st.session_state.ct_result (real column names, real data).")
+    print("    st.session_state.ct_result (real data, not synthetic fixtures).")
     print("  - Step 5: cost/latency check once call_model_stub() is wired to")
-    print("    an actual model endpoint.")
-    print("  - Confirm COLUMN_ALIASES in logic/ai_settlement_explainer.py")
-    print("    against the real core.py / bank_settlement_extension.py output.")
+    print("    an actual model endpoint -- it still raises NotImplementedError.")
     print("=" * 70)

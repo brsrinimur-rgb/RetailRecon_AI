@@ -74,7 +74,7 @@ def ensure_correction_log_schema(conn=None):
 
 
 
-CURRENT_DB_SCHEMA_VERSION = 21
+CURRENT_DB_SCHEMA_VERSION = 30
 
 def _table_columns(conn, table_name):
     return {r[1] for r in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()}
@@ -260,6 +260,20 @@ def migrate_database(conn=None):
         ("task","TEXT"),("owner","TEXT"),("due_date","TEXT"),("status","TEXT")
     ])
 
+    conn.execute("""CREATE TABLE IF NOT EXISTS reconciliation_runs (
+        run_id TEXT PRIMARY KEY,
+        created_at TEXT,
+        user TEXT,
+        period_from TEXT,
+        period_to TEXT,
+        status TEXT,
+        result_json TEXT
+    )""")
+    _ensure_columns(conn,"reconciliation_runs",[
+        ("created_at","TEXT"),("user","TEXT"),("period_from","TEXT"),
+        ("period_to","TEXT"),("status","TEXT"),("result_json","TEXT")
+    ])
+
     conn.execute(
         """INSERT INTO schema_version(id,version,updated_at)
            VALUES (1,?,?)
@@ -293,6 +307,7 @@ def get_database_health():
             "gl_verification_runs":{"run_id","time","user","legal_entity","status","summary_json","detail_json"},
             "jv_batches":{"journal_batch","row_json","approval_status","d365_status","voucher","validation_passed"},
             "accounting_period_control":{"legal_entity","closed_through_date","next_open_date","status"},
+            "reconciliation_runs":{"run_id","created_at","user","period_from","period_to","status","result_json"},
         }
         rows=[]
         healthy=True
@@ -317,6 +332,82 @@ def get_database_health():
         }
     finally:
         conn.close()
+
+
+
+def _df_to_json_safe(df):
+    if df is None or not isinstance(df,pd.DataFrame):
+        return None
+    return df.to_json(orient="split",date_format="iso")
+
+def _df_from_json_safe(payload):
+    if not payload:
+        return pd.DataFrame()
+    from io import StringIO
+    return pd.read_json(StringIO(payload),orient="split")
+
+def save_reconciliation_run(result,user="system",period_from=None,period_to=None):
+    """
+    Persist an immutable reconciliation snapshot so a later run does not
+    overwrite access to previous reports.
+    """
+    migrate_database()
+    now=datetime.now()
+    run_id="RUN-"+now.strftime("%Y%m%d-%H%M%S-%f")
+    payload={}
+    for k,v in (result or {}).items():
+        if isinstance(v,pd.DataFrame):
+            payload[k]={"type":"dataframe","data":_df_to_json_safe(v)}
+    conn=get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO reconciliation_runs
+               (run_id,created_at,user,period_from,period_to,status,result_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                run_id,now.isoformat(timespec="seconds"),str(user),
+                "" if period_from is None or pd.isna(pd.to_datetime(period_from,errors="coerce"))
+                else pd.to_datetime(period_from).isoformat(),
+                "" if period_to is None or pd.isna(pd.to_datetime(period_to,errors="coerce"))
+                else pd.to_datetime(period_to).isoformat(),
+                "COMPLETED",json.dumps(payload)
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return run_id
+
+def list_reconciliation_runs(limit=100):
+    migrate_database()
+    conn=get_conn()
+    try:
+        return pd.read_sql_query(
+            """SELECT run_id AS "Run ID", created_at AS "Created At", user AS "User",
+                      period_from AS "Period From", period_to AS "Period To", status AS "Status"
+               FROM reconciliation_runs ORDER BY created_at DESC LIMIT ?""",
+            conn,params=(int(limit),)
+        )
+    finally:
+        conn.close()
+
+def load_reconciliation_run(run_id):
+    migrate_database()
+    conn=get_conn()
+    try:
+        row=conn.execute(
+            "SELECT result_json FROM reconciliation_runs WHERE run_id=?",(str(run_id),)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {}
+    raw=json.loads(row[0] or "{}")
+    out={}
+    for k,v in raw.items():
+        if isinstance(v,dict) and v.get("type")=="dataframe":
+            out[k]=_df_from_json_safe(v.get("data"))
+    return out
 
 
 def init_db():

@@ -63,7 +63,14 @@ STORE_MAP = {
     "TAG HEUER RASHID MALL, PAYMENT LINKS":"629",
 }
 
-GL_DEFAULTS = {
+# DEPRECATED — not used anywhere in this codebase (confirmed by full-repo grep).
+# D365_JV_DEFAULTS below is the Finance-confirmed mapping actually used by
+# create_jv()/validate_jv()/pages/22_GL_Configuration.py. This dict is kept only
+# as an audit trail of a prior, incorrect draft — it must never be wired in as-is:
+# its "VAT" value (11020907) is actually the CC clearing account number, not the
+# VAT vendor code (which is "P0672" in D365_JV_DEFAULTS), and its "BANK" value
+# (1010) does not match the confirmed bank GL account (1015).
+GL_DEFAULTS_DEPRECATED_DO_NOT_USE = {
     "BANK":"1010","COMMISSION":"7231","VAT":"11020907","AMEX":"11020901",
     "SALES_CLEARING_CARD":"11020920","SALES_CLEARING_AMEX":"11020921",
     "SALES_CLEARING_TABBY":"11020922","SALES_CLEARING_TAMARA":"11020923","SALES_CLEARING_TAP":"11020924"
@@ -718,6 +725,119 @@ def is_pos_summary_or_nontransaction(row, terminal_col=None, auth_col=None, date
 
     return False
 
+def _normalize_anb_pos_terminal_id(v):
+    """
+    Some ANB terminal-level POS exports (confirmed on traf_09582037.xlsx-style
+    files) store Terminal ID as the real 8-digit ANB terminal code with a
+    constant 8-digit suffix "01300000" appended (16 digits total), e.g.
+    "5561069001300000" for terminal "55610690". ANB's own bank narration only
+    ever uses the bare 8-digit code, so leaving the suffix in place means this
+    kind of file can never match bank narration on Terminal ID.
+
+    Strips exactly that known 16-digit/01300000-suffix shape back to the
+    8-digit code. Any other shape (already 8 digits, a different length, or a
+    different suffix) passes through completely unchanged — this never guesses,
+    it only reverses one specific, confirmed pattern.
+    """
+    s=str(v or "").strip()
+    if len(s)==16 and s.isdigit() and s.endswith("01300000"):
+        return s[:8]
+    return s
+
+def is_amex_statement_file(name, df):
+    """
+    Detects an AMEX "Statement of account" export by its Submissions-sheet
+    shape (confirmed against a real file: SE-2026_07_31-9710107967.xlsx).
+    Real header row (auto-found by read_upload's scoring) contains Type,
+    Paid, Ref, Terminal Number, Amount -- distinct enough from POS/payout
+    files that this is a safe positive check, not a guess.
+    """
+    if df is None or df.empty:
+        return False
+    cols={str(c).strip().lower() for c in df.columns}
+    required={"type","paid","ref","terminal number","amount"}
+    return required.issubset(cols)
+
+def normalize_amex_statement(df, source="AMEX Statement"):
+    """
+    Parses a real AMEX statement "Submissions" sheet into two frames:
+
+      payments   -- one row per "Sarie payment made" wire AMEX claims it sent.
+                    This is AMEX's OWN claim, not bank evidence -- per the
+                    confirmed rule ("received" means landed in our own bank
+                    account, not a provider's confirmation), matching this
+                    to BANK RECEIVED still requires confirming date+amount
+                    against a real ANB/Al Rajhi bank credit narrated for
+                    AMEX. That confirmation step is NOT done by this
+                    function -- see reconcile_amex_batches_via_statement()
+                    in logic/bank_settlement_extension.py for what is/isn't
+                    built yet.
+
+      submissions -- one row per individual card submission: Terminal,
+                    Date, Ref, Gross Amount, Net Amount (gross minus AMEX's
+                    per-submission discount commission -- confirmed NOT to
+                    include VAT, which is billed separately; see VAT
+                    BreakDown sheet), and the Paid flag ("P"/"N" -- "N"
+                    means AMEX itself has not yet paid this submission,
+                    a genuine "not yet settled" state, not a parsing gap).
+
+    Column layout confirmed directly against the real file (not guessed):
+    Date, Type, Paid, Ref, Description, Merchant number, Terminal Number,
+    Amount, <DB>, <Net/CR> -- the last two arrive unnamed from read_upload()
+    because their real headers sit one row above the row read_upload scores
+    as the header row, so they're referenced by POSITION (the two columns
+    immediately following Amount), not by name.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    cols=list(df.columns)
+    def _find_ci(name):
+        for c in cols:
+            if str(c).strip().lower()==name:
+                return c
+        return None
+
+    date_c=_find_ci("date")
+    type_c=_find_ci("type")
+    paid_c=_find_ci("paid")
+    ref_c=_find_ci("ref")
+    desc_c=_find_ci("description")
+    terminal_c=_find_ci("terminal number")
+    amount_c=_find_ci("amount")
+    if not all([date_c,type_c,amount_c]):
+        return pd.DataFrame(), pd.DataFrame()
+
+    amt_idx=cols.index(amount_c)
+    db_c=cols[amt_idx+1] if amt_idx+1<len(cols) else None
+    net_c=cols[amt_idx+2] if amt_idx+2<len(cols) else None
+
+    d=df.copy()
+    d["_Type"]=d[type_c].astype(str).str.strip().str.upper()
+
+    sub=d[d["_Type"].eq("SUBMISSION")].copy()
+    submissions=pd.DataFrame({
+        "Terminal ID":sub[terminal_c].astype(str).str.strip() if terminal_c else "",
+        "Date":pd.to_datetime(sub[date_c],errors="coerce"),
+        "Ref":sub[ref_c].astype(str).str.strip() if ref_c else "",
+        "Description":sub[desc_c].astype(str).str.strip() if desc_c else "",
+        "Gross Amount":pd.to_numeric(sub[amount_c],errors="coerce").fillna(0.0),
+        "Net Amount":pd.to_numeric(sub[net_c],errors="coerce").fillna(0.0) if net_c else 0.0,
+        "Paid":sub[paid_c].astype(str).str.strip().str.upper() if paid_c else "",
+        "Source File":source,
+    }).reset_index(drop=True)
+
+    pay=d[d["_Type"].eq("PAYMENT")].copy()
+    payments=pd.DataFrame({
+        "Date":pd.to_datetime(pay[date_c],errors="coerce"),
+        "Description":pay[desc_c].astype(str).str.strip() if desc_c else "",
+        "Wire Amount":pd.to_numeric(pay[db_c],errors="coerce").fillna(0.0) if db_c else 0.0,
+        "Source File":source,
+    }).reset_index(drop=True)
+    payments["Payment ID"]=[f"AMEX-PAY-{i+1}" for i in range(len(payments))]
+
+    return payments, submissions
+
 def normalize_pos(df,source="POS",forced_payment=None):
     d=norm_cols(df)
     ac=find(d,[
@@ -830,7 +950,7 @@ def normalize_pos(df,source="POS",forced_payment=None):
                      "Provider Reference":str(r.get(ac,"")).strip() if ac else "",
                      "POS Payment":pt,"POS Amount":a,"Net Amount":n if pd.notna(n) else a,
                      "Commission":c if pd.notna(c) else 0.0,"VAT":v if pd.notna(v) else 0.0,
-                     "Terminal ID":str(r.get(terminal,"")).strip() if terminal else "",
+                     "Terminal ID":_normalize_anb_pos_terminal_id(r.get(terminal,"")) if terminal else "",
                      "Merchant ID":str(r.get(find(d,["merchant id","merchant_id","retailer id"]),"")).strip() if find(d,["merchant id","merchant_id","retailer id"]) else "",
                      "Account":str(r.get(find(d,["account","account number","retailer pos account"]),"")).strip() if find(d,["account","account number","retailer pos account"]) else "",
                      "ARN":str(r.get(find(d,["arn"]),"")).strip() if find(d,["arn"]) else "",
@@ -1514,53 +1634,61 @@ def detect_bank_name(source,df=None):
     return "UNKNOWN"
 
 
-def normalize_bank(df,bank):
+def canonical_bank_name(bank):
+    s=str(bank or "").strip().upper()
+    if "RAJHI" in s:
+        return "AL RAJHI"
+    if s in {"ANB","ANB BANK"} or "ARAB NATIONAL" in s:
+        return "ANB"
+    return s
+
+def normalize_bank(df,bank,source_file="",source_sheet=""):
     d=norm_cols(df)
+    original_positions=pd.Series(range(1,len(d)+1),index=d.index)
 
     dc=find(d,[
-        "date","transaction date","posting date","value date",
+        "date","transaction date","trans date","trans: date","posting date","value date",
         "transaction_date","posting_date","value_date","booking date"
     ])
-
-    # Prefer a direct amount/credit field.
     ac=find(d,[
         "amount","credit","credit amount","deposit amount","net amount",
         "transaction amount","amount sar","credit_amount","deposit_amount",
-        "transaction_amount","local amount"
+        "transaction_amount","local amount","amount cr","amount cr."
     ])
-
-    # Some bank statements split debit and credit.
-    credit_col=find(d,["credit","credit amount","credit_amount"])
-    debit_col=find(d,["debit","debit amount","debit_amount"])
-
+    credit_col=find(d,["credit","credit amount","credit_amount","amount cr","amount cr."])
+    debit_col=find(d,["debit","debit amount","debit_amount","amount dr","amount dr."])
     desc=find(d,[
         "description","narration","details","reference","remarks",
         "transaction details","transaction description"
     ])
 
-    if ac:
-        bank_amount=d[ac].apply(amount)
-    elif credit_col or debit_col:
+    if credit_col or debit_col:
         credit=d[credit_col].apply(amount) if credit_col else pd.Series(0.0,index=d.index)
         debit=d[debit_col].apply(amount) if debit_col else pd.Series(0.0,index=d.index)
         credit=credit.fillna(0.0)
         debit=debit.fillna(0.0)
-        # Bank credits are positive; debits negative.
         bank_amount=(credit-debit).round(2)
+    elif ac:
+        bank_amount=d[ac].apply(amount)
+        credit=bank_amount.where(bank_amount>0,0.0)
+        debit=(-bank_amount.where(bank_amount<0,0.0))
     else:
         raise ValueError(f"{bank}: amount column not found.")
 
     out=pd.DataFrame({
-        "Bank":bank,
+        "Bank":canonical_bank_name(bank),
         "Bank Date":d[dc].apply(dt) if dc else pd.NaT,
         "Bank Amount":bank_amount,
-        "Description":d[desc].astype(str) if desc else ""
+        "Credit":credit if "credit" in locals() else np.nan,
+        "Debit":debit if "debit" in locals() else np.nan,
+        "Description":d[desc].astype(str) if desc else "",
+        "Bank Source File":str(source_file or ""),
+        "Bank Source Sheet":str(source_sheet or ""),
+        "Bank Source Row":original_positions,
     })
-
-    # Remove blank/zero/non-transaction rows.
     out=out[out["Bank Amount"].notna()].copy()
     out=out[out["Bank Amount"]!=0].copy()
-    return out
+    return out.reset_index(drop=True)
 
 def apply_bank_settlement(recon,bank,tolerance=1.0):
     if recon.empty:return recon
@@ -1779,8 +1907,11 @@ def _gl_event_type(description,amount_value):
 # =====================================================================
 
 def classify_settlement_source(name,df):
-    d=norm_cols(df)
-    cols=set(d.columns)
+    # Payout classifier uses raw headers lower-cased because the detection
+    # literals below are intentionally written in that form.  Do not use
+    # norm_cols() here (it upper-cases/reformats headers and previously made
+    # every provider payout classification fail).
+    cols={str(c).strip().lower() for c in df.columns}
     n=str(name or "").upper()
 
     # Tamara merchant statement / invoice payout file.
@@ -1797,7 +1928,10 @@ def classify_settlement_source(name,df):
         return "TABBY_PAYOUT"
 
     # TAP payout/charge file: payout_id and settlement_id are critical.
-    if "payout_id" in cols and "settlement_id" in cols:
+    if (
+        ("payout_id" in cols or "payout id" in cols)
+        and ("settlement_id" in cols or "settlement id" in cols)
+    ):
         return "TAP_PAYOUT"
 
     # Generic AMEX settlement file can be extended here if payout-level columns exist.
@@ -1881,10 +2015,48 @@ def normalize_tabby_payout(df,source="Tabby Payout"):
             "VAT Amount":np.nan,
             "Expected Bank Amount":float(pd.to_numeric(g["Transferred Amount"],errors="coerce").fillna(0).sum()),
             "Order Count":int(g["Order Number"].astype(str).ne("").sum()),
+            "Order Numbers":"|".join(
+                [str(x).strip() for x in g["Order Number"].astype(str)
+                 if str(x).strip() and str(x).strip().lower()!="nan"]
+            ),
             "Source File":source,
             "Source Row":int(g["Source Row"].min()),
         })
     return pd.DataFrame(rows)
+
+
+def link_tabby_payout_underlying_ids(provider_batches, matched):
+    """
+    Link settled/settle-able TABBY payout batches back to matched transactions
+    using the already-trusted Tabby Order Number -> Provider Reference key.
+    Only unique one-to-one references are linked.  Ambiguous/unresolved orders
+    remain unlinked; nothing is guessed.
+    """
+    if provider_batches is None or provider_batches.empty:
+        return provider_batches
+    out=provider_batches.copy()
+    if "Underlying IDs" not in out.columns:
+        out["Underlying IDs"]=""
+
+    if matched is None or matched.empty or "Provider Reference" not in matched.columns:
+        return out
+
+    m=matched.copy()
+    m["_ProviderKey"]=m["Provider Reference"].astype(str).str.strip()
+    for idx,r in out.iterrows():
+        if str(r.get("Provider","")).upper()!="TABBY":
+            continue
+        orders=[x.strip() for x in str(r.get("Order Numbers","")).split("|") if x.strip()]
+        ids=[]
+        for order in orders:
+            cand=m[m["_ProviderKey"].eq(order)]
+            if len(cand)==1 and "Unique Transaction ID" in cand.columns:
+                uid=str(cand.iloc[0]["Unique Transaction ID"]).strip()
+                if uid:
+                    ids.append(uid)
+        out.at[idx,"Underlying IDs"]="|".join(dict.fromkeys(ids))
+    return out
+
 
 def normalize_tap_payout(df,source="TAP Payout"):
     d=norm_cols(df)
@@ -2672,7 +2844,7 @@ def build_d365_gl_exceptions(source_trace,jv_verification,gl_only,actual_gl):
     return out
 
 
-def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None,from_date=None,to_date=None):
+def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_control=None,from_date=None,to_date=None,grouping_map=None,active_payment_types=None):
     """
     Final D365 JV logic confirmed with Finance.
 
@@ -2720,6 +2892,18 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
         e=e[e["_SourceDate"]>=fd.normalize()].copy()
     if pd.notna(td):
         e=e[e["_SourceDate"]<=td.normalize()].copy()
+
+        # Hard accounting gate: for a normal period JV, bank receipt must be
+        # verified and dated on/before the selected period end. Late receipts
+        # stay carry-forward and are handled by the controlled late-JV flow.
+        if "Settlement Bank Date" in e.columns:
+            _receipt_date=pd.to_datetime(e["Settlement Bank Date"],errors="coerce")
+        elif "Bank Date" in e.columns:
+            _receipt_date=pd.to_datetime(e["Bank Date"],errors="coerce")
+        else:
+            _receipt_date=pd.Series(pd.NaT,index=e.index)
+        e=e[_receipt_date.notna() & (_receipt_date.dt.normalize()<=td.normalize())].copy()
+
     if pd.notna(fd) and pd.notna(td) and fd.normalize()>td.normalize():
         raise ValueError("JV From Date cannot be later than JV To Date.")
     if e.empty:
@@ -2728,7 +2912,17 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
     rate_map,vat_map,method_map=_commission_master_maps(commission_master)
 
     e["Payment Type"]=e["Payment Type"].apply(_norm_payment)
-    e["Group"]=e["Payment Type"].apply(jv_group)
+    if active_payment_types is not None:
+        active={_norm_payment(x) for x in active_payment_types}
+        e=e[e["Payment Type"].isin(active)].copy()
+    if e.empty:
+        return pd.DataFrame()
+
+    if grouping_map:
+        gm={_norm_payment(k):str(v).strip().upper() for k,v in grouping_map.items()}
+        e["Group"]=e["Payment Type"].map(gm).fillna(e["Payment Type"])
+    else:
+        e["Group"]=e["Payment Type"].apply(jv_group)
 
     # One JV per Store + Finance Group for the selected From/To period.
     # If no range was supplied (backward compatibility), use the actual
@@ -2795,6 +2989,9 @@ def create_jv(recon,gl=None,commission_master=None,accounting_date=None,period_c
         sale_gl_by_group = {
             "CC": gl_effective["CC_GL"],
             "CARD": gl_effective["CC_GL"],  # legacy batches
+            "MADA": gl_effective["CC_GL"],
+            "VISA": gl_effective["CC_GL"],
+            "MASTERCARD": gl_effective["CC_GL"],
             "AMEX": gl_effective["AMEX_GL"],
             "TABBY": gl_effective["TABBY_GL"],
             "TAMARA": gl_effective["TAMARA_GL"],

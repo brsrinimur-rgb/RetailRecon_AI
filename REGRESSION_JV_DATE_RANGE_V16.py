@@ -16,7 +16,7 @@ for store in ["601","609"]:
     ]:
         rows.append({
             "Store Code":store,"Date":pd.Timestamp(day),"Status":"Matched","Difference":0.0,
-            "Bank Settled":True,"Payment Type":pay,"D365 Amount":amt,"POS Amount":amt,
+            "Bank Settled":True,"Settlement Bank Date":pd.Timestamp(day),"Payment Type":pay,"D365 Amount":amt,"POS Amount":amt,
             "Commission":0.0,"VAT":0.0
         })
 r=pd.DataFrame(rows)
