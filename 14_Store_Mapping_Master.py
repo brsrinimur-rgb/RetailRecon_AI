@@ -13,6 +13,11 @@ st.markdown(theme.top_banner("RETAIL CONTROL TOWER","Store Mapping Master"),unsa
 st.title("Store Mapping Master")
 st.caption(
     "Maintain Provider/Branch/Store Name → D365 Store Code mappings without changing Python code. "
+    "A Store Code can have several alias rows (e.g. different POS/Tabby/Tamara naming) — that's "
+    "expected. But every ACTIVE alias row for the same Store Code must agree on the same "
+    "'D365 Store Display Name' (the name that actually posts to D365); a conflicting value there "
+    "is rejected on save, not silently accepted. 'D365 Store Display Name' can be left blank on "
+    "an alias-only row that isn't yet confirmed. "
     "Uploads with blank names, blank Store Codes, or duplicate names are rejected outright. "
     "Every change is recorded below with who made it and what changed."
 )

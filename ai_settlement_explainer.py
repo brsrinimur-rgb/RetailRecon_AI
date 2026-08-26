@@ -8,28 +8,28 @@ or any JV path. It only reads st.session_state.ct_result (already produced by
 the existing V25-V31 matching engine) and produces a structured explanation.
 
 ------------------------------------------------------------------------------
-IMPORTANT — HONESTY NOTE ABOUT VERIFICATION STATUS (read before relying on this):
+VERIFICATION STATUS (updated after real source review):
 
-This module was written against the *documented* shape of st.session_state
-.ct_result and its sub-frames, as described across the V25-V32 project specs
-(column names like "Settlement Status", "Bank Source File", "Bank Source Row",
-"Terminal ID", "Source Date", "Scheme", "Gross Amount", "Provider",
-"Order Numbers", "Expected Bank Amount", etc.). The actual core.py and
-bank_settlement_extension.py source files have never been provided in this
-engagement, so exact column names, dtypes, and edge cases (NaNs, alternate
-casing, renamed fields across versions) are NOT independently confirmed here.
+COLUMN_ALIASES below is CONFIRMED against the actual core.py and
+logic/bank_settlement_extension.py source (not the documented/assumed shape
+from the earlier project specs) -- verified field-by-field, including the
+schema bug this replaces: "Payment Type" for scheme (not "Scheme"),
+"Narration Terminal ID" as a separate bank-side field (not the POS-side
+"Terminal ID"), "Description" as the primary narration text (not "Narration
+1/2/3", which are raw input headers that don't survive normalization), and
+"Settlement Batch ID" as the primary batch identifier. PROVE_V32_AI_EXPLAINER.py
+tests this exact real shape end-to-end, including a regression test that
+reproduces the old bug (zero candidates found) to prove it's actually fixed.
 
-Before trusting this module's output on a real Review Required queue:
-  1. Run _get_column() failures will surface immediately as skipped/flagged
-     rows rather than silent wrong answers (see _safe_col below) - but you
-     should still diff the expected column names against the real DataFrames
-     in a live st.session_state.ct_result and adjust COLUMN_ALIASES below.
-  2. Run PROVE_V32_AI_EXPLAINER.py (delivered alongside this file) against
-     real session data before using this on production numbers.
-
-This is the same "state it plainly" discipline used in V28's storage
-decision section and V33's open-questions list - flagging the limitation
-here rather than hiding it in a docstring no one reads.
+Two things remain genuinely open, both functional rather than schema-related:
+  1. call_model_stub() in pages/34_AI_Settlement_Explainer.py still raises
+     NotImplementedError -- no model endpoint is wired yet, so every
+     explanation currently comes back as "Model not wired up yet" (by
+     design -- it fails closed, not silently).
+  2. This has not yet been run against a live, real Review Required queue
+     end-to-end (PROVE_V32_AI_EXPLAINER.py's Step 3, per the V32 spec §7) --
+     only proven against synthetic fixtures built to the confirmed real
+     schema shape.
 ------------------------------------------------------------------------------
 """
 
@@ -41,15 +41,28 @@ from typing import Any, Optional
 
 
 # ------------------------------------------------------------------------
-# Column aliasing — real column names may differ; edit this table once the
-# actual core.py / bank_settlement_extension.py output is confirmed, rather
-# than editing logic scattered through the rest of the file.
+# Column aliasing — CONFIRMED against the real core.py / logic/bank_settlement
+# _extension.py source (not guessed). Verified field-by-field:
+#   - Settlement Batches use "Payment Type" (never "Scheme") — set in
+#     core.build_card_settlement_batches() and carried through
+#     reconcile_card_batches_advanced()'s rec=r.to_dict() passthrough.
+#   - Bank-side terminal evidence is "Narration Terminal ID", parsed by
+#     normalize_bank_statement()/parse_bank_narration() — never a bare
+#     "Terminal ID" on bank rows (that field only exists on the POS/batch side).
+#   - Raw bank narration text lands in "Description" after normalization.
+#     "Narration 1/2/3" are RAW INPUT column headers on the original ANB
+#     statement file (before normalize_bank_statement() runs) — they do not
+#     survive as passthrough columns on the normalized output the explainer
+#     actually reads from st.session_state.ct_result["settlement_bank_unmatched"].
+#     Kept below only as a fallback in case a differently-shaped bank frame
+#     (e.g. a legacy-parsed statement) happens to carry them raw.
 # ------------------------------------------------------------------------
 COLUMN_ALIASES = {
     "settlement_status": ["Settlement Status"],
-    "terminal_id": ["Terminal ID", "Terminal"],
-    "source_date": ["Source Date", "Settlement Date", "Date"],
-    "scheme": ["Scheme"],
+    "terminal_id": ["Terminal ID", "Terminal"],  # POS/batch side only
+    "bank_terminal_id": ["Narration Terminal ID"],  # bank side only — confirmed real field
+    "source_date": ["Settlement Date", "Source Date", "Date"],
+    "scheme": ["Payment Type", "Scheme"],  # Payment Type confirmed as the real field name
     "provider": ["Provider"],
     "gross_amount": ["Gross Amount", "Expected Bank Amount", "Net Amount"],
     "bank_source_file": ["Bank Source File"],
@@ -57,14 +70,24 @@ COLUMN_ALIASES = {
     "bank_source_row": ["Bank Source Row"],
     "bank_date": ["Bank Date", "Value Date"],
     "bank_amount": ["Bank Amount", "Credit", "Amount"],
-    "narration": ["Narration"],
-    "narration_1": ["Narration 1"],
-    "narration_2": ["Narration 2"],
-    "narration_3": ["Narration 3"],
-    "fee_amount": ["Fee Amount", "Commission"],
-    "vat_amount": ["VAT Amount", "VAT"],
+    "narration": ["Description", "Narration"],  # Description confirmed as the real field
+    "narration_1": ["Narration 1"],  # fallback only — see note above
+    "narration_2": ["Narration 2"],  # fallback only — see note above
+    "narration_3": ["Narration 3"],  # fallback only — see note above
+    "fee_amount": ["Fee Amount", "Narration Fee", "ANB Commission", "Commission"],
+    "vat_amount": ["VAT Amount", "Narration VAT", "ANB VAT", "VAT"],
     "order_numbers": ["Order Numbers"],
-    "batch_id": ["Unique Transaction ID", "Batch ID", "Settlement Batch ID"],
+    "batch_id": ["Settlement Batch ID", "Unique Transaction ID", "Batch ID"],  # Settlement Batch ID confirmed primary
+}
+
+# CONFIRMED real ct_result keys (lowercase, snake_case) as written by
+# pages/1_POS_Reconciliation.py — the earlier "Settlement Batches" /
+# "Settlement Bank Unmatched" / "Provider Payout Batches" (title-case) keys
+# used in the page/spec were WRONG and would silently find nothing.
+CT_RESULT_KEYS = {
+    "settlement_batches": "settlement_batches",
+    "settlement_bank_unmatched": "settlement_bank_unmatched",
+    "provider_payout_batches": "provider_payout_batches",
 }
 
 REVIEW_STATES = {"BANK REVIEW REQUIRED", "BANK RECEIPT PENDING"}
@@ -88,10 +111,10 @@ class ExplainerCandidate:
     bank_source_row: Any = ""
     bank_date: str = ""
     bank_amount: Optional[float] = None
-    narration: str = ""
-    narration_1: str = ""
-    narration_2: str = ""
-    narration_3: str = ""
+    narration: str = ""  # primary raw text — Description on real bank rows
+    narration_1: str = ""  # fallback only, usually empty on real data
+    narration_2: str = ""  # fallback only, usually empty on real data
+    narration_3: str = ""  # fallback only, usually empty on real data
 
     def cite(self) -> str:
         return f"{self.bank_source_file}::{self.bank_source_sheet}::{self.bank_source_row}"
@@ -179,7 +202,12 @@ def build_candidates(
 
         candidates: list[ExplainerCandidate] = []
         for bank_row in settlement_bank_unmatched_rows:
-            b_terminal = str(_get(bank_row, "terminal_id", ""))
+            # CONFIRMED real field: bank rows carry terminal evidence in
+            # "Narration Terminal ID" (parsed from ANB narration text), never
+            # a bare "Terminal ID" — that field only exists on the POS/batch
+            # side. Using the wrong alias here silently narrowed every
+            # candidate list to empty against real data.
+            b_terminal = str(_get(bank_row, "bank_terminal_id", ""))
             b_date = str(_get(bank_row, "bank_date", ""))
             # Narrow scope: same terminal (when both sides have one — TAP/
             # TABBY/Tamara narration may not carry terminal), and let the
@@ -255,16 +283,29 @@ SHORTLISTED BANK CANDIDATES (only these — do not assume others exist):
 {candidates_text}
 
 TASK:
-Determine whether the gross_pos_amount ties to a candidate bank credit,
-accounting for the settlement_lag_days and any fee/VAT deduction pattern
-(gross - fee - vat = net credit, or gross itself equals the credit exactly).
+Determine whether gross_pos_amount ties to a candidate bank credit.
+
+CONFIRMED ACCOUNTING RULE for this system (do not deviate from this):
+  The PRIMARY tie is: gross_pos_amount == candidate_bank_amount (within the
+  matching tolerance), accounting for settlement_lag_days on the date side.
+  fee_amount and vat_amount, when present, are SEPARATE DEBIT ROWS on the
+  bank statement — they are evidence that a real ANB deduction occurred
+  alongside the credit, but they are NEVER subtracted from gross_pos_amount
+  to derive the amount that must match the bank credit. Do not compute or
+  expect "gross - fee - vat = candidate_bank_amount" — that was an earlier,
+  since-corrected assumption and does not match how this engine actually
+  settles batches. If fee_amount/vat_amount are present, report them in
+  computed_net purely as informational commentary (gross - fee - vat, i.e.
+  the net cash movement after those separate debits), but the tie/no-tie
+  verdict itself must be judged against gross_pos_amount vs
+  candidate_bank_amount directly, not against computed_net.
 
 Respond with ONLY a JSON object, no other text, in this exact shape:
 {{
   "verdict": "Ties" | "Partial / Gap Unexplained" | "No Plausible Candidate",
   "confidence": "High" | "Medium" | "Low",
   "candidate_bank_amount": <number or null>,
-  "computed_net": <number or null>,
+  "computed_net": <number or null, informational only — gross minus fee minus vat, not the tie criterion>,
   "narration_decode": "<what the narration fields appear to encode, or empty string>",
   "explanation": "<plain-language walkthrough of the arithmetic and identity match>",
   "cited_rows": ["<file::sheet::row for every candidate your verdict actually rests on>"]
