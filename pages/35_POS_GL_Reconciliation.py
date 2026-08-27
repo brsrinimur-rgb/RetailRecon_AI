@@ -1,5 +1,6 @@
 
 import io, zipfile
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 import auth, theme
@@ -41,53 +42,81 @@ def expand_zip(zf):
                 result.append((Path(name).name,z.read(info)))
     return result
 
-st.subheader("1. POS Statements — Daily Bulk Upload")
-st.caption("Select as many daily POS files as you need, or upload one ZIP containing all POS files.")
-pos_mode=st.radio("POS upload method",["Multiple files","ZIP batch"],horizontal=True,key="v53_pos_mode")
+st.subheader("1. POS Statements — BULK EXCEL UPLOAD")
+st.caption("Upload many daily POS Excel/CSV files together. There is no one-file limit.")
+
+pos_uploads=st.file_uploader(
+    "📤 UPLOAD MULTIPLE POS EXCEL FILES",
+    type=["xlsx","xls","csv"],
+    accept_multiple_files=True,
+    key="v54_pos_multi",
+    help="In the Windows picker, hold Ctrl or Shift to select several files. You can also drag multiple files into this box."
+)
+pos_zip=st.file_uploader(
+    "OR upload ONE ZIP containing all POS files",
+    type=["zip"],
+    accept_multiple_files=False,
+    key="v54_pos_zip"
+)
+
 pos_pairs=[]
-if pos_mode=="Multiple files":
-    pos_uploads=st.file_uploader(
-        "POS files — MULTIPLE",
-        type=["xlsx","xls","csv"],
-        accept_multiple_files=True,
-        key="v53_pos_multi",
-        help="Use the file picker to select several files. You can also add more files after the picker opens."
-    )
-    for f in (pos_uploads or []):
-        pos_pairs.append((f.name,f.getvalue()))
-else:
-    pos_zip=st.file_uploader("POS ZIP batch",type=["zip"],accept_multiple_files=False,key="v53_pos_zip")
-    if pos_zip: pos_pairs=expand_zip(pos_zip)
+for f in (pos_uploads or []):
+    pos_pairs.append((f.name,f.getvalue()))
+if pos_zip:
+    pos_pairs.extend(expand_zip(pos_zip))
+
+_seen=set()
+clean=[]
+for item in pos_pairs:
+    if item[0] not in _seen:
+        _seen.add(item[0])
+        clean.append(item)
+pos_pairs=clean
 
 if pos_pairs:
     st.success(f"POS files loaded: {len(pos_pairs)}")
-    st.write("POS: " + " | ".join(n for n,_ in pos_pairs[:50]) + (" ..." if len(pos_pairs)>50 else ""))
+    with st.expander("View POS files", expanded=False):
+        st.write("\n".join(f"• {n}" for n,_ in pos_pairs))
 else:
-    st.info("POS: no files loaded.")
+    st.info("POS: upload multiple Excel files above, or upload one ZIP batch.")
 
-st.subheader("2. D365 GL — Daily Bulk Upload")
-st.caption("Upload all GL account dumps together. More than 8 GL accounts is supported; there is no account-count limit in the reconciliation UI.")
-gl_mode=st.radio("GL upload method",["Multiple files","ZIP batch"],horizontal=True,key="v53_gl_mode")
+st.subheader("2. D365 GL — BULK EXCEL UPLOAD")
+st.caption("Upload all D365 GL account dumps together. 8, 20, 50+ GL accounts are supported.")
+
+gl_uploads=st.file_uploader(
+    "📤 UPLOAD MULTIPLE D365 GL EXCEL FILES",
+    type=["xlsx","xls","csv"],
+    accept_multiple_files=True,
+    key="v54_gl_multi",
+    help="In the Windows picker, hold Ctrl or Shift to select several files. You can also drag multiple files into this box."
+)
+gl_zip=st.file_uploader(
+    "OR upload ONE ZIP containing all D365 GL files",
+    type=["zip"],
+    accept_multiple_files=False,
+    key="v54_gl_zip"
+)
+
 gl_pairs=[]
-if gl_mode=="Multiple files":
-    gl_uploads=st.file_uploader(
-        "D365 GL files — MULTIPLE",
-        type=["xlsx","xls","csv"],
-        accept_multiple_files=True,
-        key="v53_gl_multi",
-        help="Select all GL account dumps for the period. You can upload 8, 20, 50+ files."
-    )
-    for f in (gl_uploads or []):
-        gl_pairs.append((f.name,f.getvalue()))
-else:
-    gl_zip=st.file_uploader("D365 GL ZIP batch",type=["zip"],accept_multiple_files=False,key="v53_gl_zip")
-    if gl_zip: gl_pairs=expand_zip(gl_zip)
+for f in (gl_uploads or []):
+    gl_pairs.append((f.name,f.getvalue()))
+if gl_zip:
+    gl_pairs.extend(expand_zip(gl_zip))
+
+_seen=set()
+clean=[]
+for item in gl_pairs:
+    if item[0] not in _seen:
+        _seen.add(item[0])
+        clean.append(item)
+gl_pairs=clean
 
 if gl_pairs:
     st.success(f"D365 GL files loaded: {len(gl_pairs)}")
-    st.write("GL: " + " | ".join(n for n,_ in gl_pairs[:50]) + (" ..." if len(gl_pairs)>50 else ""))
+    with st.expander("View D365 GL files", expanded=False):
+        st.write("\n".join(f"• {n}" for n,_ in gl_pairs))
 else:
-    st.info("D365 GL: no files loaded.")
+    st.info("D365 GL: upload multiple Excel files above, or upload one ZIP batch.")
 
 tolerance=st.number_input("Matching tolerance (SAR)",0.0,10.0,0.50,0.01)
 
