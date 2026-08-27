@@ -1,5 +1,5 @@
 
-import io
+import io, zipfile
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -20,71 +20,103 @@ st.info(
     "Amount is compared only after deterministic GL evidence is identified."
 )
 
-def _find_header_row(path_or_bytes, sheet_name):
-    raw=pd.read_excel(path_or_bytes, sheet_name=sheet_name, header=None, nrows=30)
-    wanted={"merchant id","transaction amount","terminal id","approval code","trans seq number",
-            "retailer pos account","retailer id","transaction date"}
-    for i,row in raw.iterrows():
-        vals={str(v).strip().lower() for v in row.tolist() if pd.notna(v)}
-        if len(vals & wanted) >= 2:
-            return int(i)
-    return 0
-
 def read_one_bytes(name, data):
     lname=name.lower()
     if lname.endswith(".csv"):
-        raw=pd.read_csv(io.BytesIO(data),header=None)
-        for i,row in raw.iterrows():
-            vals={str(v).strip().lower() for v in row.tolist() if pd.notna(v)}
-            if len(vals & {"merchant id","transaction amount","terminal id","approval code"}) >= 2:
-                return pd.read_csv(io.BytesIO(data),header=i)
         return pd.read_csv(io.BytesIO(data))
-    frames=[]
-    for s in pd.ExcelFile(io.BytesIO(data)).sheet_names:
-        header=_find_header_row(io.BytesIO(data),s)
-        x=pd.read_excel(io.BytesIO(data),sheet_name=s,header=header)
-        x=x.dropna(axis=0,how="all").dropna(axis=1,how="all")
-        if not x.empty:
-            x["__Source Sheet"]=s
-            frames.append(x)
-    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+    return pd.concat(
+        [pd.read_excel(io.BytesIO(data), sheet_name=s) for s in pd.ExcelFile(io.BytesIO(data)).sheet_names],
+        ignore_index=True
+    )
 
 def read_uploaded(f):
     return read_one_bytes(f.name, f.getvalue())
 
-st.subheader("1. POS Statements — MULTIPLE EXCEL FILES")
-st.caption("Select multiple daily POS Excel/CSV files in one Windows file-selection window.")
+def expand_zip(zf):
+    result=[]
+    with zipfile.ZipFile(io.BytesIO(zf.getvalue())) as z:
+        for info in z.infolist():
+            if info.is_dir(): continue
+            name=info.filename
+            if name.lower().endswith((".xlsx",".xls",".csv")):
+                result.append((Path(name).name,z.read(info)))
+    return result
+
+st.subheader("1. POS Statements — BULK EXCEL UPLOAD")
+st.caption("Upload many daily POS Excel/CSV files together. There is no one-file limit.")
+
 pos_uploads=st.file_uploader(
-    "📤 SELECT MULTIPLE POS EXCEL FILES",
+    "📤 UPLOAD MULTIPLE POS EXCEL FILES",
     type=["xlsx","xls","csv"],
     accept_multiple_files=True,
-    key="final_pos_multi",
-    help="In the Windows file picker, hold Ctrl or Shift to select multiple files."
+    key="v54_pos_multi",
+    help="In the Windows picker, hold Ctrl or Shift to select several files. You can also drag multiple files into this box."
 )
-pos_pairs=[(f.name,f.getvalue()) for f in (pos_uploads or [])]
+pos_zip=st.file_uploader(
+    "OR upload ONE ZIP containing all POS files",
+    type=["zip"],
+    accept_multiple_files=False,
+    key="v54_pos_zip"
+)
+
+pos_pairs=[]
+for f in (pos_uploads or []):
+    pos_pairs.append((f.name,f.getvalue()))
+if pos_zip:
+    pos_pairs.extend(expand_zip(pos_zip))
+
+_seen=set()
+clean=[]
+for item in pos_pairs:
+    if item[0] not in _seen:
+        _seen.add(item[0])
+        clean.append(item)
+pos_pairs=clean
+
 if pos_pairs:
-    st.success(f"POS files selected: {len(pos_pairs)}")
-    with st.expander("View selected POS files"):
+    st.success(f"POS files loaded: {len(pos_pairs)}")
+    with st.expander("View POS files", expanded=False):
         st.write("\n".join(f"• {n}" for n,_ in pos_pairs))
 else:
-    st.info("Select one or multiple POS Excel files.")
+    st.info("POS: upload multiple Excel files above, or upload one ZIP batch.")
 
-st.subheader("2. D365 GL — MULTIPLE EXCEL FILES")
-st.caption("Select all D365 GL account Excel/CSV files together. No account limit.")
+st.subheader("2. D365 GL — BULK EXCEL UPLOAD")
+st.caption("Upload all D365 GL account dumps together. 8, 20, 50+ GL accounts are supported.")
+
 gl_uploads=st.file_uploader(
-    "📤 SELECT MULTIPLE D365 GL EXCEL FILES",
+    "📤 UPLOAD MULTIPLE D365 GL EXCEL FILES",
     type=["xlsx","xls","csv"],
     accept_multiple_files=True,
-    key="final_gl_multi",
-    help="In the Windows file picker, hold Ctrl or Shift to select multiple files."
+    key="v54_gl_multi",
+    help="In the Windows picker, hold Ctrl or Shift to select several files. You can also drag multiple files into this box."
 )
-gl_pairs=[(f.name,f.getvalue()) for f in (gl_uploads or [])]
+gl_zip=st.file_uploader(
+    "OR upload ONE ZIP containing all D365 GL files",
+    type=["zip"],
+    accept_multiple_files=False,
+    key="v54_gl_zip"
+)
+
+gl_pairs=[]
+for f in (gl_uploads or []):
+    gl_pairs.append((f.name,f.getvalue()))
+if gl_zip:
+    gl_pairs.extend(expand_zip(gl_zip))
+
+_seen=set()
+clean=[]
+for item in gl_pairs:
+    if item[0] not in _seen:
+        _seen.add(item[0])
+        clean.append(item)
+gl_pairs=clean
+
 if gl_pairs:
-    st.success(f"D365 GL files selected: {len(gl_pairs)}")
-    with st.expander("View selected D365 GL files"):
+    st.success(f"D365 GL files loaded: {len(gl_pairs)}")
+    with st.expander("View D365 GL files", expanded=False):
         st.write("\n".join(f"• {n}" for n,_ in gl_pairs))
 else:
-    st.info("Select one or multiple D365 GL Excel files.")
+    st.info("D365 GL: upload multiple Excel files above, or upload one ZIP batch.")
 
 tolerance=st.number_input("Matching tolerance (SAR)",0.0,10.0,0.50,0.01)
 
@@ -104,13 +136,6 @@ if st.button("RUN POS → GL RECONCILIATION",type="primary",use_container_width=
 
     raw_pos=pd.concat(pos_frames,ignore_index=True) if pos_frames else pd.DataFrame()
     raw_gl=pd.concat(gl_frames,ignore_index=True) if gl_frames else pd.DataFrame()
-    if not raw_pos.empty:
-        preview=normalize_pos(raw_pos,"MULTIPLE POS FILES")
-        mids=preview["merchant_id"].replace("",pd.NA).dropna().unique().tolist()
-        terms=preview["terminal_id"].replace("",pd.NA).dropna().unique().tolist() if "terminal_id" in preview else []
-        st.success(f"POS extraction: {len(preview):,} rows | Merchant IDs: {len(mids)} | Terminals: {len(terms)}")
-        if mids: st.write("Merchant ID(s): "+", ".join(map(str,mids[:30])))
-        if terms: st.write("Terminal ID(s): "+", ".join(map(str,terms[:30])))
 
     st.session_state.v53_pos_gl=reconcile_pos_to_gl(
         normalize_pos(raw_pos,"MULTIPLE POS FILES"),
