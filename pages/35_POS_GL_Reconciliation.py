@@ -20,14 +20,34 @@ st.info(
     "Amount is compared only after deterministic GL evidence is identified."
 )
 
+def _find_header_row(path_or_bytes, sheet_name):
+    raw=pd.read_excel(path_or_bytes, sheet_name=sheet_name, header=None, nrows=30)
+    wanted={"merchant id","transaction amount","terminal id","approval code","trans seq number",
+            "retailer pos account","retailer id","transaction date"}
+    for i,row in raw.iterrows():
+        vals={str(v).strip().lower() for v in row.tolist() if pd.notna(v)}
+        if len(vals & wanted) >= 2:
+            return int(i)
+    return 0
+
 def read_one_bytes(name, data):
     lname=name.lower()
     if lname.endswith(".csv"):
+        raw=pd.read_csv(io.BytesIO(data),header=None)
+        for i,row in raw.iterrows():
+            vals={str(v).strip().lower() for v in row.tolist() if pd.notna(v)}
+            if len(vals & {"merchant id","transaction amount","terminal id","approval code"}) >= 2:
+                return pd.read_csv(io.BytesIO(data),header=i)
         return pd.read_csv(io.BytesIO(data))
-    return pd.concat(
-        [pd.read_excel(io.BytesIO(data), sheet_name=s) for s in pd.ExcelFile(io.BytesIO(data)).sheet_names],
-        ignore_index=True
-    )
+    frames=[]
+    for s in pd.ExcelFile(io.BytesIO(data)).sheet_names:
+        header=_find_header_row(io.BytesIO(data),s)
+        x=pd.read_excel(io.BytesIO(data),sheet_name=s,header=header)
+        x=x.dropna(axis=0,how="all").dropna(axis=1,how="all")
+        if not x.empty:
+            x["__Source Sheet"]=s
+            frames.append(x)
+    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
 def read_uploaded(f):
     return read_one_bytes(f.name, f.getvalue())
@@ -136,6 +156,13 @@ if st.button("RUN POS → GL RECONCILIATION",type="primary",use_container_width=
 
     raw_pos=pd.concat(pos_frames,ignore_index=True) if pos_frames else pd.DataFrame()
     raw_gl=pd.concat(gl_frames,ignore_index=True) if gl_frames else pd.DataFrame()
+    if not raw_pos.empty:
+        preview=normalize_pos(raw_pos,"MULTIPLE POS FILES")
+        mids=preview["merchant_id"].replace("",pd.NA).dropna().unique().tolist()
+        terms=preview["terminal_id"].replace("",pd.NA).dropna().unique().tolist() if "terminal_id" in preview else []
+        st.success(f"POS extraction: {len(preview):,} rows | Merchant IDs: {len(mids)} | Terminals: {len(terms)}")
+        if mids: st.write("Merchant ID(s): "+", ".join(map(str,mids[:30])))
+        if terms: st.write("Terminal ID(s): "+", ".join(map(str,terms[:30])))
 
     st.session_state.v53_pos_gl=reconcile_pos_to_gl(
         normalize_pos(raw_pos,"MULTIPLE POS FILES"),
