@@ -1,5 +1,5 @@
 
-import io, zipfile
+import io
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -52,91 +52,39 @@ def read_one_bytes(name, data):
 def read_uploaded(f):
     return read_one_bytes(f.name, f.getvalue())
 
-def expand_zip(zf):
-    result=[]
-    with zipfile.ZipFile(io.BytesIO(zf.getvalue())) as z:
-        for info in z.infolist():
-            if info.is_dir(): continue
-            name=info.filename
-            if name.lower().endswith((".xlsx",".xls",".csv")):
-                result.append((Path(name).name,z.read(info)))
-    return result
-
-st.subheader("1. POS Statements — BULK EXCEL UPLOAD")
-st.caption("Upload many daily POS Excel/CSV files together. There is no one-file limit.")
-
+st.subheader("1. POS Statements — MULTIPLE EXCEL FILES")
+st.caption("Select multiple daily POS Excel/CSV files in one Windows file-selection window.")
 pos_uploads=st.file_uploader(
-    "📤 UPLOAD MULTIPLE POS EXCEL FILES",
+    "📤 SELECT MULTIPLE POS EXCEL FILES",
     type=["xlsx","xls","csv"],
     accept_multiple_files=True,
-    key="v54_pos_multi",
-    help="In the Windows picker, hold Ctrl or Shift to select several files. You can also drag multiple files into this box."
+    key="final_pos_multi",
+    help="In the Windows file picker, hold Ctrl or Shift to select multiple files."
 )
-pos_zip=st.file_uploader(
-    "OR upload ONE ZIP containing all POS files",
-    type=["zip"],
-    accept_multiple_files=False,
-    key="v54_pos_zip"
-)
-
-pos_pairs=[]
-for f in (pos_uploads or []):
-    pos_pairs.append((f.name,f.getvalue()))
-if pos_zip:
-    pos_pairs.extend(expand_zip(pos_zip))
-
-_seen=set()
-clean=[]
-for item in pos_pairs:
-    if item[0] not in _seen:
-        _seen.add(item[0])
-        clean.append(item)
-pos_pairs=clean
-
+pos_pairs=[(f.name,f.getvalue()) for f in (pos_uploads or [])]
 if pos_pairs:
-    st.success(f"POS files loaded: {len(pos_pairs)}")
-    with st.expander("View POS files", expanded=False):
+    st.success(f"POS files selected: {len(pos_pairs)}")
+    with st.expander("View selected POS files"):
         st.write("\n".join(f"• {n}" for n,_ in pos_pairs))
 else:
-    st.info("POS: upload multiple Excel files above, or upload one ZIP batch.")
+    st.info("Select one or multiple POS Excel files.")
 
-st.subheader("2. D365 GL — BULK EXCEL UPLOAD")
-st.caption("Upload all D365 GL account dumps together. 8, 20, 50+ GL accounts are supported.")
-
+st.subheader("2. D365 GL — MULTIPLE EXCEL FILES")
+st.caption("Select all D365 GL account Excel/CSV files together. No account limit.")
 gl_uploads=st.file_uploader(
-    "📤 UPLOAD MULTIPLE D365 GL EXCEL FILES",
+    "📤 SELECT MULTIPLE D365 GL EXCEL FILES",
     type=["xlsx","xls","csv"],
     accept_multiple_files=True,
-    key="v54_gl_multi",
-    help="In the Windows picker, hold Ctrl or Shift to select several files. You can also drag multiple files into this box."
+    key="final_gl_multi",
+    help="In the Windows file picker, hold Ctrl or Shift to select multiple files."
 )
-gl_zip=st.file_uploader(
-    "OR upload ONE ZIP containing all D365 GL files",
-    type=["zip"],
-    accept_multiple_files=False,
-    key="v54_gl_zip"
-)
-
-gl_pairs=[]
-for f in (gl_uploads or []):
-    gl_pairs.append((f.name,f.getvalue()))
-if gl_zip:
-    gl_pairs.extend(expand_zip(gl_zip))
-
-_seen=set()
-clean=[]
-for item in gl_pairs:
-    if item[0] not in _seen:
-        _seen.add(item[0])
-        clean.append(item)
-gl_pairs=clean
-
+gl_pairs=[(f.name,f.getvalue()) for f in (gl_uploads or [])]
 if gl_pairs:
-    st.success(f"D365 GL files loaded: {len(gl_pairs)}")
-    with st.expander("View D365 GL files", expanded=False):
+    st.success(f"D365 GL files selected: {len(gl_pairs)}")
+    with st.expander("View selected D365 GL files"):
         st.write("\n".join(f"• {n}" for n,_ in gl_pairs))
 else:
-    st.info("D365 GL: upload multiple Excel files above, or upload one ZIP batch.")
+    st.info("Select one or multiple D365 GL Excel files.")
 
 tolerance=st.number_input("Matching tolerance (SAR)",0.0,10.0,0.50,0.01)
 
