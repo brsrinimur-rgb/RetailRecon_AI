@@ -7,8 +7,11 @@ import auth, theme
 from logic.pos_gl_reconciliation import (
     build_pos_dataset, build_gl_dataset,
     reconcile_pos_to_gl, reconcile_pos_to_gl_by_bucket,
-    detect_exact_duplicate_files, detect_content_duplicate_pos, detect_content_duplicate_gl,
+    detect_exact_duplicate_files,
+    detect_probable_duplicate_pos, detect_probable_duplicate_gl,
+    detect_content_duplicate_pos, detect_content_duplicate_gl,
     validate_pos_completeness, upload_control_summary,
+    detect_incomplete_pos_provider_coverage, validate_gl_sign_convention,
 )
 
 st.set_page_config(page_title="POS → D365 GL Reconciliation", layout="wide", page_icon="🧾")
@@ -143,18 +146,45 @@ if st.session_state.get("v53_validated"):
 
     exact_pos = detect_exact_duplicate_files(pos_pairs)
     exact_gl = detect_exact_duplicate_files(gl_pairs)
-    content_pos = detect_content_duplicate_pos(npos)
-    content_gl = detect_content_duplicate_gl(ngl)
-    all_dupes = exact_pos + exact_gl + content_pos + content_gl
+    probable_pos = detect_probable_duplicate_pos(npos)
+    probable_gl = detect_probable_duplicate_gl(ngl)
+    possible_pos = detect_content_duplicate_pos(npos)
+    possible_gl = detect_content_duplicate_gl(ngl)
+    all_exact = exact_pos + exact_gl
+    all_probable = probable_pos + probable_gl
+    all_possible = possible_pos + possible_gl
 
-    if all_dupes:
-        st.error(f"🔴 DUPLICATE SOURCE FILE DETECTED ({len(all_dupes)}) -- review before running reconciliation. Totals will double-count until this is resolved.")
-        for d in exact_pos + exact_gl:
-            st.write(f"• **Exact duplicate:** `{d['file_a']}` and `{d['file_b']}` -- {d['reason']}")
-        for d in content_pos + content_gl:
-            st.write(f"• **Likely duplicate:** `{d['file_a']}` and `{d['file_b']}` -- {d['reason']}")
+    if all_exact or all_probable or all_possible:
+        st.error(
+            f"🔴 DUPLICATE SOURCE FILE DETECTED ({len(all_exact)} exact, {len(all_probable)} probable, "
+            f"{len(all_possible)} possible) -- review before running reconciliation. Totals will "
+            f"double-count until this is resolved. No file is auto-excluded; these are warnings for "
+            f"you to confirm."
+        )
+        for d in all_exact:
+            st.write(f"• 🔴 **Exact duplicate:** `{d['file_a']}` and `{d['file_b']}` -- {d['reason']}")
+        for d in all_probable:
+            st.write(f"• 🟠 **Probable duplicate:** `{d['file_a']}` and `{d['file_b']}` -- {d['reason']}")
+        for d in all_possible:
+            st.write(f"• 🟡 **Possible duplicate:** `{d['file_a']}` and `{d['file_b']}` -- {d['reason']} (row count/total/date range only -- could be two different files that coincidentally match; verify before assuming.)")
     else:
         st.success("✅ No duplicate files detected among the uploads.")
+
+    coverage_warnings = detect_incomplete_pos_provider_coverage(npos, ngl)
+    if coverage_warnings:
+        st.warning(f"⚠️ UPLOAD COMPLETENESS: {len(coverage_warnings)} Store/provider combination(s) posted in D365 GL have no matching POS file uploaded. This is a separate control from accounting exceptions below -- it means the upload is likely incomplete, not that GL posted something wrong.")
+        with st.expander("View missing POS provider coverage", expanded=True):
+            for w in coverage_warnings:
+                st.write(f"• {w['message']}")
+    else:
+        st.success("✅ Upload completeness: every GL clearing account has a matching POS provider file for that store.")
+
+    sign_check = validate_gl_sign_convention(npos, ngl)
+    if sign_check.get("checked"):
+        if sign_check["suspected_inverted"]:
+            st.warning(f"⚠️ GL SIGN CONVENTION: {sign_check['message']}")
+        else:
+            st.caption(f"✅ Sign check: {sign_check['message']}")
 
     comp = validate_pos_completeness(npos)
     if comp["missing_store"] or comp["missing_date"] or comp["missing_amount"]:
@@ -190,14 +220,13 @@ if st.session_state.get("v53_validated"):
         st.caption(f"Stores in GL only (no POS activity at all): {', '.join(ctrl['stores_gl_only'])}")
 
 st.divider()
-tolerance=st.number_input("Matching tolerance per line item (SAR)",0.0,10.0,0.50,0.01,
-    help="Applied per transaction/line in a bucket, with a hard automatic bucket ceiling of SAR 50. This prevents a large row count from creating an unsafe multi-hundred or multi-thousand SAR tolerance.")
-
-st.info(
-    "Control principle: Store Code + Date is the only matching key. "
-    "Amount proves or rejects the Store+Date bucket. Provider, Merchant ID, "
-    "Terminal and Auth Code are investigation fields only."
-)
+tc1, tc2 = st.columns(2)
+with tc1:
+    tolerance=st.number_input("Matching tolerance per line item (SAR)",0.0,10.0,0.50,0.01,
+        help="Applied per transaction/line in a bucket -- effective bucket tolerance scales with how many POS/GL rows fall into it, so summing many independently-rounded transactions doesn't manufacture false exceptions.")
+with tc2:
+    max_bucket_tolerance=st.number_input("Maximum bucket tolerance ceiling (SAR)",1.0,10000.0,25.00,1.0,
+        help="Hard cap on the effective per-bucket tolerance. Without this, a bucket with thousands of line items could accept a real difference of thousands of SAR as MATCHED. Never allow this to grow unbounded.")
 
 granularity=st.radio(
     "Matching granularity",
@@ -247,7 +276,7 @@ if st.button("RUN POS → GL RECONCILIATION",type="primary",use_container_width=
         ngl=build_gl_dataset(gl_pairs)
 
     if granularity.startswith("Store + Date"):
-        st.session_state.v53_pos_gl=reconcile_pos_to_gl_by_bucket(npos,ngl,tolerance,settlement_lag_days,exclude_dup_pos,exclude_dup_gl)
+        st.session_state.v53_pos_gl=reconcile_pos_to_gl_by_bucket(npos,ngl,tolerance,settlement_lag_days,exclude_dup_pos,exclude_dup_gl,max_bucket_tolerance)
     else:
         st.session_state.v53_pos_gl=reconcile_pos_to_gl(npos,ngl,tolerance)
 
@@ -259,21 +288,16 @@ if r:
 
     if is_bucket:
         st.subheader("POS → D365 GL CONTROL")
+        st.caption("Matched / Exceptions below are counted at the Store+Date BUCKET level -- one bucket, however many POS transactions it contains, counts once. POS/GL row counts are shown separately so the two are never confused.")
         a,b,c=st.columns(3)
-        a.metric("Files Loaded",f"{len(pos_pairs)+len(gl_pairs)}"); b.metric("POS Rows",f"{int(s['POS Rows']):,}"); c.metric("GL Rows",f"{int(s['GL Rows']):,}")
+        a.metric("Files Loaded",f"{len(pos_pairs)+len(gl_pairs)}"); b.metric("POS Transaction Rows",f"{int(s['POS Transaction Rows']):,}"); c.metric("GL Line Rows",f"{int(s['GL Line Rows']):,}")
         a,b,c=st.columns(3)
-        a.metric("Store-Date Buckets",f"{int(s['Store-Date Buckets']):,}")
-        b.metric("Matched Buckets",f"{int(s['GL Matched Buckets']):,}")
-        c.metric("Exception Buckets",f"{int(s['GL Amount Exception Buckets']):,}")
-        st.caption(
-            f"Accounting KPI: {int(s['GL Matched Buckets']):,} Store+Date buckets reconciled. "
-            f"This is NOT a count of individual POS transactions."
-        )
+        a.metric("Store-Date Buckets",f"{int(s['Store-Date Buckets']):,}"); b.metric("Matched Buckets",f"{int(s['Matched Buckets']):,}"); c.metric("Exception Buckets",f"{int(s['Exception Buckets']):,}")
         a,b,c=st.columns(3)
-        a.metric("GL Not Posted",f"{int(s['GL Not Posted']):,}"); b.metric("Duplicate POS Excluded",f"{int(s['Duplicate POS Rows Excluded']):,}"); c.metric("Duplicate GL Excluded",f"{int(s['Duplicate GL Rows Excluded']):,}")
+        a.metric("GL Not Posted (buckets)",f"{int(s['GL Not Posted']):,}"); b.metric("Duplicate POS Excluded",f"{int(s['Duplicate POS Rows Excluded']):,}"); c.metric("Duplicate GL Excluded",f"{int(s['Duplicate GL Rows Excluded']):,}")
         a,b,c=st.columns(3)
         a.metric("POS Total (SAR)",f"{s['POS Total (SAR)']:,.2f}"); b.metric("GL Total (SAR)",f"{s['GL Total (SAR)']:,.2f}"); c.metric("Net Difference (SAR)",f"{s['Net Difference (SAR)']:,.2f}")
-        st.caption(f"Overall: {overall}")
+        st.caption(f"Overall: {overall} · Max bucket tolerance ceiling: SAR {s['Max Bucket Tolerance SAR']:,.2f}")
 
         swaps = r["bucket_summary"][r["bucket_summary"]["Store Swap Suspected With"]!=""]
         if not swaps.empty:
