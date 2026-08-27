@@ -1,61 +1,64 @@
 """
-logic/pos_gl_reconciliation.py — FIXED
+logic/pos_gl_reconciliation.py
 
-Root cause of "POS and GL report matching is not working":
-  1. pages/35_POS_GL_Reconciliation.py read every uploaded file with a naive
-     pd.read_excel(header=0) and concatenated ALL files/sheets into one blob
-     before normalizing. Real POS exports (e.g. ANB Details_mada/Details_CC)
-     have title rows above the real header, so header=0 grabbed the wrong
-     row and produced "Unnamed: 0..N" columns -> normalize_pos found none of
-     its aliases (Merchant ID population fell to ~8%, mostly noise).
-  2. normalize_gl looked for literal "Merchant ID"/"Store Code"/"Provider"/
-     "Auth Code" columns on the GL side. Real D365 "General journal account
-     entry" exports do not have those columns at all -- Store Code has to be
-     PARSED out of the combined "Ledger account" dimension string
-     (e.g. "11020907-601--Sale-10415---" -> store 601). Because that parsing
-     never happened, every GL identity field was 100% blank, so every POS
-     row's identity filters found nothing to narrow on for GL Rows -- with
-     6,542 candidate GL rows still in the pool, `len(pool)==1` was never
-     true, so every POS row fell through to "GL REVIEW REQUIRED" and 0 GL
-     rows were ever marked used. That exactly matches the reported result:
-     0 GL Matched / 5,454 Review Required / 0 Unmatched-GL touched.
+CHANGE HISTORY (most recent first) -- kept here because this module has been
+patched several times against real production files, and each pass fixed a
+real, evidence-based problem. Read this before changing the matching logic
+again.
 
-Fix: reuse core.py's proven, already-in-production parsers instead of the
-narrow reimplementation that caused both bugs --
-  - core.read_upload(file)          -> per-sheet header auto-detection
-  - core.normalize_pos(df, ...)     -> real POS/provider alias handling,
-                                        Store Map resolution, TAP/TABBY/
-                                        TAMARA/AMEX provider detection
-  - core.normalize_d365_gl(df, ...) -> Ledger Account dimension parsing for
-                                        Store Code / Main Account, Sales
-                                        Order extraction from Description
+PASS 4 (2026-08-27) -- "Finance Control Tower" rework, per user's explicit
+production-readiness review after report4:
+  - Bucket key reverted to Store Code + Date ONLY, per the user's explicit
+    instruction. PASS 3 had grouped by Store + provider clearing account +
+    Date to stop cross-provider totals being compared to each other; the
+    user's call is that Store+Date is the correct, simpler accounting
+    control key, and that duplicate/completeness/variance CONTROLS should
+    do the work instead of a more complex matching key. Provider/Merchant/
+    Terminal/Auth Code remain on every row as supporting investigation
+    detail, never as part of the match key.
+  - Duplicate-file control: detect_duplicate_files() flags byte-identical
+    uploads and same-content-different-filename uploads before
+    reconciliation runs (the exact "uploaded yesterday's file twice"
+    scenario the user described).
+  - Row-level duplicate detection on both sides (POS: Store+Date+Reference+
+    Amount; GL: Voucher+Journal+Main Account+Store+Date), auto-excluded
+    from bucket sums (keeping one copy), counts reported.
+  - GL bucket totals now sum Signed Amount (not Absolute Amount) so
+    reversal/correction pairs net to their real economic effect instead of
+    both legs adding as positive.
+  - Cross-store swap detection: flags mirror-pair buckets where Store A's
+    POS total matches Store B's GL total and vice versa (exactly the
+    Store 633 <-> Store 659 pattern found in report4).
+  - Exceptions now carry a rule-based "Likely Cause" and are sorted by
+    ABS(Difference) descending (variance ranking).
+  - New helper functions for period completeness and an upload control
+    summary, meant to run BEFORE the user commits to a full reconciliation
+    (see pages/35_POS_GL_Reconciliation.py's Validate step).
 
-reconcile_pos_to_gl() -- the original row-to-row matching algorithm and the
-report's column/sheet layout -- is UNCHANGED, kept as a selectable mode.
+PASS 3 (2026-08-27, report4): grouped by Store + expected D365 clearing
+account + Date; found and fixed a too-tight flat tolerance on bucket sums
+(scaled per line item instead). Superseded by PASS 4 above on the grouping
+key specifically; the tolerance-scaling and Controlled-Clearing-Account
+filtering from this pass are kept.
 
-SECOND PASS (2026-08-27, after checking a real re-run of this fix,
-report2/report3): row-to-row matching still produced ~0 GL Matched even
-with correct identity fields, because real D365 exports post many GL lines
-per store per day, not one -- added reconcile_pos_to_gl_by_bucket(), which
-compares SUM(POS Amount) vs SUM(GL Amount) per Store+Date instead. Checking
-THAT against the same real re-run surfaced two more real issues, both fixed
-here:
-  3. A single Store+Date GL bucket can hold CARD, TABBY, TAMARA, CASH, and
-     TAP clearing-account lines all at once -- comparing a card-only POS
-     total against that combined total produced wild differences. Buckets
-     are now keyed by Store + expected D365 clearing account (via
-     core._gl_expected_account_for_tender(), the same mapping
-     core.trace_d365_source_to_gl() already uses elsewhere in this app),
-     not just Store + Date.
-  4. Real D365 "General journal account entry" exports can carry
-     Sales/COGS/Tax/Discount/Inventory postings under the same Store
-     dimension as the clearing lines -- build_gl_dataset() now filters to
-     Controlled Clearing Account rows only, the same filter
-     core.trace_d365_source_to_gl() and related functions already apply.
+PASS 2 (2026-08-27, report2/report3): first bucket-sum matching
+(reconcile_pos_to_gl_by_bucket), because PASS 1's row-to-row matching
+produced ~0 GL Matched against real D365 exports (many GL lines post per
+store per day, not one).
+
+PASS 1 (2026-08-27, original bug report): root-caused the original "0
+matches" bug to two bugs in this module and the page that used it -- no
+real header-row detection on upload, and no D365 Ledger Account dimension
+parsing for Store Code. Fixed by reusing core.py's proven read_upload() /
+normalize_pos() / normalize_d365_gl() plus the Store/Merchant/Terminal
+Master chain, instead of this module's own narrow reimplementation.
+reconcile_pos_to_gl() (row-to-row) is kept from this pass as a selectable
+mode.
 """
 
 from __future__ import annotations
 import re
+import hashlib
 import pandas as pd
 import core
 import db
@@ -68,8 +71,8 @@ def norm(v):
 
 
 class _UploadLike:
-    """Wraps (filename, bytes) so it satisfies core.read_upload()'s file-like
-    interface (.name / .getvalue())."""
+    """Wraps (filename, bytes) so it satisfies core.read_upload()'s
+    file-like interface (.name / .getvalue())."""
     def __init__(self, name, data):
         self.name = name
         self._data = data
@@ -84,6 +87,89 @@ def _sheets_for(name, data):
     except Exception:
         return {}
 
+
+# ---------------------------------------------------------------------------
+# 1. Duplicate-file control (checked BEFORE reconciliation runs)
+# ---------------------------------------------------------------------------
+
+def detect_exact_duplicate_files(pairs):
+    """
+    pairs: list of (filename, bytes). Flags byte-identical uploads -- the
+    literal "uploaded the same file twice" case, catches it even if the
+    uploader assigns the two uploads different internal names. Cheap and
+    reliable; works before any parsing/normalization.
+
+    Returns [{"file_a","file_b","reason"}, ...].
+    """
+    exact = []
+    byte_hash = {}
+    for name, data in pairs:
+        h = hashlib.sha256(data).hexdigest()
+        if h in byte_hash:
+            exact.append({"file_a": byte_hash[h], "file_b": name,
+                          "reason": "Byte-identical file content -- this is the same file uploaded twice."})
+        else:
+            byte_hash[h] = name
+    return exact
+
+
+def _content_duplicates(dataset, amount_col, date_col):
+    """
+    Shared implementation for detect_content_duplicate_pos/gl. Groups the
+    ALREADY-NORMALIZED dataset by source_file and compares (row count,
+    total of the real amount column, date range) -- deliberately built on
+    the business amount/date fields core.py already identified, not raw
+    file columns, so ID-like columns (Terminal ID, Merchant ID, Card
+    Number...) can never dominate the signature and cause false positives.
+    """
+    if dataset is None or dataset.empty:
+        return []
+    g = dataset.groupby("source_file").agg(
+        rows=(amount_col, "size"), total=(amount_col, "sum"),
+        dmin=(date_col, "min"), dmax=(date_col, "max"),
+    )
+    dupes = []
+    seen = {}
+    for src, row in g.iterrows():
+        sig = (int(row["rows"]), round(float(row["total"]) if pd.notna(row["total"]) else 0.0, 2),
+               str(row["dmin"]), str(row["dmax"]))
+        base_name = str(src).split(" [")[0]
+        prior = seen.get(sig)
+        if prior and prior.split(" [")[0] != base_name:
+            dupes.append({"file_a": prior, "file_b": src,
+                          "reason": f"Same row count ({int(row['rows'])}), same total amount (~SAR {row['total']:,.2f}), same date range -- looks like the same data under a different filename."})
+        else:
+            seen.setdefault(sig, src)
+    return dupes
+
+
+def detect_content_duplicate_pos(pos_dataset):
+    """pos_dataset: output of build_pos_dataset(). See _content_duplicates()."""
+    return _content_duplicates(pos_dataset, "pos_amount", "pos_date")
+
+
+def detect_content_duplicate_gl(gl_dataset):
+    """gl_dataset: output of build_gl_dataset(). See _content_duplicates()."""
+    return _content_duplicates(gl_dataset, "gl_signed_amount", "gl_date")
+
+
+def detect_duplicate_files(pairs, dataset=None, amount_col=None, date_col=None):
+    """
+    Convenience wrapper combining the exact-byte check (always available)
+    with the content check (only if a normalized `dataset` is supplied --
+    pass the build_pos_dataset()/build_gl_dataset() output with
+    amount_col="pos_amount"/date_col="pos_date" or
+    amount_col="gl_signed_amount"/date_col="gl_date").
+    """
+    exact = detect_exact_duplicate_files(pairs)
+    content = _content_duplicates(dataset, amount_col, date_col) if dataset is not None and amount_col else []
+    return {"exact_duplicates": exact, "content_duplicates": content,
+            "has_duplicates": bool(exact or content)}
+
+
+# ---------------------------------------------------------------------------
+# Normalization (unchanged from PASS 1/2: reuse core.py's proven parsers)
+# ---------------------------------------------------------------------------
 
 def build_pos_dataset(pos_pairs):
     """pos_pairs: list of (filename, bytes). Returns the internal matching
@@ -116,11 +202,10 @@ def build_pos_dataset(pos_pairs):
                 continue
             parts.append(n)
 
+    cols = ["merchant_id", "store_code", "provider", "reference", "auth_code",
+            "pos_date", "pos_amount", "source_file", "source_row"]
     if not parts:
-        return pd.DataFrame(columns=[
-            "merchant_id", "store_code", "provider", "reference", "auth_code",
-            "pos_date", "pos_amount", "source_file", "source_row"
-        ])
+        return pd.DataFrame(columns=cols)
 
     pos = pd.concat(parts, ignore_index=True)
 
@@ -130,11 +215,7 @@ def build_pos_dataset(pos_pairs):
     # it always wins). Many real POS/provider exports (e.g. ANB
     # Details_mada/Details_CC) carry no Store column at all -- only a
     # constant company name like "UNITED LUXURY CORP" -- so without this
-    # step POS Store never becomes a real D365 Store Code and GL Store Code
-    # never has anything to match against, even after the parsing fix
-    # above. This reuses the SAME masters already maintained live in pages
-    # 14/16/17 and read by page 1's own reconciliation -- nothing new to
-    # configure.
+    # step POS Store never becomes a real D365 Store Code.
     try:
         store_master = db.load_store_mapping_master()
         if not pos.empty and store_master is not None and not store_master.empty:
@@ -171,7 +252,8 @@ def build_pos_dataset(pos_pairs):
 def build_gl_dataset(gl_pairs):
     """gl_pairs: list of (filename, bytes). Returns the internal matching
     schema (merchant_id, store_code, provider, reference, auth_code,
-    gl_date, gl_amount, main_account, voucher, journal, source_file,
+    gl_date, gl_amount [absolute, reference only], gl_signed_amount [used
+    for bucket sums], main_account, voucher, journal, source_file,
     source_row)."""
     parts = []
     for name, data in gl_pairs:
@@ -186,44 +268,37 @@ def build_gl_dataset(gl_pairs):
                 continue
             parts.append(n)
 
+    cols = ["merchant_id", "store_code", "provider", "reference", "auth_code",
+            "gl_date", "gl_amount", "gl_signed_amount", "main_account", "voucher",
+            "journal", "source_file", "source_row"]
     if not parts:
-        return pd.DataFrame(columns=[
-            "merchant_id", "store_code", "provider", "reference", "auth_code",
-            "gl_date", "gl_amount", "main_account", "voucher", "journal",
-            "source_file", "source_row"
-        ])
+        return pd.DataFrame(columns=cols)
 
     gl = pd.concat(parts, ignore_index=True)
 
-    # Defensive: real D365 "General journal account entry" exports can carry
+    # Only clearing-account rows are ever comparable to a POS/provider
+    # statement -- real D365 "General journal account entry" exports carry
     # Sales/COGS/Tax/Discount/Inventory postings under the same Store
-    # dimension as the card/provider clearing lines. Only clearing-account
-    # rows (core.D365_CLEARING_ACCOUNT_MAP) are ever comparable to a POS/
-    # provider statement -- this is the exact same filter
-    # core.trace_d365_source_to_gl() and friends already apply
+    # dimension. This is the same filter core.trace_d365_source_to_gl() and
+    # related functions already apply
     # (`actual_gl[actual_gl["Controlled Clearing Account"].fillna(False)]`).
     gl = gl[gl["Controlled Clearing Account"].fillna(False)].copy()
     if gl.empty:
-        return pd.DataFrame(columns=[
-            "merchant_id", "store_code", "provider", "reference", "auth_code",
-            "gl_date", "gl_amount", "main_account", "voucher", "journal",
-            "source_file", "source_row"
-        ])
+        return pd.DataFrame(columns=cols)
 
     out = pd.DataFrame({
-        # D365 GL exports carry no merchant_id/provider/auth_code -- left
-        # blank on purpose. reconcile_pos_to_gl() already skips any filter
-        # whose POS-side value has nothing to match, so this is safe and
-        # matches the report's own stated rule ("Merchant ID, Store,
-        # Provider, Reference/Auth and Date establish identity" -- Store +
-        # Date + Sales Order/Reference are the fields D365 actually has).
         "merchant_id": "",
         "store_code": gl["Store Code"].map(norm),
         "provider": "",
         "reference": gl["Sales Order"].map(norm),
         "auth_code": "",
         "gl_date": pd.to_datetime(gl["GL Date"], errors="coerce"),
+        # Debit/Credit control: preserve the signed amount for bucket
+        # sums (a reversal/correction pair nets to its real economic
+        # effect) and keep Absolute Amount only as a reference column --
+        # never sum Absolute Amount blindly.
         "gl_amount": pd.to_numeric(gl["Absolute Amount"], errors="coerce"),
+        "gl_signed_amount": pd.to_numeric(gl["Signed Amount"], errors="coerce"),
         "main_account": gl["Main Account"].map(norm),
         "voucher": gl["Voucher"].map(norm),
         "journal": gl["Journal Number"].map(norm),
@@ -233,56 +308,196 @@ def build_gl_dataset(gl_pairs):
     return out
 
 
-# Kept for backward compatibility / direct unit testing against a single
-# already-loaded DataFrame -- no longer used by pages/35 (which now calls
-# build_pos_dataset / build_gl_dataset directly on the raw uploaded files,
-# since header detection has to happen per-file, before concatenation).
-def normalize_pos(df, source_file=""):
-    return build_pos_dataset([(source_file or "POS", None)]) if df is None else _legacy_normalize(df, source_file, "pos")
+# ---------------------------------------------------------------------------
+# 2. Store+Date completeness control
+# ---------------------------------------------------------------------------
+
+def validate_pos_completeness(pos):
+    """
+    Checks every normalized POS row for a usable Store Code, Date and
+    Amount BEFORE any bucketing happens. Returns a dict of counts plus a
+    sample of the offending rows, meant to be shown to the user in the
+    upload control summary (not buried in the exceptions sheet).
+    """
+    if pos is None or pos.empty:
+        return {"total_rows": 0, "missing_store": 0, "missing_date": 0,
+                "missing_amount": 0, "clean_rows": 0, "sample": pos}
+    missing_store = pos["store_code"] == ""
+    missing_date = pos["pos_date"].isna()
+    missing_amount = pos["pos_amount"].isna()
+    bad = missing_store | missing_date | missing_amount
+    sample = pos[bad].copy()
+    sample["Missing Store Code"] = missing_store[bad]
+    sample["Missing Date"] = missing_date[bad]
+    sample["Missing Amount"] = missing_amount[bad]
+    return {
+        "total_rows": len(pos),
+        "missing_store": int(missing_store.sum()),
+        "missing_date": int(missing_date.sum()),
+        "missing_amount": int(missing_amount.sum()),
+        "clean_rows": int((~bad).sum()),
+        "sample": sample.head(200),
+    }
 
 
-def normalize_gl(df, source_file=""):
-    return build_gl_dataset([(source_file or "GL", None)]) if df is None else _legacy_normalize(df, source_file, "gl")
+# ---------------------------------------------------------------------------
+# 8. Period completeness
+# ---------------------------------------------------------------------------
+
+def period_completeness(pos, gl):
+    """
+    Summarizes the calendar-date coverage on each side: min/max date,
+    distinct dates, and which dates appear on one side but not the other.
+    """
+    pos_dates = set(pd.to_datetime(pos["pos_date"], errors="coerce").dt.normalize().dropna()) if pos is not None and not pos.empty else set()
+    gl_dates = set(pd.to_datetime(gl["gl_date"], errors="coerce").dt.normalize().dropna()) if gl is not None and not gl.empty else set()
+    missing_in_gl = sorted(pos_dates - gl_dates)
+    missing_in_pos = sorted(gl_dates - pos_dates)
+    return {
+        "pos_date_min": min(pos_dates) if pos_dates else None,
+        "pos_date_max": max(pos_dates) if pos_dates else None,
+        "pos_distinct_dates": len(pos_dates),
+        "gl_date_min": min(gl_dates) if gl_dates else None,
+        "gl_date_max": max(gl_dates) if gl_dates else None,
+        "gl_distinct_dates": len(gl_dates),
+        "dates_pos_only": missing_in_gl,
+        "dates_gl_only": missing_in_pos,
+    }
 
 
-def _legacy_normalize(df, source_file, kind):
-    if kind == "pos":
-        try:
-            n = core.normalize_pos(df, source_file or "POS", None)
-        except Exception:
-            n = pd.DataFrame()
-        if n.empty:
-            return pd.DataFrame(columns=["merchant_id", "store_code", "provider", "reference", "auth_code", "pos_date", "pos_amount", "source_file", "source_row"])
-        out = pd.DataFrame({
-            "merchant_id": n["Merchant ID"].map(norm),
-            "store_code": n["POS Store"].map(norm),
-            "provider": n["Provider"].map(norm),
-            "reference": n["Provider Reference"].map(norm),
-            "auth_code": n["Auth Code"].map(norm),
-            "pos_date": pd.to_datetime(n["POS Date"], errors="coerce"),
-            "pos_amount": pd.to_numeric(n["POS Amount"], errors="coerce"),
-            "source_file": n["Source File"],
-        })
-        out["source_row"] = range(2, len(out) + 2)
-        return out
-    else:
-        try:
-            n = core.normalize_d365_gl(df, source_file or "GL")
-        except Exception:
-            n = pd.DataFrame()
-        if n.empty:
-            return pd.DataFrame(columns=["merchant_id", "store_code", "provider", "reference", "auth_code", "gl_date", "gl_amount", "main_account", "voucher", "journal", "source_file", "source_row"])
-        out = pd.DataFrame({
-            "merchant_id": "", "store_code": n["Store Code"].map(norm), "provider": "",
-            "reference": n["Sales Order"].map(norm), "auth_code": "",
-            "gl_date": pd.to_datetime(n["GL Date"], errors="coerce"),
-            "gl_amount": pd.to_numeric(n["Absolute Amount"], errors="coerce"),
-            "main_account": n["Main Account"].map(norm), "voucher": n["Voucher"].map(norm),
-            "journal": n["Journal Number"].map(norm), "source_file": n["Source File"],
-        })
-        out["source_row"] = range(2, len(out) + 2)
-        return out
+# ---------------------------------------------------------------------------
+# 9. Upload control summary
+# ---------------------------------------------------------------------------
 
+def upload_control_summary(pos_pairs, gl_pairs, pos, gl):
+    """
+    Pre-reconciliation snapshot: how many files/rows were loaded, what date
+    range and which stores/GL accounts they cover. Meant to be shown right
+    after Validate, before the user commits to RUN.
+    """
+    pos_stores = sorted(set(pos["store_code"]) - {""}) if pos is not None and not pos.empty else []
+    gl_stores = sorted(set(gl["store_code"]) - {""}) if gl is not None and not gl.empty else []
+    gl_accounts = sorted(set(gl["main_account"]) - {""}) if gl is not None and not gl.empty else []
+    period = period_completeness(pos, gl)
+    return {
+        "pos_files": len(pos_pairs), "gl_files": len(gl_pairs),
+        "pos_rows": 0 if pos is None else len(pos), "gl_rows": 0 if gl is None else len(gl),
+        "pos_stores": pos_stores, "gl_stores": gl_stores, "gl_accounts": gl_accounts,
+        "stores_pos_only": sorted(set(pos_stores) - set(gl_stores)),
+        "stores_gl_only": sorted(set(gl_stores) - set(pos_stores)),
+        "period": period,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3 & 4. Row-level duplicate detection (GL and POS)
+# ---------------------------------------------------------------------------
+
+def _flag_pos_duplicates(pos):
+    """
+    Flags POS rows that look like the same transaction counted more than
+    once: same Store + Date + Reference/Auth Code + Amount. Requires a
+    non-blank reference so unrelated cash-only rows sharing a round amount
+    aren't falsely flagged.
+    """
+    pos = pos.copy()
+    ref = pos["reference"].astype(str)
+    ref = ref.where(ref.str.len() > 0, pos["auth_code"].astype(str))
+    pos["_dup_ref"] = ref
+    eligible = (pos["store_code"] != "") & pos["pos_date"].notna() & (pos["_dup_ref"] != "") & pos["pos_amount"].notna()
+    key_cols = ["store_code", "pos_date", "_dup_ref", "pos_amount"]
+    group_dup = pd.Series(False, index=pos.index)
+    extra_dup = pd.Series(False, index=pos.index)
+    if eligible.any():
+        sub = pos[eligible]
+        group_dup.loc[sub.index] = sub.duplicated(subset=key_cols, keep=False)
+        extra_dup.loc[sub.index] = sub.duplicated(subset=key_cols, keep="first")
+    pos["is_duplicate_pos"] = group_dup
+    pos["is_duplicate_pos_extra"] = extra_dup
+    return pos.drop(columns=["_dup_ref"])
+
+
+def _flag_gl_duplicates(gl):
+    """
+    Flags GL rows sharing Voucher + Journal + Main Account + Store + Date
+    (Voucher/Journal numbers are meant to be unique per real D365 posting,
+    so a repeated combination is a strong duplicate-upload signal).
+    """
+    gl = gl.copy()
+    eligible = (gl["voucher"] != "") & (gl["journal"] != "") & (gl["store_code"] != "") & gl["gl_date"].notna()
+    key_cols = ["voucher", "journal", "main_account", "store_code", "gl_date"]
+    group_dup = pd.Series(False, index=gl.index)
+    extra_dup = pd.Series(False, index=gl.index)
+    if eligible.any():
+        sub = gl[eligible]
+        group_dup.loc[sub.index] = sub.duplicated(subset=key_cols, keep=False)
+        extra_dup.loc[sub.index] = sub.duplicated(subset=key_cols, keep="first")
+    gl["is_duplicate_gl"] = group_dup
+    gl["is_duplicate_gl_extra"] = extra_dup
+    return gl
+
+
+# ---------------------------------------------------------------------------
+# 7. Cross-store swap detection
+# ---------------------------------------------------------------------------
+
+def _detect_store_swaps(bucket_df, tolerance):
+    """
+    For each pair of buckets on the SAME date but different stores, checks
+    whether Store A's POS Total lines up with Store B's GL Total (and vice
+    versa) -- a mirror pair, the signature of a Store Code swap somewhere
+    in the pipeline. Returns {(store, date): suspected_counterpart_store}.
+    """
+    swaps = {}
+    for date, grp in bucket_df.groupby("bucket_gl_date"):
+        grp = grp.reset_index(drop=True)
+        n = len(grp)
+        for i in range(n):
+            a = grp.iloc[i]
+            if max(abs(a["pos_total"]), abs(a["gl_total"])) <= tolerance * 2:
+                continue
+            for j in range(n):
+                if i == j:
+                    continue
+                b = grp.iloc[j]
+                if a["store_code"] == b["store_code"]:
+                    continue
+                if abs(a["pos_total"] - b["gl_total"]) <= tolerance and abs(a["gl_total"] - b["pos_total"]) <= tolerance:
+                    swaps[(a["store_code"], date)] = b["store_code"]
+    return swaps
+
+
+# ---------------------------------------------------------------------------
+# 10. Exception reason engine
+# ---------------------------------------------------------------------------
+
+def _classify_exception(row, swap_map):
+    key = (row["store_code"], row["bucket_gl_date"])
+    if key in swap_map:
+        return f"POSSIBLE STORE CODE SWAP with Store {swap_map[key]} -- this store's POS total matches the other store's GL total and vice versa."
+    if row.get("pos_duplicate_rows", 0) or row.get("gl_duplicate_rows", 0):
+        return (f"Duplicate rows detected and excluded from totals "
+                f"({int(row.get('pos_duplicate_rows',0))} POS, {int(row.get('gl_duplicate_rows',0))} GL) -- "
+                f"remaining variance may still need review.")
+    pos_total, gl_total = row["pos_total"], row["gl_total"]
+    if gl_total and pos_total:
+        ratio = pos_total / gl_total
+        if abs(ratio - 2) < 0.08:
+            return "POS Total is ~2x GL Total -- check for a duplicate POS file upload for this Store+Date."
+        if abs(ratio - 0.5) < 0.08:
+            return "GL Total is ~2x POS Total -- check for a duplicate GL file upload, or a missing POS file for this Store+Date."
+    pos_count, gl_count = row["pos_count"], row["gl_count"]
+    if pos_count and gl_count:
+        if gl_count < pos_count * 0.5:
+            return f"GL has far fewer lines ({int(gl_count)}) than POS transactions ({int(pos_count)}) -- check for a missing/partial GL file for this date."
+        if pos_count < gl_count * 0.5:
+            return f"POS has far fewer transactions ({int(pos_count)}) than GL lines ({int(gl_count)}) -- check for a missing/partial POS file for this date."
+    return "Amount variance has no obvious cause from row-count or ratio patterns -- needs manual review."
+
+
+# ---------------------------------------------------------------------------
+# Row-to-row matching (PASS 1, kept as a selectable mode)
+# ---------------------------------------------------------------------------
 
 def reconcile_pos_to_gl(pos, gl, tolerance=0.50):
     pos = pos.reset_index(drop=True); gl = gl.reset_index(drop=True)
@@ -335,196 +550,210 @@ def reconcile_pos_to_gl(pos, gl, tolerance=0.50):
     return {"detail": d, "matched": matched, "exceptions": exc, "unmatched_gl": gl.loc[~gl.index.isin(used)].copy(), "summary": summary}
 
 
+# ---------------------------------------------------------------------------
+# Bucket matching -- Store Code + Date only (PASS 4 default), with the
+# full control stack: duplicate exclusion, signed-amount sums, variance
+# ranking, swap detection, exception classification.
+# ---------------------------------------------------------------------------
 
-
-def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0):
+def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0,
+                                   exclude_duplicate_pos=True, exclude_duplicate_gl=True):
     """
-    Bucket-level reconciliation: compares SUM(POS Amount) vs SUM(GL Amount)
-    per Store + Date, with the POS tender used only to select the expected D365 clearing account, instead of requiring
-    reconcile_pos_to_gl()'s 1:1 POS row <-> GL row match.
+    Bucket key is Store Code + Date ONLY (per explicit user decision --
+    do not add Merchant ID/Provider/Terminal/Auth Code to the match key;
+    those stay available as investigation columns). Compares SUM(POS
+    Amount) vs SUM(GL Signed Amount) per bucket.
 
-    Correction added after checking a real second verification run
-    (report2/report3, 2026-08-27) against this function's first version:
+    Controls applied before summing:
+      - Duplicate GL rows (same Voucher+Journal+Main Account+Store+Date)
+        and duplicate POS rows (same Store+Date+Reference/Auth+Amount) are
+        detected and, by default, excluded from the sums (one copy kept);
+        counts are reported on every bucket and in the row-level detail.
+      - Bucket tolerance scales with line-item count
+        (tolerance * max(POS rows, GL rows) in the bucket) so summing many
+        independently-rounded transactions doesn't manufacture false
+        exceptions.
+      - GL side sums Signed Amount, not Absolute Amount, so reversal/
+        correction pairs net out correctly.
 
-    GROUP BY PROVIDER, NOT JUST STORE+DATE. A single real Store+Date GL
-    bucket can hold CARD, TABBY, TAMARA, CASH, and TAP clearing-account
-    lines all at once. Comparing a card-only POS total against that
-    combined total produced wild, meaningless differences (94% "GL AMOUNT
-    EXCEPTION" in that run). Buckets are now keyed by (Store Code, expected
-    D365 clearing account(s), Date), using
-    core._gl_expected_account_for_tender() -- the SAME mapping
-    core.trace_d365_source_to_gl() already uses for Store Tender -> GL
-    matching elsewhere in this app -- so a MADA/VISA/MASTERCARD POS
-    transaction is only ever compared against the card clearing account
-    (11020907), never against that day's TABBY/CASH/TAMARA lines.
-
-    On settlement_lag_days (default 0, tunable): tested a 1-day lag here
-    (by analogy with this project's V30 finding that ANB books a card
-    batch's BANK credit under the next day's date) and it made real results
-    worse, not better, on this dataset -- 0 matches at lag=1 vs 250 at
-    lag=0. That tracks: V30's lag is for the BANK settlement date (money
-    physically landing, which genuinely takes an extra day), not the D365
-    GL/journal posting date, which books same-day as an accrual entry.
-    Default is 0 for that reason; the parameter is still exposed in case a
-    given org's D365 configuration genuinely lags GL postings by design.
-
-    Known simplification: one global lag is applied to every provider alike.
-    Real provider settlement timing varies (V30/V31 found AMEX bundles
-    multiple days into one wire and doesn't follow a fixed lag at all) --
-    if AMEX/TABBY/TAMARA buckets still show as exceptions, that may need
-    the same provider-specific handling already built for bank settlement
-    (see V30/V31), not a bigger lag.
+    After bucketing:
+      - Cross-store swap detection flags mirror-pair buckets.
+      - Every exception gets a rule-based "Likely Cause".
+      - Exceptions are sorted by ABS(Difference) descending (variance
+        ranking) so the largest financial risk surfaces first.
     """
     pos = pos.copy().reset_index(drop=True)
     gl = gl.copy().reset_index(drop=True)
     pos["pos_date_n"] = pd.to_datetime(pos["pos_date"], errors="coerce").dt.normalize()
     gl["gl_date_n"] = pd.to_datetime(gl["gl_date"], errors="coerce").dt.normalize()
     pos["pos_amount"] = pd.to_numeric(pos["pos_amount"], errors="coerce")
+    gl["gl_signed_amount"] = pd.to_numeric(gl["gl_signed_amount"], errors="coerce")
     gl["gl_amount"] = pd.to_numeric(gl["gl_amount"], errors="coerce")
 
-    def _expected_accounts(row):
-        """Return the D365 clearing account(s) expected for this POS tender.
-        Store+Date+Amount are the only common reconciliation evidence.
-        Provider is used only internally to select the correct GL clearing
-        account and is never presented as a required GL matching key.
-        """
-        try:
-            accounts = core._gl_expected_account_for_tender(
-                row.get("provider", ""), row.get("store_code", "")
-            )
-            if isinstance(accounts, str):
-                accounts = [accounts]
-            return frozenset(norm(x) for x in (accounts or []) if norm(x))
-        except Exception:
-            return frozenset()
+    pos = _flag_pos_duplicates(pos)
+    gl = _flag_gl_duplicates(gl)
 
-    pos["expected_accounts"] = pos.apply(_expected_accounts, axis=1)
-    pos["group_key"] = pos["expected_accounts"].apply(lambda s: "+".join(sorted(s)) if s else "")
-
-    can_bucket = (pos["store_code"] != "") & pos["pos_date_n"].notna() & (pos["group_key"] != "")
+    can_bucket = (pos["store_code"] != "") & pos["pos_date_n"].notna()
     has_amount = pos["pos_amount"].notna()
-    pos_valid = pos[can_bucket & has_amount].copy()
+    pos_all = pos[can_bucket & has_amount].copy()
     pos_bad = pos[~(can_bucket & has_amount)].copy()
+    pos_all["bucket_gl_date"] = pos_all["pos_date_n"] + pd.to_timedelta(int(settlement_lag_days or 0), unit="D")
 
-    pos_valid["bucket_gl_date"] = pos_valid["pos_date_n"] + pd.to_timedelta(int(settlement_lag_days or 0), unit="D")
+    gl_all = gl[(gl["store_code"] != "") & gl["gl_date_n"].notna()].copy()
 
-    gl_valid = gl[(gl["store_code"] != "") & gl["gl_date_n"].notna()].copy()
+    pos_sum_src = pos_all[~(exclude_duplicate_pos & pos_all["is_duplicate_pos_extra"])] if exclude_duplicate_pos else pos_all
+    gl_sum_src = gl_all[~(exclude_duplicate_gl & gl_all["is_duplicate_gl_extra"])] if exclude_duplicate_gl else gl_all
 
-    pos_bucket = (pos_valid.groupby(["store_code", "group_key", "bucket_gl_date"])
-                  .agg(pos_count=("pos_amount", "size"), pos_total=("pos_amount", "sum"),
-                       pos_date=("pos_date_n", "first"))
+    pos_bucket = (pos_all.groupby(["store_code", "bucket_gl_date"])
+                  .agg(pos_count_all=("pos_amount", "size"), pos_duplicate_rows=("is_duplicate_pos_extra", "sum"))
                   .reset_index())
-    # carry the expected_accounts set back onto each bucket row
-    acct_lookup = (pos_valid.drop_duplicates(["store_code", "group_key"])
-                    .set_index(["store_code", "group_key"])["expected_accounts"])
-    pos_bucket["expected_accounts"] = pos_bucket.apply(
-        lambda r: acct_lookup.get((r["store_code"], r["group_key"]), frozenset()), axis=1
-    )
+    pos_sum = (pos_sum_src.groupby(["store_code", "bucket_gl_date"])
+               .agg(pos_count=("pos_amount", "size"), pos_total=("pos_amount", "sum"), pos_date=("pos_date_n", "first"))
+               .reset_index())
+    pos_bucket = pos_bucket.merge(pos_sum, on=["store_code", "bucket_gl_date"], how="left")
+    pos_bucket["pos_count"] = pos_bucket["pos_count"].fillna(0).astype(int)
+    pos_bucket["pos_total"] = pos_bucket["pos_total"].fillna(0.0)
 
-    claimed_idx = set()
-    gl_counts = []
-    gl_totals = []
-    for _, b in pos_bucket.iterrows():
-        accts = b["expected_accounts"]
-        sub = gl_valid[
-            (gl_valid["store_code"] == b["store_code"]) &
-            (gl_valid["gl_date_n"] == b["bucket_gl_date"]) &
-            (gl_valid["main_account"].isin(accts))
-        ]
-        claimed_idx.update(sub.index.tolist())
-        gl_counts.append(len(sub))
-        gl_totals.append(float(sub["gl_amount"].sum()) if len(sub) else 0.0)
-    pos_bucket["gl_count"] = gl_counts
-    pos_bucket["gl_total"] = gl_totals
-    pos_bucket["bucket_diff"] = pos_bucket["pos_total"] - pos_bucket["gl_total"]
+    gl_bucket = (gl_all.groupby(["store_code", "gl_date_n"])
+                 .agg(gl_count_all=("gl_signed_amount", "size"), gl_duplicate_rows=("is_duplicate_gl_extra", "sum"))
+                 .reset_index().rename(columns={"gl_date_n": "bucket_gl_date"}))
+    gl_sum = (gl_sum_src.groupby(["store_code", "gl_date_n"])
+              .agg(gl_count=("gl_signed_amount", "size"), gl_total=("gl_signed_amount", "sum"))
+              .reset_index().rename(columns={"gl_date_n": "bucket_gl_date"}))
+    gl_bucket = gl_bucket.merge(gl_sum, on=["store_code", "bucket_gl_date"], how="left")
+    gl_bucket["gl_count"] = gl_bucket["gl_count"].fillna(0).astype(int)
+    gl_bucket["gl_total"] = gl_bucket["gl_total"].fillna(0.0)
+
+    merged = pos_bucket.merge(gl_bucket, on=["store_code", "bucket_gl_date"], how="outer", indicator=True)
+    for c in ["pos_count", "pos_total", "pos_duplicate_rows", "gl_count", "gl_total", "gl_duplicate_rows"]:
+        merged[c] = merged[c].fillna(0)
+    merged["bucket_diff"] = merged["pos_total"] - merged["gl_total"]
+    # Do not let a large transaction count turn a SAR 0.50 tolerance into
+    # hundreds/thousands of SAR. That would weaken the finance control.
+    calculated_tolerance = tolerance * merged[["pos_count", "gl_count"]].max(axis=1).clip(lower=1)
+    merged["bucket_tolerance"] = calculated_tolerance.clip(upper=50.0)
 
     def _status(r):
-        if r["gl_count"] == 0:
+        if r["_merge"] == "left_only" or r["gl_count"] == 0:
             return "GL NOT POSTED"
-        if abs(r["bucket_diff"]) <= tolerance:
+        if r["_merge"] == "right_only" or r["pos_count"] == 0:
+            return "UNMATCHED GL"
+        if abs(r["bucket_diff"]) <= r["bucket_tolerance"]:
             return "GL MATCHED"
         return "GL AMOUNT EXCEPTION"
-    pos_bucket["bucket_status"] = pos_bucket.apply(_status, axis=1)
-    reason_map = {
-        "GL MATCHED": "Sum of POS Amount equals sum of D365 GL Amount for this Store+Provider+Date (settlement-lag adjusted) within tolerance.",
-        "GL AMOUNT EXCEPTION": "Sum of POS Amount does not equal sum of D365 GL Amount for this Store+Provider+Date (settlement-lag adjusted) within tolerance.",
-        "GL NOT POSTED": "POS activity exists for this Store+Provider+Date but no matching D365 GL clearing-account activity was found in the settlement-lag window.",
-    }
-    pos_bucket["bucket_reason"] = pos_bucket["bucket_status"].map(reason_map)
+    merged["bucket_status"] = merged.apply(_status, axis=1)
 
-    bkey = pos_bucket.set_index(["store_code", "group_key", "bucket_gl_date"])
+    swap_map = _detect_store_swaps(merged[merged.bucket_status == "GL AMOUNT EXCEPTION"], tolerance)
+
+    def _reason(r):
+        if r["bucket_status"] == "GL MATCHED":
+            return "Sum of POS Amount equals sum of D365 GL Amount for this Store+Date within tolerance."
+        if r["bucket_status"] == "GL NOT POSTED":
+            return "POS activity exists for this Store+Date but no matching D365 GL clearing-account activity was found."
+        if r["bucket_status"] == "UNMATCHED GL":
+            return "D365 GL clearing-account activity exists for this Store+Date with no corresponding POS statement rows."
+        return _classify_exception(r, swap_map)
+    merged["bucket_reason"] = merged.apply(_reason, axis=1)
+    merged["store_swap_with"] = merged.apply(lambda r: swap_map.get((r["store_code"], r["bucket_gl_date"]), ""), axis=1)
+
+    bkey = merged.set_index(["store_code", "bucket_gl_date"])
 
     rows = []
-    for _, p in pos_valid.iterrows():
-        key = (p["store_code"], p["group_key"], p["pos_date_n"] + pd.to_timedelta(int(settlement_lag_days or 0), unit="D"))
+    for _, p in pos_all.iterrows():
+        key = (p["store_code"], p["bucket_gl_date"])
         b = bkey.loc[key]
         rows.append({
             "POS Row": p["source_row"], "Merchant ID": p["merchant_id"], "Store Code": p["store_code"],
             "Provider": p["provider"], "POS Reference": p["reference"], "POS Date": p["pos_date"], "POS Amount": p["pos_amount"],
-            "GL Row": "", "GL Main Account": p["group_key"], "GL Voucher": "", "GL Journal": "",
-            "GL Date": key[2], "GL Amount": b["gl_total"], "Difference": float(b["bucket_diff"]),
-            "Status": b["bucket_status"], "Match Rule": "Store + Provider Clearing Account + Date (Bucket Sum)",
+            "GL Row": "", "GL Main Account": "", "GL Voucher": "", "GL Journal": "",
+            "GL Date": key[1], "GL Amount": b["gl_total"], "Difference": float(b["bucket_diff"]),
+            "Status": b["bucket_status"], "Match Rule": "Store + Date (Bucket Sum)",
             "Reason": b["bucket_reason"], "GL Source File": "",
             "Bucket POS Rows": int(b["pos_count"]), "Bucket GL Rows": int(b["gl_count"]),
+            "Bucket Tolerance": float(b["bucket_tolerance"]),
+            "Is Duplicate POS Row": bool(p["is_duplicate_pos"]),
+            "Store Swap Suspected With": b["store_swap_with"],
         })
     for _, p in pos_bad.iterrows():
-        if pd.isna(p["pos_amount"]):
-            reason, status = "POS Amount missing/non-numeric.", "POS DATA INCOMPLETE"
-        elif p["group_key"] == "":
-            reason, status = "Payment/provider type does not map to a known D365 clearing account.", "IDENTIFIER MISMATCH"
-        else:
-            reason, status = "Store Code or Date missing; cannot allocate to a Store+Date GL bucket.", "IDENTIFIER MISMATCH"
+        reason = "POS Amount missing/non-numeric." if pd.isna(p["pos_amount"]) else "Store Code or Date missing; cannot allocate to a Store+Date GL bucket."
+        status = "POS DATA INCOMPLETE" if pd.isna(p["pos_amount"]) else "IDENTIFIER MISMATCH"
         rows.append({
             "POS Row": p["source_row"], "Merchant ID": p["merchant_id"], "Store Code": p["store_code"],
             "Provider": p["provider"], "POS Reference": p["reference"], "POS Date": p["pos_date"], "POS Amount": p["pos_amount"],
             "GL Row": "", "GL Main Account": "", "GL Voucher": "", "GL Journal": "",
             "GL Date": pd.NaT, "GL Amount": float("nan"), "Difference": float("nan"),
             "Status": status, "Match Rule": "", "Reason": reason, "GL Source File": "",
-            "Bucket POS Rows": 0, "Bucket GL Rows": 0,
+            "Bucket POS Rows": 0, "Bucket GL Rows": 0, "Bucket Tolerance": float("nan"),
+            "Is Duplicate POS Row": bool(p.get("is_duplicate_pos", False)), "Store Swap Suspected With": "",
         })
 
     d = pd.DataFrame(rows)
     matched = d[d.Status == "GL MATCHED"].copy()
     exc = d[d.Status != "GL MATCHED"].copy()
+    exc["_abs_diff"] = exc["Difference"].abs()
+    exc = exc.sort_values("_abs_diff", ascending=False, na_position="last").drop(columns=["_abs_diff"])
 
-    unmatched_gl = gl_valid.loc[~gl_valid.index.isin(claimed_idx)].copy()
+    unmatched_gl_keys = set(merged[merged.bucket_status == "UNMATCHED GL"][["store_code", "bucket_gl_date"]].apply(tuple, axis=1))
+    if unmatched_gl_keys:
+        gl_all["_key"] = list(zip(gl_all["store_code"], gl_all["gl_date_n"]))
+        unmatched_gl = gl_all[gl_all["_key"].isin(unmatched_gl_keys)].drop(columns=["_key"]).copy()
+    else:
+        unmatched_gl = gl_all.iloc[0:0].copy()
+
+    bucket_summary = merged.rename(columns={
+        "store_code": "Store Code", "bucket_gl_date": "Date",
+        "pos_count": "POS Rows", "pos_total": "POS Total",
+        "gl_count": "GL Rows", "gl_total": "GL Total",
+        "bucket_diff": "Difference", "bucket_tolerance": "Bucket Tolerance",
+        "bucket_status": "Status", "bucket_reason": "Reason",
+        "pos_duplicate_rows": "Duplicate POS Rows Excluded", "gl_duplicate_rows": "Duplicate GL Rows Excluded",
+        "store_swap_with": "Store Swap Suspected With",
+    })[["Store Code", "Date", "POS Rows", "POS Total", "GL Rows", "GL Total", "Difference",
+        "Bucket Tolerance", "Duplicate POS Rows Excluded", "Duplicate GL Rows Excluded",
+        "Store Swap Suspected With", "Status", "Reason"]].copy()
+    bucket_summary["_abs_diff"] = bucket_summary["Difference"].abs()
+    bucket_summary = bucket_summary.sort_values(["Status", "_abs_diff"], ascending=[True, False]).drop(columns=["_abs_diff"])
+
+    top_exceptions = (bucket_summary[bucket_summary["Status"] == "GL AMOUNT EXCEPTION"]
+                       .assign(_ad=lambda x: x["Difference"].abs())
+                       .sort_values("_ad", ascending=False).drop(columns=["_ad"]).head(20))
+
+    total_pos_dup = int(pos_all["is_duplicate_pos_extra"].sum())
+    total_gl_dup = int(gl_all["is_duplicate_gl_extra"].sum())
+
+    # Finance KPI: a "match" is one reconciled Store+Date accounting bucket,
+    # NOT the number of POS transaction rows repeated inside that bucket.
+    matched_buckets = int((merged["bucket_status"] == "GL MATCHED").sum())
+    exception_buckets = int((merged["bucket_status"] == "GL AMOUNT EXCEPTION").sum())
+    not_posted_buckets = int((merged["bucket_status"] == "GL NOT POSTED").sum())
+    unmatched_gl_buckets = int((merged["bucket_status"] == "UNMATCHED GL").sum())
 
     summary = pd.DataFrame([{
         "POS Rows": len(pos), "GL Rows": len(gl),
-        "GL Matched": len(matched),
-        "GL Amount Exceptions": int((d.Status == "GL AMOUNT EXCEPTION").sum()),
-        "GL Not Posted": int((d.Status == "GL NOT POSTED").sum()),
-        "Review Required": 0,
+        "Store-Date Buckets": len(merged),
+        "GL Matched": matched_buckets,
+        "GL Matched Buckets": matched_buckets,
+        "GL Amount Exceptions": exception_buckets,
+        "GL Amount Exception Buckets": exception_buckets,
+        "GL Not Posted": not_posted_buckets,
+        "Unmatched GL Buckets": unmatched_gl_buckets,
+        "POS Transaction Rows Matched": int((d.Status == "GL MATCHED").sum()),
         "Identifier Mismatch": int((d.Status == "IDENTIFIER MISMATCH").sum()),
         "POS Data Incomplete": int((d.Status == "POS DATA INCOMPLETE").sum()),
+        "Duplicate POS Rows Excluded": total_pos_dup,
+        "Duplicate GL Rows Excluded": total_gl_dup,
         "Unmatched GL Rows": len(unmatched_gl),
+        "POS Total (SAR)": float(pos_sum_src["pos_amount"].sum()) if not pos_sum_src.empty else 0.0,
+        "GL Total (SAR)": float(gl_sum_src["gl_signed_amount"].sum()) if not gl_sum_src.empty else 0.0,
         "Tolerance SAR": tolerance,
         "Settlement Lag Days": settlement_lag_days,
         "Overall Status": "RECONCILED" if exc.empty else "EXCEPTIONS REQUIRE REVIEW",
-        "Match Granularity": "Store + Date bucket; expected D365 clearing account is used only to prevent cross-provider GL contamination. Amount is reconciled by bucket sum.",
+        "Match Granularity": "Store + Date bucket (sum of amounts); amount decides match/exception, not the key",
     }])
-    bucket_report = pos_bucket.rename(columns={
-        "store_code": "Store Code",
-        "pos_date": "POS Date",
-        "group_key": "Expected GL Clearing Account",
-        "pos_count": "POS Rows",
-        "pos_total": "POS Total",
-        "gl_count": "GL Rows",
-        "gl_total": "GL Total",
-        "bucket_diff": "Difference",
-        "bucket_status": "Status",
-        "bucket_reason": "Reason",
-    })[
-        ["Store Code", "POS Date", "Expected GL Clearing Account",
-         "POS Rows", "POS Total", "GL Rows", "GL Total",
-         "Difference", "Status", "Reason"]
-    ].sort_values(["Store Code", "POS Date"]).reset_index(drop=True)
+    summary["Net Difference (SAR)"] = summary["POS Total (SAR)"] - summary["GL Total (SAR)"]
 
-    return {
-        "detail": d,
-        "matched": matched,
-        "exceptions": exc,
-        "unmatched_gl": unmatched_gl,
-        "summary": summary,
-        "buckets": bucket_report,
-    }
+    matched_bucket_summary = bucket_summary[bucket_summary["Status"] == "GL MATCHED"].copy()
+
+    return {"detail": d, "matched": matched, "exceptions": exc, "unmatched_gl": unmatched_gl,
+            "bucket_summary": bucket_summary, "matched_bucket_summary": matched_bucket_summary,
+            "top_exceptions": top_exceptions, "summary": summary}
