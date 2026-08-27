@@ -1,6 +1,6 @@
 
 from pathlib import Path
-p=Path(__file__).resolve().parents[1]/"pages/35_POS_GL_Reconciliation.py"
+p=Path(__file__).resolve().parent/"pages/35_POS_GL_Reconciliation.py"
 t=p.read_text(encoding="utf-8")
 assert t.count("accept_multiple_files=True") >= 2
 assert "UPLOAD MULTIPLE POS EXCEL FILES" in t
