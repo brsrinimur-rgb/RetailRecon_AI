@@ -10,16 +10,35 @@ st.title("🧾 POS Statement → D365 GL Reconciliation")
 st.caption("Accounting authority: POS Statement Amount ↔ D365 GL Amount. Store Tender is not part of this module.")
 st.info("Merchant ID is a key identity control. Amount is never used to select a GL row. Amount is compared only after deterministic GL evidence is identified.")
 a,b,c=st.columns([1,1,.5])
-with a: pf=st.file_uploader("POS Statement",type=["xlsx","xls","csv"],key="v47pos")
-with b: gf=st.file_uploader("D365 GL Ledger / GL Verification",type=["xlsx","xls","csv"],key="v47gl")
+with a: pf=st.file_uploader("POS Statement — select one or multiple files",type=["xlsx","xls","csv"],accept_multiple_files=True,key="v49pos")
+with b: gf=st.file_uploader("D365 GL Ledger / GL Verification — select one or multiple files",type=["xlsx","xls","csv"],accept_multiple_files=True,key="v49gl")
 with c: tol=st.number_input("Tolerance (SAR)",0.0,10.0,.50,.01)
-def read(f):
-    if f.name.lower().endswith(".csv"): return pd.read_csv(f)
+def read_one(f):
+    if f.name.lower().endswith(".csv"):
+        return pd.read_csv(f)
     return pd.concat([pd.read_excel(f,sheet_name=s) for s in pd.ExcelFile(f).sheet_names],ignore_index=True)
+
+def read_many(files):
+    frames=[]
+    for f in files:
+        df=read_one(f)
+        if not df.empty:
+            df["__uploaded_file__"]=f.name
+            frames.append(df)
+    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+
 if st.button("RUN POS → GL RECONCILIATION",type="primary",use_container_width=True):
-    if not pf or not gf: st.error("Upload both POS Statement and D365 GL Ledger."); st.stop()
-    st.session_state["v47"]=reconcile_pos_to_gl(normalize_pos(read(pf),pf.name),normalize_gl(read(gf),gf.name),tol)
-r=st.session_state.get("v47")
+    if not pf or not gf:
+        st.error("Upload at least one POS Statement file and at least one D365 GL Ledger file.")
+        st.stop()
+    raw_pos=read_many(pf)
+    raw_gl=read_many(gf)
+    st.session_state["v49"]=reconcile_pos_to_gl(
+        normalize_pos(raw_pos,"MULTIPLE POS FILES"),
+        normalize_gl(raw_gl,"MULTIPLE GL FILES"),
+        tol
+    )
+r=st.session_state.get("v49")
 if r:
     s=r["summary"].iloc[0]; a,b,c,d=st.columns(4)
     a.metric("Overall",s["Overall Status"]); b.metric("POS Rows",int(s["POS Rows"])); c.metric("GL Matched",int(s["GL Matched"])); d.metric("Exceptions",len(r["exceptions"]))
