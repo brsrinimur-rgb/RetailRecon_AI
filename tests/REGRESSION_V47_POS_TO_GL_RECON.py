@@ -12,3 +12,7 @@ g["gl_amount"]=99.0; r=reconcile_pos_to_gl(p,g,.50); assert r["detail"].iloc[0].
 g["gl_amount"]=float("nan"); r=reconcile_pos_to_gl(p,g,.50); assert r["detail"].iloc[0].Status=="GL NOT POSTED"; print("[PASS] missing GL")
 g=pd.concat([g.assign(gl_amount=100.0),g.assign(gl_amount=100.0)],ignore_index=True); r=reconcile_pos_to_gl(p,g,.50); assert r["detail"].iloc[0].Status=="GL REVIEW REQUIRED"; print("[PASS] multiple candidates")
 print("REGRESSION V47 POS TO GL RECON PASS")
+
+assert "Merchant ID" in r["detail"].columns
+assert r["detail"].iloc[0]["Merchant ID"]=="M123"
+print("[PASS] Merchant ID retained in final report")
