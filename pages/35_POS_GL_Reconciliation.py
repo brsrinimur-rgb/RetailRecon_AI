@@ -22,18 +22,30 @@ st.info(
 c1, c2, c3 = st.columns([1, 1, 0.5])
 with c1:
     pos_files = st.file_uploader(
-        "POS Statement — select one or multiple files",
-        type=["xlsx", "xls", "csv"], accept_multiple_files=True, key="v50_pos"
+        "POS Statement — MULTIPLE FILES",
+        type=["xlsx", "xls", "csv"], accept_multiple_files=True, key="v51_pos",
+        help="Use Ctrl/Shift to select several files together, or click + to add files one by one."
     )
 with c2:
     gl_files = st.file_uploader(
-        "D365 GL Ledger / GL Verification — select one or multiple files",
-        type=["xlsx", "xls", "csv"], accept_multiple_files=True, key="v50_gl"
+        "D365 GL LEDGER — MULTIPLE FILES",
+        type=["xlsx", "xls", "csv"], accept_multiple_files=True, key="v51_gl",
+        help="Use Ctrl/Shift to select several files together, or click + to add files one by one."
     )
 with c3:
     tolerance = st.number_input("Tolerance (SAR)", 0.0, 10.0, 0.50, 0.01)
 
-st.caption("Multiple POS and GL files are supported. Source filenames are retained in the reconciliation evidence.")
+st.caption("MULTI-FILE MODE: Add multiple POS files and multiple D365 GL files. Use Ctrl/Shift in the picker, or click + to add files one by one.")
+if pos_files:
+    st.success(f"POS files selected: {len(pos_files)}")
+    st.write("POS: " + " | ".join(f.name for f in pos_files))
+else:
+    st.info("POS: No files selected yet.")
+if gl_files:
+    st.success(f"D365 GL files selected: {len(gl_files)}")
+    st.write("D365 GL: " + " | ".join(f.name for f in gl_files))
+else:
+    st.info("D365 GL: No files selected yet.")
 
 def read_one(f):
     if f.name.lower().endswith(".csv"):
