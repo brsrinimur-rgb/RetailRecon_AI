@@ -13,17 +13,13 @@ def col(df,names):
     return None
 
 def normalize_pos(df,source_file=""):
-    names={"merchant_id":["Merchant ID","MerchantID"],"store_code":["Store Code","Store","Store ID","POS Store","Terminal Store"],
-    "provider":["Provider","Payment Provider","Payment Type","POS Payment","POS Description"],"reference":["Transaction ID","Unique Transaction ID","Reference","Receipt ID","Order ID","Trans Seq Number","Transaction Sequence Number"],
-    "auth_code":["Auth Code","Authorization Code","Approval Code","Trans Approval Cd"],"pos_date":["POS Date","Date","Transaction Date","Business Date","Posting Date"],
-    "pos_amount":["POS Amount","Amount","Transaction Amount","Gross Amount","Transaction Reversal Amount"]}
+    names={"merchant_id":["Merchant ID","MerchantID"],"store_code":["Store Code","Store","Store ID","POS Store"],
+    "provider":["Provider","Payment Provider","Payment Type","POS Payment"],"reference":["Transaction ID","Unique Transaction ID","Reference","Receipt ID","Order ID"],
+    "auth_code":["Auth Code","Authorization Code","Approval Code"],"pos_date":["POS Date","Date","Transaction Date","Business Date"],
+    "pos_amount":["POS Amount","Amount","Transaction Amount","Gross Amount"]}
     o=pd.DataFrame(index=df.index)
     for k,v in names.items():
         c=col(df,v); o[k]=df[c] if c else ""
-    term_col=col(df,["Terminal ID","TerminalID","POS Terminal","Terminal"])
-    rid_col=col(df,["Retailer Id","Retailer ID","RetailerID"])
-    o["terminal_id"]=df[term_col] if term_col else ""
-    o["retailer_id"]=df[rid_col] if rid_col else ""
     o["source_file"]=source_file; o["source_row"]=range(2,len(o)+2)
     o["pos_amount"]=pd.to_numeric(o["pos_amount"],errors="coerce"); o["pos_date"]=pd.to_datetime(o["pos_date"],errors="coerce")
     for c in ["merchant_id","store_code","provider","reference","auth_code"]: o[c]=o[c].map(norm)
@@ -38,10 +34,6 @@ def normalize_gl(df,source_file=""):
     o=pd.DataFrame(index=df.index)
     for k,v in names.items():
         c=col(df,v); o[k]=df[c] if c else ""
-    term_col=col(df,["Terminal ID","TerminalID","POS Terminal","Terminal"])
-    rid_col=col(df,["Retailer Id","Retailer ID","RetailerID"])
-    o["terminal_id"]=df[term_col] if term_col else ""
-    o["retailer_id"]=df[rid_col] if rid_col else ""
     o["source_file"]=source_file; o["source_row"]=range(2,len(o)+2)
     o["gl_amount"]=pd.to_numeric(o["gl_amount"],errors="coerce"); o["gl_date"]=pd.to_datetime(o["gl_date"],errors="coerce")
     for c in ["merchant_id","store_code","provider","reference","auth_code","main_account","voucher","journal"]: o[c]=o[c].map(norm)
