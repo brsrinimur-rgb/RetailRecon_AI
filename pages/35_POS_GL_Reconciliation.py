@@ -602,7 +602,28 @@ if r:
         # above), so this call -- which does re-execute on every rerun,
         # since it has to for the cached result to stay visible -- is now
         # idempotent instead of logging a fresh sighting every rerun.
-        swap_history = swap_tracking.record_and_annotate_swaps(r["bucket_summary"], run_id=st.session_state.get("v53_run_id"))
+        # V42.1 compatibility fix:
+        # Some deployed repos still have the pre-V40 swap_tracking.py whose
+        # record_and_annotate_swaps() does not accept run_id=. Calling it
+        # with the keyword raises TypeError and breaks the whole page after
+        # reconciliation has already completed.
+        #
+        # Cache one result per actual reconciliation run so even the legacy
+        # function is not called again on ordinary Streamlit reruns (which
+        # would otherwise inflate Times Seen).
+        _swap_run_id = st.session_state.get("v53_run_id") or str(s.get("Run ID") or "")
+        _swap_cache_key = f"v53_swap_history::{_swap_run_id}"
+        if _swap_cache_key in st.session_state:
+            swap_history = st.session_state[_swap_cache_key]
+        else:
+            try:
+                swap_history = swap_tracking.record_and_annotate_swaps(
+                    r["bucket_summary"], run_id=_swap_run_id
+                )
+            except TypeError:
+                # Backward compatibility with older swap_tracking.py.
+                swap_history = swap_tracking.record_and_annotate_swaps(r["bucket_summary"])
+            st.session_state[_swap_cache_key] = swap_history
         if not swap_history.empty:
             recurring = swap_history[swap_history["Status"].astype(str).str.startswith("RECURRING")]
             if not recurring.empty:
