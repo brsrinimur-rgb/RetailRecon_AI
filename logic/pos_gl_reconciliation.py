@@ -2059,10 +2059,20 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
     _keys = sorted(set(_pos_by_gl) | set(_gl_by_key))
     _gl_summary_rows = []
     for _key in _keys:
+        # V42.5: flag unmapped rows prominently instead of letting them
+        # blend in as if they were just another GL account with a
+        # variance. This is a categorically different problem (missing
+        # configuration, not an accounting difference) and deserves to
+        # stand out. The underlying GL Account key ("UNMAPPED"/"UNMAPPED
+        # GL") is left unchanged so anything matching on it programmatically
+        # still works; only the displayed GL Name changes, plus a new
+        # explicit "Mapping Required" boolean column so the Excel writer
+        # can highlight these rows without fragile text matching.
+        _mapping_required = _key in ("UNMAPPED", "UNMAPPED GL")
         if _key == "UNMAPPED":
-            _name = "Unmapped POS Provider"
+            _name = "\u26a0 MAPPING REQUIRED \u2014 Unmapped POS Provider"
         elif _key == "UNMAPPED GL":
-            _name = "Unmapped GL Account"
+            _name = "\u26a0 MAPPING REQUIRED \u2014 Unmapped GL Account"
         else:
             _parts = [x.strip() for x in _key.split("+")]
             _names = []
@@ -2078,8 +2088,12 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
             "GL Total": _gl_amt,
             "POS Total": _pos_amt,
             "Difference": _pos_amt - _gl_amt,
+            "Mapping Required": _mapping_required,
         })
-    gl_summary = pd.DataFrame(_gl_summary_rows, columns=["GL Account", "GL Name", "GL Total", "POS Total", "Difference"])
+    gl_summary = pd.DataFrame(
+        _gl_summary_rows,
+        columns=["GL Account", "GL Name", "GL Total", "POS Total", "Difference", "Mapping Required"],
+    )
     if not gl_summary.empty:
         # Same tolerance rule as store_summary's Status, so both compact
         # tables give Finance the same quick verdict. Uses the same
