@@ -1,10 +1,11 @@
 from __future__ import annotations
+
 import io
-import numpy as np
 import pandas as pd
 import streamlit as st
 
 import auth, theme, db
+from logic.commission_control import validate_commission_transactions
 
 st.set_page_config(page_title="Commission Validation",layout="wide",page_icon="💳")
 auth.require_login({"Admin","Finance Manager","Finance Checker"})
@@ -87,90 +88,22 @@ if m.empty:
     st.info("No matched transactions are available for commission validation.")
     st.stop()
 
+# V46B shared calculation engine: this is the same calculation used by report_export.py.
 master=db.load_commission_rate_master().copy()
-master["Payment Type"]=master["Payment Type"].astype(str).str.strip().str.upper()
-master["Active"]=master["Active"].astype(str).str.strip().str.upper()
-master=master[master["Active"].isin(["YES","Y","TRUE","1"])].copy()
-
-# Normalize tender naming.
-def norm_payment(v):
-    p=str(v or "").strip().upper()
-    aliases={
-        "MASTER":"MASTERCARD",
-        "MC":"MASTERCARD",
-        "VC":"VISA",
-        "P":"MADA",
-        "P1":"MADA",
-        "AX":"AMEX",
-        "GCCNET":"GCC NET",
-        "GCC_NET":"GCC NET",
-        "GCC-NET":"GCC NET",
-    }
-    return aliases.get(p,p)
-
-m["Payment Type"]=m["Payment Type"].apply(norm_payment)
-
-rate_map=master.set_index("Payment Type")["Commission Rate %"].to_dict()
-vat_map=master.set_index("Payment Type")["VAT Rate %"].to_dict()
-method_map=master.set_index("Payment Type")["Validation Method"].to_dict()
-
-m["Contract Rate %"]=m["Payment Type"].map(rate_map)
-m["VAT Rate %"]=m["Payment Type"].map(vat_map).fillna(15.0)
-m["Validation Method"]=m["Payment Type"].map(method_map).fillna("RATE_NOT_CONFIGURED")
-
-m["Actual Commission"]=pd.to_numeric(m["Commission"],errors="coerce").fillna(0.0).round(2)
-m["Actual VAT"]=pd.to_numeric(m["VAT"],errors="coerce").fillna(0.0).round(2)
-
-def expected_commission(row):
-    method=str(row["Validation Method"]).upper()
-    rate=row["Contract Rate %"]
-
-    if method=="CONTRACT_RATE" and pd.notna(rate):
-        return round(abs(float(row["POS Amount"])) * float(rate) / 100.0, 2)
-
-    # Provider actual mode: contract not yet configured.
-    if method=="PROVIDER_ACTUAL":
-        return np.nan
-
-    return np.nan
-
-m["Expected Commission"]=m.apply(expected_commission,axis=1)
-m["Expected VAT"]=(m["Expected Commission"] * m["VAT Rate %"] / 100.0).round(2)
-
-m["Commission Variance"]=(m["Actual Commission"]-m["Expected Commission"]).round(2)
-m["VAT Variance"]=(m["Actual VAT"]-m["Expected VAT"]).round(2)
-
-def commission_status(row):
-    method=str(row["Validation Method"]).upper()
-
-    if method=="PROVIDER_ACTUAL":
-        return "CONTRACT RATE PENDING"
-
-    if pd.isna(row["Expected Commission"]):
-        return "RATE NOT CONFIGURED"
-
-    variance=float(row["Commission Variance"])
-    if abs(variance)<=0.05:
-        return "OK"
-    if variance>0:
-        return "OVERCHARGED"
-    return "UNDERCHARGED"
-
-m["Commission Status"]=m.apply(commission_status,axis=1)
-
-# Expected net is only calculated where a contract rate exists.
-m["Expected Net Amount"]=(
-    pd.to_numeric(m["POS Amount"],errors="coerce").abs()
-    - m["Expected Commission"].fillna(0)
-    - m["Expected VAT"].fillna(0)
-).round(2)
-m.loc[m["Expected Commission"].isna(),"Expected Net Amount"]=np.nan
+m=validate_commission_transactions(
+    m,
+    master,
+    payment_col="Payment Type",
+    amount_col="POS Amount",
+    commission_col="Commission",
+    vat_col="VAT",
+)
 
 # --------------------------------------------------------------- KPI
-ok=(m["Commission Status"]=="OK").sum()
-over=(m["Commission Status"]=="OVERCHARGED").sum()
-under=(m["Commission Status"]=="UNDERCHARGED").sum()
-pending=m["Commission Status"].isin(["CONTRACT RATE PENDING","RATE NOT CONFIGURED"]).sum()
+ok=(m["Control Status"]=="OK").sum()
+over=(m["Control Status"]=="OVERCHARGED").sum()
+under=(m["Control Status"]=="UNDERCHARGED").sum()
+pending=m["Control Status"].isin(["CONTRACT RATE PENDING","RATE NOT CONFIGURED"]).sum()
 
 k1,k2,k3,k4=st.columns(4)
 k1.metric("Commission OK",int(ok))
@@ -184,14 +117,14 @@ cols=[
     "Contract Rate %","Validation Method",
     "Actual Commission","Expected Commission","Commission Variance",
     "VAT Rate %","Actual VAT","Expected VAT","VAT Variance",
-    "Net Amount","Expected Net Amount","Commission Status","Source File"
+    "Net Amount","Expected Net Amount","Control Status","Source File"
 ]
 cols=[c for c in cols if c in m.columns]
 
 st.markdown("### Transaction-Level Commission Validation")
 st.dataframe(m[cols],use_container_width=True,hide_index=True)
 
-exceptions=m[m["Commission Status"]!="OK"].copy()
+exceptions=m[m["Control Status"]!="OK"].copy()
 st.markdown("### Commission Exceptions")
 if exceptions.empty:
     st.success("No commission exceptions found for configured contract rates.")
