@@ -77,8 +77,11 @@ def _write_summary_sheet(r):
     with pd.ExcelWriter(b, engine="openpyxl") as w:
         _store_summary = r.get("store_summary", pd.DataFrame())
         _gl_summary = r.get("gl_summary", pd.DataFrame())
+        # V42.5: "Mapping Required" is a raw flag, not a displayed column --
+        # dropped before writing, same as the real page.
+        _gl_summary_display = _gl_summary.drop(columns=["Mapping Required"], errors="ignore")
         _store_summary.to_excel(w, index=False, sheet_name="Summary", startrow=2, startcol=0)
-        _gl_summary.to_excel(w, index=False, sheet_name="Summary", startrow=2, startcol=6)
+        _gl_summary_display.to_excel(w, index=False, sheet_name="Summary", startrow=2, startcol=6)
         _ws = w.sheets["Summary"]
         _ws["A1"] = "STORE-WISE SUMMARY"
         _ws["G1"] = "GL-WISE SUMMARY"
