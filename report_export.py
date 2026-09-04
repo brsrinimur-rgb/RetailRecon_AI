@@ -270,7 +270,7 @@ def settlement_commission(tx, commission_rate_master=None):
     if tx.empty:
         return pd.DataFrame(columns=visible_cols + [flag_col])
 
-    g = tx[tx["POS Total"] != 0].copy()
+    g = tx[(tx["POS Total"] != 0) & (tx["POS Tender"].astype(str).str.upper() != "CASH")].copy()
     if g.empty:
         return pd.DataFrame(columns=visible_cols + [flag_col])
 
@@ -306,11 +306,10 @@ def settlement_commission(tx, commission_rate_master=None):
             return "RATE NOT CONFIGURED"
 
         priority = [
-            "OVERCHARGED",
-            "UNDERCHARGED",
-            "VAT VARIANCE",
             "SOURCE COMMISSION MISSING",
             "SOURCE VAT MISSING",
+            "COMMISSION VARIANCE — REVIEW",
+            "VAT VARIANCE",
             "RATE NOT CONFIGURED",
             "CONTRACT RATE PENDING",
             "OK",
