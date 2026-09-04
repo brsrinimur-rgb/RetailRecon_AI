@@ -101,14 +101,14 @@ m=validate_commission_transactions(
 
 # --------------------------------------------------------------- KPI
 ok=(m["Control Status"]=="OK").sum()
-over=(m["Control Status"]=="OVERCHARGED").sum()
-under=(m["Control Status"]=="UNDERCHARGED").sum()
+review=(m["Control Status"]=="COMMISSION VARIANCE — REVIEW").sum()
+vat_review=(m["Control Status"]=="VAT VARIANCE").sum()
 pending=m["Control Status"].isin(["CONTRACT RATE PENDING","RATE NOT CONFIGURED"]).sum()
 
 k1,k2,k3,k4=st.columns(4)
 k1.metric("Commission OK",int(ok))
-k2.metric("Overcharged",int(over))
-k3.metric("Undercharged",int(under))
+k2.metric("Commission Variance — Review",int(review))
+k3.metric("VAT Variance",int(vat_review))
 k4.metric("Rate Pending / Missing",int(pending))
 
 # --------------------------------------------------------------- display
