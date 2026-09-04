@@ -3,194 +3,438 @@
 #   python REGRESSION_REPORT_V46A_MERCHANT_MAPPING_REQUIRED.py
 
 from __future__ import annotations
+
 import io
+from datetime import datetime
+
+import numpy as np
 import pandas as pd
-import openpyxl
-import report_export as rexp
-
-LABEL = "⚠ MERCHANT MAPPING REQUIRED"
-FLAG = "Merchant Mapping Required"
-ORANGE = "00FCE4D6"
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.utils import get_column_letter
 
 
-def _blank_tx_row(payment: str, amount: float, auth: str, commission: float = 0.0):
-    r = {c: "" for c in rexp.TX_COLUMNS}
-    for p in rexp.PAYMENTS:
-        r[f"D365 {p}"] = 0.0
-        r[f"POS {p}"] = 0.0
-        r[f"Diff {p}"] = 0.0
-    r.update({
-        "Store Code": "",
-        "Date": pd.NaT,
-        "Receipt ID": "",
-        "Auth Code": auth,
-        "D365 Source Type": "",
-        "Cash Amount": 0.0,
+PAYMENTS = ["MADA", "VISA", "MASTER", "AMEX", "TABBY", "TAMARA", "TAP", "FLOOSS", "PAYLATER", "DEEMA"]
+
+TX_COLUMNS = [
+    "Store Code", "Date", "Receipt ID", "Auth Code", "D365 Source Type",
+    "Reservation Type", "Reservation Flow", "Sales Order", "Customer Account",
+    "Customer Name", "Description", "Reservation Cash", "Order Balance",
+    "Reservation Report Total", "Reservation Auth Resolution",
+    "D365 MADA", "POS MADA", "Diff MADA",
+    "D365 VISA", "POS VISA", "Diff VISA",
+    "D365 MASTER", "POS MASTER", "Diff MASTER",
+    "D365 AMEX", "POS AMEX", "Diff AMEX",
+    "D365 TABBY", "POS TABBY", "Diff TABBY",
+    "D365 TAMARA", "POS TAMARA", "Diff TAMARA",
+    "D365 TAP", "POS TAP", "Diff TAP",
+    "D365 FLOOSS", "POS FLOOSS", "Diff FLOOSS",
+    "D365 PAYLATER", "POS PAYLATER", "Diff PAYLATER",
+    "D365 DEEMA", "POS DEEMA", "Diff DEEMA",
+    "D365 Total", "POS Total", "Total Difference",
+    "D365 Tender", "POS Tender", "POS Date", "Posting Date", "Terminal ID",
+    "Commission", "VAT", "Net Amount", "Source", "Status", "Remarks"
+]
+
+
+def _master_name(payment):
+    p = str(payment or "").strip().upper()
+    if p in {"MASTERCARD", "MASTER CARD", "MC"}:
+        return "MASTER"
+    return p
+
+
+def _zero_tx():
+    d = {c: "" for c in TX_COLUMNS}
+    for p in PAYMENTS:
+        d[f"D365 {p}"] = 0.0
+        d[f"POS {p}"] = 0.0
+        d[f"Diff {p}"] = 0.0
+    d.update({
         "Reservation Cash": 0.0,
         "Order Balance": 0.0,
         "Reservation Report Total": 0.0,
         "D365 Total": 0.0,
-        "POS Total": amount,
-        "Total Difference": -amount,
-        "D365 Tender": "",
-        "POS Tender": payment,
-        "POS Date": pd.Timestamp("2026-07-22"),
-        "Posting Date": pd.Timestamp("2026-07-23"),
-        "Terminal ID": "T-UNMAPPED",
-        "Commission": commission,
-        "VAT": 0.0,
-        "Net Amount": amount - commission,
-        "Source": "synthetic_pos.xlsx",
-        "Status": "Merchant Mapping Required",
-        "Remarks": "Synthetic unresolved merchant/store mapping row.",
-    })
-    if payment in rexp.PAYMENTS:
-        r[f"POS {payment}"] = amount
-        r[f"Diff {payment}"] = -amount
-    return r
-
-
-def _mapped_tx_row(store: str, payment: str, amount: float, auth: str):
-    r = {c: "" for c in rexp.TX_COLUMNS}
-    for p in rexp.PAYMENTS:
-        r[f"D365 {p}"] = 0.0
-        r[f"POS {p}"] = 0.0
-        r[f"Diff {p}"] = 0.0
-    r.update({
-        "Store Code": store,
-        "Date": pd.Timestamp("2026-07-22"),
-        "Receipt ID": "R-" + auth,
-        "Auth Code": auth,
-        "D365 Source Type": "Store Tender",
-        "Cash Amount": 0.0,
-        "Reservation Cash": 0.0,
-        "Order Balance": 0.0,
-        "Reservation Report Total": 0.0,
-        "D365 Total": amount,
-        "POS Total": amount,
+        "POS Total": 0.0,
         "Total Difference": 0.0,
-        "D365 Tender": payment,
-        "POS Tender": payment,
-        "POS Date": pd.Timestamp("2026-07-22"),
-        "Posting Date": pd.Timestamp("2026-07-23"),
-        "Terminal ID": "T-MAPPED",
         "Commission": 0.0,
         "VAT": 0.0,
-        "Net Amount": amount,
-        "Source": "synthetic_pos.xlsx",
-        "Status": "Matched",
-        "Remarks": "Synthetic mapped row.",
+        "Net Amount": 0.0,
     })
-    if payment in rexp.PAYMENTS:
-        r[f"D365 {payment}"] = amount
-        r[f"POS {payment}"] = amount
-        r[f"Diff {payment}"] = 0.0
-    return r
+    return d
 
 
-tx = pd.DataFrame([
-    _blank_tx_row("MADA", 228_544.39, "A1", 100.00),
-    _blank_tx_row("VISA", 173_900.37, "A2", 50.00),
-    _blank_tx_row("MASTER", 169_900.36, "A3", 25.00),
-    _mapped_tx_row("601", "MADA", 1_000.00, "B1"),
-], columns=rexp.TX_COLUMNS)
+def transaction_reconciliation(result):
+    rows = []
 
-expected_unmapped = round(228_544.39 + 173_900.37 + 169_900.36, 2)
+    m = result.get("matched", pd.DataFrame())
+    for _, r in m.iterrows():
+        x = _zero_tx()
+        p = _master_name(r.get("Payment Type"))
+        d365 = float(r.get("D365 Amount", 0) or 0)
+        pos = float(r.get("POS Amount", 0) or 0)
+        x.update({
+            "Store Code": r.get("Store Code", ""),
+            "Date": r.get("Date", pd.NaT),
+            "Receipt ID": r.get("Receipt ID", ""),
+            "Auth Code": r.get("Auth Code", ""),
+            "D365 Source Type": "Store Tender",
+            "D365 Total": d365,
+            "POS Total": pos,
+            "Total Difference": round(d365 - pos, 2),
+            "D365 Tender": p,
+            "POS Tender": p,
+            "POS Date": r.get("POS Date", pd.NaT),
+            "Posting Date": r.get("Posting Date", pd.NaT),
+            "Terminal ID": r.get("Terminal ID", ""),
+            "Commission": float(r.get("Commission", 0) or 0),
+            "VAT": float(r.get("VAT", 0) or 0),
+            "Net Amount": float(r.get("Net Amount", 0) or 0),
+            "Source": r.get("Source File", ""),
+            "Status": "Matched" if str(r.get("Status", "")).lower() == "matched" else "Review",
+            "Remarks": "Reconciled successfully." if str(r.get("Status", "")).lower() == "matched"
+                       else "Authorization matched but amount requires Finance review.",
+        })
+        if p in PAYMENTS:
+            x[f"D365 {p}"] = d365
+            x[f"POS {p}"] = pos
+            x[f"Diff {p}"] = round(d365 - pos, 2)
+        rows.append(x)
 
-store = rexp.store_summary(tx)
-assert FLAG in store.columns
-assert LABEL in set(store["Store Code"].astype(str))
-u = store[store["Store Code"].astype(str) == LABEL].iloc[0]
-assert bool(u[FLAG]) is True
-assert round(float(u["POS Total"]), 2) == expected_unmapped
-assert round(float(u["D365 Total"]), 2) == 0.00
-assert round(float(u["Total Difference"]), 2) == -expected_unmapped
-print("[PASS] Store_Summary labels unresolved merchant activity and preserves amounts.")
+    us = result.get("unmatched_sales", pd.DataFrame())
+    for _, r in us.iterrows():
+        x = _zero_tx()
+        p = _master_name(r.get("D365 Payment"))
+        d365 = float(r.get("D365 Amount", 0) or 0)
+        x.update({
+            "Store Code": r.get("Store Code", ""),
+            "Date": r.get("Date", pd.NaT),
+            "Receipt ID": r.get("Receipt ID", ""),
+            "Auth Code": r.get("Auth Code", ""),
+            "D365 Source Type": "Store Tender",
+            "D365 Total": d365,
+            "POS Total": 0.0,
+            "Total Difference": d365,
+            "D365 Tender": p,
+            "POS Tender": "",
+            "Status": "Missing POS",
+            "Remarks": "D365 transaction found but no matching POS settlement. Please check bank/provider settlement.",
+        })
+        if p in PAYMENTS:
+            x[f"D365 {p}"] = d365
+            x[f"POS {p}"] = 0.0
+            x[f"Diff {p}"] = d365
+        rows.append(x)
 
-m = store[store["Store Code"].astype(str) == "601"].iloc[0]
-assert bool(m[FLAG]) is False
-assert round(float(m["POS Total"]), 2) == 1000.00
-assert round(float(m["D365 Total"]), 2) == 1000.00
-print("[PASS] Normal mapped store remains unchanged.")
+    up = result.get("unmatched_pos", pd.DataFrame())
+    for _, r in up.iterrows():
+        x = _zero_tx()
+        p = _master_name(r.get("POS Payment"))
+        pos = float(r.get("POS Amount", 0) or 0)
+        x.update({
+            "Store Code": r.get("POS Store", ""),
+            "Date": pd.NaT,
+            "Receipt ID": "",
+            "Auth Code": r.get("Auth Code", ""),
+            "D365 Source Type": "",
+            "D365 Total": 0.0,
+            "POS Total": pos,
+            "Total Difference": -pos,
+            "D365 Tender": "",
+            "POS Tender": p,
+            "POS Date": r.get("POS Date", pd.NaT),
+            "Posting Date": r.get("Posting Date", pd.NaT),
+            "Terminal ID": r.get("Terminal ID", ""),
+            "Commission": float(r.get("Commission", 0) or 0),
+            "VAT": float(r.get("VAT", 0) or 0),
+            "Net Amount": float(r.get("Net Amount", 0) or 0),
+            "Source": r.get("Source File", ""),
+            "Status": "Missing D365",
+            "Remarks": "POS/provider settlement found but no matching D365 Store Tender transaction.",
+        })
+        if p in PAYMENTS:
+            x[f"D365 {p}"] = 0.0
+            x[f"POS {p}"] = pos
+            x[f"Diff {p}"] = -pos
+        rows.append(x)
 
-sett = rexp.settlement_commission(tx)
-assert FLAG in sett.columns
-unmapped_sett = sett[sett["Store Code"].astype(str) == LABEL].copy()
-assert len(unmapped_sett) == 3
-assert set(unmapped_sett["Payment Type"]) == {"MADA", "VISA", "MASTER"}
-assert unmapped_sett[FLAG].map(bool).all()
-assert round(float(unmapped_sett["Gross Amount"].sum()), 2) == expected_unmapped
-print("[PASS] Settlement_Commission preserves payment-type split and flags all unresolved rows.")
+    out = pd.DataFrame(rows, columns=TX_COLUMNS)
+    if out.empty:
+        out = pd.DataFrame(columns=TX_COLUMNS)
+    return out
 
-unmatched_pos = pd.DataFrame([
-    {"POS Store": "", "POS Payment": "MADA", "POS Amount": 228_544.39, "Auth Code": "A1",
-     "POS Date": pd.Timestamp("2026-07-22"), "Posting Date": pd.Timestamp("2026-07-23"),
-     "Terminal ID": "T-UNMAPPED", "Commission": 100.0, "VAT": 0.0, "Net Amount": 228_444.39,
-     "Source File": "synthetic_pos.xlsx", "Exception Status": "Merchant Mapping Required",
-     "Reason": "Synthetic unresolved merchant/store mapping row."},
-    {"POS Store": "", "POS Payment": "VISA", "POS Amount": 173_900.37, "Auth Code": "A2",
-     "POS Date": pd.Timestamp("2026-07-22"), "Posting Date": pd.Timestamp("2026-07-23"),
-     "Terminal ID": "T-UNMAPPED", "Commission": 50.0, "VAT": 0.0, "Net Amount": 173_850.37,
-     "Source File": "synthetic_pos.xlsx", "Exception Status": "Merchant Mapping Required",
-     "Reason": "Synthetic unresolved merchant/store mapping row."},
-    {"POS Store": "", "POS Payment": "MASTER", "POS Amount": 169_900.36, "Auth Code": "A3",
-     "POS Date": pd.Timestamp("2026-07-22"), "Posting Date": pd.Timestamp("2026-07-23"),
-     "Terminal ID": "T-UNMAPPED", "Commission": 25.0, "VAT": 0.0, "Net Amount": 169_875.36,
-     "Source File": "synthetic_pos.xlsx", "Exception Status": "Merchant Mapping Required",
-     "Reason": "Synthetic unresolved merchant/store mapping row."},
-])
 
-matched = pd.DataFrame([{
-    "Store Code": "601", "Date": pd.Timestamp("2026-07-22"), "Receipt ID": "R-B1",
-    "Auth Code": "B1", "Payment Type": "MADA", "D365 Amount": 1000.0, "POS Amount": 1000.0,
-    "POS Date": pd.Timestamp("2026-07-22"), "Posting Date": pd.Timestamp("2026-07-23"),
-    "Terminal ID": "T-MAPPED", "Commission": 0.0, "VAT": 0.0, "Net Amount": 1000.0,
-    "Source File": "synthetic_pos.xlsx", "Status": "Matched",
-}])
+def _merchant_mapping_required_store(value):
+    """True only when Store Code is genuinely blank/unresolved."""
+    if pd.isna(value):
+        return True
+    return str(value).strip() == ""
 
-result = {
-    "matched": matched,
-    "cash_transactions": pd.DataFrame(),
-    "unmatched_sales": pd.DataFrame(),
-    "unmatched_pos": unmatched_pos,
-}
 
-xlsx = rexp.create_reconciliation_pack(result, tolerance=1.0)
-wb = openpyxl.load_workbook(io.BytesIO(xlsx))
-ws_store = wb["Store_Summary"]
-ws_sett = wb["Settlement_Commission"]
+def store_summary(tx):
+    flag_col = "Merchant Mapping Required"
+    visible_cols = ["Store Code"] + [f"{z} {p}" for p in PAYMENTS for z in ("D365","POS","Diff")] + [
+        "D365 Total","POS Total","Total Difference","Exceptions"
+    ]
+    if tx.empty:
+        return pd.DataFrame(columns=visible_cols + [flag_col])
 
-assert ws_store.max_column == 35, f"Store_Summary width drift: {ws_store.max_column}"
-assert ws_sett.max_column == 7, f"Settlement_Commission width drift: {ws_sett.max_column}"
-print("[PASS] Visible widths unchanged: Store_Summary=35, Settlement_Commission=7.")
+    rows = []
+    for store, g in tx.groupby("Store Code", dropna=False):
+        mapping_required = _merchant_mapping_required_store(store)
+        r = {
+            "Store Code": "⚠ MERCHANT MAPPING REQUIRED" if mapping_required else store,
+            flag_col: mapping_required,
+        }
+        for p in PAYMENTS:
+            r[f"D365 {p}"] = g[f"D365 {p}"].sum()
+            r[f"POS {p}"] = g[f"POS {p}"].sum()
+            r[f"Diff {p}"] = g[f"Diff {p}"].sum()
+        r["D365 Total"] = g["D365 Total"].sum()
+        r["POS Total"] = g["POS Total"].sum()
+        r["Total Difference"] = g["Total Difference"].sum()
+        r["Exceptions"] = int((g["Status"] != "Matched").sum())
+        rows.append(r)
 
-for ws in (ws_store, ws_sett):
-    vals = [cell.value for row in ws.iter_rows() for cell in row]
-    assert FLAG not in vals
-    assert not any(isinstance(v, bool) for v in vals)
-print("[PASS] Raw Merchant Mapping Required flag never leaks into visible Excel.")
+    return pd.DataFrame(rows, columns=visible_cols + [flag_col])
 
-def _find_rows(ws, value):
-    return [r for r in range(1, ws.max_row + 1) if ws.cell(r, 1).value == value]
+def payment_summary(tx):
+    rows = []
+    for p in PAYMENTS:
+        d365 = float(tx[f"D365 {p}"].sum()) if not tx.empty else 0.0
+        pos = float(tx[f"POS {p}"].sum()) if not tx.empty else 0.0
+        rows.append({"Payment Type": p, "D365 Amount": d365, "POS Amount": pos, "Difference": d365-pos})
+    return pd.DataFrame(rows)
 
-store_rows = _find_rows(ws_store, LABEL)
-assert len(store_rows) == 1
-sr = store_rows[0]
-for c in range(1, ws_store.max_column + 1):
-    assert ws_store.cell(sr, c).fill.fgColor.rgb == ORANGE
-assert ws_store.cell(sr, 1).font.bold is True
-print("[PASS] Store_Summary mapping-required row is orange across all visible columns.")
 
-sett_rows = _find_rows(ws_sett, LABEL)
-assert len(sett_rows) == 3
-for rr in sett_rows:
-    for c in range(1, ws_sett.max_column + 1):
-        assert ws_sett.cell(rr, c).fill.fgColor.rgb == ORANGE
-    assert ws_sett.cell(rr, 1).font.bold is True
-print("[PASS] Settlement_Commission mapping-required rows are orange across all visible columns.")
+def settlement_commission(tx):
+    flag_col = "Merchant Mapping Required"
+    visible_cols = ["Store Code","Payment Type","Transactions","Gross Amount","Commission","VAT","Net Settlement"]
+    if tx.empty:
+        return pd.DataFrame(columns=visible_cols + [flag_col])
+    g = tx[tx["POS Total"] != 0].copy()
+    if g.empty:
+        return pd.DataFrame(columns=visible_cols + [flag_col])
+    out = g.groupby(["Store Code","POS Tender"], dropna=False).agg(
+        Transactions=("Auth Code","count"),
+        Gross_Amount=("POS Total","sum"),
+        Commission=("Commission","sum"),
+        VAT=("VAT","sum"),
+        Net_Settlement=("Net Amount","sum"),
+    ).reset_index()
+    out.columns=visible_cols
+    out[flag_col] = out["Store Code"].map(_merchant_mapping_required_store)
+    out.loc[out[flag_col], "Store Code"] = "⚠ MERCHANT MAPPING REQUIRED"
+    return out[visible_cols + [flag_col]]
 
-assert "Payment_Summary" in wb.sheetnames
-assert "Settlement_Delay" in wb.sheetnames
-print("[PASS] Existing report sheets remain present.")
+def settlement_delay(tx):
+    m = tx[tx["Status"]=="Matched"].copy()
+    if m.empty:
+        return pd.DataFrame({
+            "Delay Bucket":["T+0","T+1","T+2","T+3",">T+3","Unknown"],
+            "Transactions":[0]*6,
+            "% of Matched":[0.0]*6,
+            "D365 Amount":[0.0]*6,
+        })
+    sale = pd.to_datetime(m["Date"], errors="coerce")
+    pos = pd.to_datetime(m["POS Date"], errors="coerce")
+    m["_delay"] = (pos.dt.normalize() - sale.dt.normalize()).dt.days
 
-print("REGRESSION REPORT V46A MERCHANT MAPPING REQUIRED PASS")
+    def bucket(v):
+        if pd.isna(v): return "Unknown"
+        if v <= 0: return "T+0"
+        if v == 1: return "T+1"
+        if v == 2: return "T+2"
+        if v == 3: return "T+3"
+        return ">T+3"
+
+    m["_bucket"] = m["_delay"].map(bucket)
+    order=["T+0","T+1","T+2","T+3",">T+3","Unknown"]
+    rows=[]
+    total=len(m)
+    for b in order:
+        x=m[m["_bucket"]==b]
+        rows.append({
+            "Delay Bucket":b,
+            "Transactions":len(x),
+            "% of Matched":len(x)/total if total else 0.0,
+            "D365 Amount":x["D365 Total"].sum(),
+        })
+    return pd.DataFrame(rows)
+
+
+def _write_title(ws, title, subtitle, end_col):
+    ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=end_col)
+    ws.cell(1,1,title)
+    ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=end_col)
+    ws.cell(2,1,subtitle)
+
+
+def _style_sheet(ws, title_row=1, header_row=4, money_cols=None, percent_cols=None):
+    navy = "17365D"
+    blue = "1F4E78"
+    light = "D9EAF7"
+    red = "FCE4D6"
+    green = "E2F0D9"
+    white = "FFFFFF"
+    thin = Side(style="thin", color="D9E1F2")
+
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = f"A{header_row+1}"
+
+    for cell in ws[title_row]:
+        cell.fill=PatternFill("solid",fgColor=navy)
+        cell.font=Font(color=white,bold=True,size=16)
+        cell.alignment=Alignment(vertical="center")
+    ws.row_dimensions[title_row].height=25
+
+    for cell in ws[header_row]:
+        cell.fill=PatternFill("solid",fgColor=blue)
+        cell.font=Font(color=white,bold=True)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=Border(bottom=thin)
+    ws.row_dimensions[header_row].height=34
+
+    if money_cols:
+        for col in money_cols:
+            for c in ws[col][header_row:]:
+                c.number_format='#,##0.00'
+    if percent_cols:
+        for col in percent_cols:
+            for c in ws[col][header_row:]:
+                c.number_format='0.00%'
+
+    # Practical width limits
+    for col_cells in ws.columns:
+        letter=get_column_letter(col_cells[0].column)
+        max_len=0
+        for c in col_cells[:200]:
+            if c.value is not None:
+                max_len=max(max_len,len(str(c.value)))
+        ws.column_dimensions[letter].width=min(max(max_len+2,11),34)
+
+    # Status highlighting when available
+    header_map={ws.cell(header_row,c).value:c for c in range(1,ws.max_column+1)}
+    if "Status" in header_map:
+        col=get_column_letter(header_map["Status"])
+        ws.conditional_formatting.add(f"{col}{header_row+1}:{col}{ws.max_row}",
+            CellIsRule(operator="equal", formula=['"Matched"'], fill=PatternFill("solid",fgColor=green)))
+        ws.conditional_formatting.add(f"{col}{header_row+1}:{col}{ws.max_row}",
+            CellIsRule(operator="notEqual", formula=['"Matched"'], fill=PatternFill("solid",fgColor=red)))
+
+
+def _highlight_mapping_required_rows(ws, row_flags, header_row=4):
+    """Presentation-only V46A highlight. row_flags aligns with exported data rows."""
+    fill = PatternFill("solid", fgColor="FCE4D6")
+    dark_orange = "9C5700"
+    for offset, required in enumerate(row_flags, start=header_row + 1):
+        if not bool(required):
+            continue
+        for col in range(1, ws.max_column + 1):
+            ws.cell(offset, col).fill = fill
+        ws.cell(offset, 1).font = Font(bold=True, color=dark_orange)
+
+
+def create_reconciliation_pack(result, tolerance=1.0):
+    tx = transaction_reconciliation(result)
+    exceptions = tx[tx["Status"]!="Matched"].copy()
+    store = store_summary(tx)
+    payment = payment_summary(tx)
+    settlement = settlement_commission(tx)
+    delay = settlement_delay(tx)
+
+    # V46A: keep formatting identity internally, never expose the raw flag in Excel.
+    _mapping_flag = "Merchant Mapping Required"
+    store_mapping_flags = store[_mapping_flag].tolist() if _mapping_flag in store.columns else [False] * len(store)
+    settlement_mapping_flags = settlement[_mapping_flag].tolist() if _mapping_flag in settlement.columns else [False] * len(settlement)
+    store = store.drop(columns=[_mapping_flag], errors="ignore")
+    settlement = settlement.drop(columns=[_mapping_flag], errors="ignore")
+
+    total=len(tx)
+    matched=int((tx["Status"]=="Matched").sum()) if total else 0
+    exc=total-matched
+    d365=float(tx["D365 Total"].sum()) if total else 0.0
+    pos=float(tx["POS Total"].sum()) if total else 0.0
+
+    now=datetime.now()
+    stamp=now.strftime("%d-%b-%Y %H:%M")
+    out=io.BytesIO()
+
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        # Dashboard
+        dash=pd.DataFrame([
+            ["Total Transactions",total],
+            ["Matched",matched],
+            ["Exceptions",exc],
+            ["Match %",matched/total if total else 0],
+            ["Total D365 Amount",d365],
+            ["Total POS/Provider Amount",pos],
+            ["Total Difference",d365-pos],
+        ],columns=["Metric","Value"])
+        dash.to_excel(writer,sheet_name="Dashboard",index=False,startrow=3)
+        ws=writer.book["Dashboard"]
+        _write_title(ws,"RetailRecon AI — Reconciliation Dashboard",f"Generated {stamp} | Tolerance SAR {tolerance:.2f}",6)
+        _style_sheet(ws,header_row=4)
+        ws["B8"].number_format="0.00%"
+        for r in range(9,12): ws[f"B{r}"].number_format='#,##0.00'
+
+        # Main transaction
+        tx.to_excel(writer,sheet_name="Transaction_Reconciliation",index=False,startrow=3)
+        ws=writer.book["Transaction_Reconciliation"]
+        _write_title(ws,"Transaction Reconciliation",f"Generated {stamp} | {len(tx):,} row(s)",len(TX_COLUMNS))
+        _style_sheet(ws,header_row=4)
+        for col in range(16,58):
+            letter=get_column_letter(col)
+            for c in ws[letter][4:]: c.number_format='#,##0.00'
+        for dc in ["B","AY","AZ"]:
+            for c in ws[dc][4:]: c.number_format='dd-mmm-yyyy'
+
+        # Exceptions
+        exceptions.to_excel(writer,sheet_name="Exceptions",index=False,startrow=3)
+        ws=writer.book["Exceptions"]
+        _write_title(ws,"Exceptions",f"Generated {stamp} | {len(exceptions):,} exception row(s)",len(TX_COLUMNS))
+        _style_sheet(ws,header_row=4)
+        for col in range(16,58):
+            letter=get_column_letter(col)
+            for c in ws[letter][4:]: c.number_format='#,##0.00'
+
+        # Store summary
+        store.to_excel(writer,sheet_name="Store_Summary",index=False,startrow=3)
+        ws=writer.book["Store_Summary"]
+        _write_title(ws,"Store Summary",f"Generated {stamp}",len(store.columns))
+        _style_sheet(ws,header_row=4)
+        _highlight_mapping_required_rows(ws, store_mapping_flags, header_row=4)
+        for col in range(2,ws.max_column):
+            letter=get_column_letter(col)
+            for c in ws[letter][4:]: c.number_format='#,##0.00'
+
+        # Payment summary
+        payment.to_excel(writer,sheet_name="Payment_Summary",index=False,startrow=3)
+        ws=writer.book["Payment_Summary"]
+        _write_title(ws,"Payment Summary",f"Generated {stamp}",4)
+        _style_sheet(ws,header_row=4)
+        for col in ["B","C","D"]:
+            for c in ws[col][4:]: c.number_format='#,##0.00'
+
+        # Settlement commission
+        settlement.to_excel(writer,sheet_name="Settlement_Commission",index=False,startrow=3)
+        ws=writer.book["Settlement_Commission"]
+        _write_title(ws,"Settlement & Commission",f"Generated {stamp}",7)
+        _style_sheet(ws,header_row=4)
+        _highlight_mapping_required_rows(ws, settlement_mapping_flags, header_row=4)
+        for col in ["D","E","F","G"]:
+            for c in ws[col][4:]: c.number_format='#,##0.00'
+
+        # Settlement delay
+        delay.to_excel(writer,sheet_name="Settlement_Delay",index=False,startrow=4)
+        ws=writer.book["Settlement_Delay"]
+        _write_title(ws,"Settlement Delay Analysis",
+                     f"Generated {stamp} | Matched transactions only | Delay = POS/provider date - D365 sale date",10)
+        ws["A4"]="Delay Distribution — Matched Transactions Only"
+        ws["A4"].font=Font(bold=True,size=12)
+        _style_sheet(ws,header_row=5)
+        for c in ws["C"][5:]: c.number_format="0.00%"
+        for c in ws["D"][5:]: c.number_format='#,##0.00'
+
+    out.seek(0)
+    return out.getvalue()
