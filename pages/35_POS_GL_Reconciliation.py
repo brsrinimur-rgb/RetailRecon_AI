@@ -693,8 +693,15 @@ if r:
         # not just provable by manually summing the rows.
         _store_summary = r.get("store_summary", pd.DataFrame())
         _gl_summary = r.get("gl_summary", pd.DataFrame())
+        # "Mapping Required" drives highlighting only -- it's a raw boolean
+        # flag, not something Finance needs to see as its own column, so
+        # it's captured here and dropped before writing the visible table.
+        _gl_mapping_required = (
+            _gl_summary["Mapping Required"].tolist() if "Mapping Required" in _gl_summary.columns else []
+        )
+        _gl_summary_display = _gl_summary.drop(columns=["Mapping Required"], errors="ignore")
         _store_summary.to_excel(w,index=False,sheet_name="Summary",startrow=2,startcol=0)
-        _gl_summary.to_excel(w,index=False,sheet_name="Summary",startrow=2,startcol=6)
+        _gl_summary_display.to_excel(w,index=False,sheet_name="Summary",startrow=2,startcol=6)
         _ws = w.sheets["Summary"]
         _ws["A1"] = "STORE-WISE SUMMARY"
         _ws["G1"] = "GL-WISE SUMMARY"
@@ -758,6 +765,24 @@ if r:
                         _cell.fill, _cell.font = _ok_fill, _ok_font
                     elif _cell.value == "REVIEW":
                         _cell.fill, _cell.font = _review_fill, _review_font
+
+            # V42.5: rows needing a GL/provider mapping are a categorically
+            # different problem than an amount variance -- missing
+            # configuration, not an accounting difference -- so they get a
+            # distinct highlight (orange) across the whole row, overriding
+            # the plain OK/REVIEW coloring set above for those specific rows.
+            if not _gl_summary.empty and _gl_mapping_required:
+                _mapping_fill = PatternFill("solid", fgColor="FCE4D6")
+                _mapping_font = Font(color="974706", bold=True)
+                for _offset, _needs_mapping in enumerate(_gl_mapping_required):
+                    if not _needs_mapping:
+                        continue
+                    _r = 4 + _offset
+                    for _c in range(7, 13):
+                        _cell = _ws.cell(row=_r, column=_c)
+                        _cell.fill = _mapping_fill
+                        if _c in (7, 8):
+                            _cell.font = _mapping_font
 
             # Bold the Total rows and give them a top border to set them
             # apart from the data above.
