@@ -15,7 +15,7 @@ PAYMENTS = ["MADA", "VISA", "MASTER", "AMEX", "TABBY", "TAMARA", "TAP", "FLOOSS"
 TX_COLUMNS = [
     "Store Code", "Date", "Receipt ID", "Auth Code", "D365 Source Type",
     "Reservation Type", "Reservation Flow", "Sales Order", "Customer Account",
-    "Customer Name", "Description", "Cash Classification", "Cash Amount", "Reservation Cash", "Order Balance",
+    "Customer Name", "Description", "Reservation Cash", "Order Balance",
     "Reservation Report Total", "Reservation Auth Resolution",
     "D365 MADA", "POS MADA", "Diff MADA",
     "D365 VISA", "POS VISA", "Diff VISA",
@@ -47,7 +47,6 @@ def _zero_tx():
         d[f"POS {p}"] = 0.0
         d[f"Diff {p}"] = 0.0
     d.update({
-        "Cash Amount": 0.0,
         "Reservation Cash": 0.0,
         "Order Balance": 0.0,
         "Reservation Report Total": 0.0,
@@ -98,29 +97,6 @@ def transaction_reconciliation(result):
             x[f"Diff {p}"] = round(d365 - pos, 2)
         rows.append(x)
 
-    cash = result.get("cash_transactions", pd.DataFrame())
-    for _, r in cash.iterrows():
-        x = _zero_tx()
-        amt = float(r.get("Cash Amount", r.get("D365 Amount", 0)) or 0)
-        cls = str(r.get("Cash Classification","")).strip() or ("Cash Sales" if amt > 0 else "Cash Refund")
-        x.update({
-            "Store Code": r.get("Store Code", ""),
-            "Date": r.get("Date", pd.NaT),
-            "Receipt ID": r.get("Receipt ID", ""),
-            "Auth Code": r.get("Auth Code", ""),
-            "D365 Source Type": "Store Tender",
-            "Cash Classification": cls,
-            "Cash Amount": amt,
-            "D365 Total": amt,
-            "POS Total": 0.0,
-            "Total Difference": 0.0,
-            "D365 Tender": "CASH",
-            "POS Tender": "",
-            "Status": cls,
-            "Remarks": "Cash transaction from D365 Store Tender. No POS/provider settlement required.",
-        })
-        rows.append(x)
-
     us = result.get("unmatched_sales", pd.DataFrame())
     for _, r in us.iterrows():
         x = _zero_tx()
@@ -169,8 +145,8 @@ def transaction_reconciliation(result):
             "VAT": float(r.get("VAT", 0) or 0),
             "Net Amount": float(r.get("Net Amount", 0) or 0),
             "Source": r.get("Source File", ""),
-            "Status": r.get("Exception Status", "Missing D365"),
-            "Remarks": r.get("Reason", "POS/provider settlement found but no matching D365 Store Tender transaction."),
+            "Status": "Missing D365",
+            "Remarks": "POS/provider settlement found but no matching D365 Store Tender transaction.",
         })
         if p in PAYMENTS:
             x[f"D365 {p}"] = 0.0
@@ -184,16 +160,28 @@ def transaction_reconciliation(result):
     return out
 
 
+def _merchant_mapping_required_store(value):
+    """True only when Store Code is genuinely blank/unresolved."""
+    if pd.isna(value):
+        return True
+    return str(value).strip() == ""
+
+
 def store_summary(tx):
+    flag_col = "Merchant Mapping Required"
+    visible_cols = ["Store Code"] + [f"{z} {p}" for p in PAYMENTS for z in ("D365","POS","Diff")] + [
+        "D365 Total","POS Total","Total Difference","Exceptions"
+    ]
     if tx.empty:
-        cols = ["Store Code"] + [f"{z} {p}" for p in PAYMENTS for z in ("D365","POS","Diff")] + [
-            "D365 Total","POS Total","Total Difference","Exceptions"
-        ]
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=visible_cols + [flag_col])
 
     rows = []
     for store, g in tx.groupby("Store Code", dropna=False):
-        r = {"Store Code": store}
+        mapping_required = _merchant_mapping_required_store(store)
+        r = {
+            "Store Code": "⚠ MERCHANT MAPPING REQUIRED" if mapping_required else store,
+            flag_col: mapping_required,
+        }
         for p in PAYMENTS:
             r[f"D365 {p}"] = g[f"D365 {p}"].sum()
             r[f"POS {p}"] = g[f"POS {p}"].sum()
@@ -204,8 +192,7 @@ def store_summary(tx):
         r["Exceptions"] = int((g["Status"] != "Matched").sum())
         rows.append(r)
 
-    return pd.DataFrame(rows)
-
+    return pd.DataFrame(rows, columns=visible_cols + [flag_col])
 
 def payment_summary(tx):
     rows = []
@@ -217,11 +204,13 @@ def payment_summary(tx):
 
 
 def settlement_commission(tx):
+    flag_col = "Merchant Mapping Required"
+    visible_cols = ["Store Code","Payment Type","Transactions","Gross Amount","Commission","VAT","Net Settlement"]
     if tx.empty:
-        return pd.DataFrame(columns=["Store Code","Payment Type","Transactions","Gross Amount","Commission","VAT","Net Settlement"])
+        return pd.DataFrame(columns=visible_cols + [flag_col])
     g = tx[tx["POS Total"] != 0].copy()
     if g.empty:
-        return pd.DataFrame(columns=["Store Code","Payment Type","Transactions","Gross Amount","Commission","VAT","Net Settlement"])
+        return pd.DataFrame(columns=visible_cols + [flag_col])
     out = g.groupby(["Store Code","POS Tender"], dropna=False).agg(
         Transactions=("Auth Code","count"),
         Gross_Amount=("POS Total","sum"),
@@ -229,9 +218,10 @@ def settlement_commission(tx):
         VAT=("VAT","sum"),
         Net_Settlement=("Net Amount","sum"),
     ).reset_index()
-    out.columns=["Store Code","Payment Type","Transactions","Gross Amount","Commission","VAT","Net Settlement"]
-    return out
-
+    out.columns=visible_cols
+    out[flag_col] = out["Store Code"].map(_merchant_mapping_required_store)
+    out.loc[out[flag_col], "Store Code"] = "⚠ MERCHANT MAPPING REQUIRED"
+    return out[visible_cols + [flag_col]]
 
 def settlement_delay(tx):
     m = tx[tx["Status"]=="Matched"].copy()
@@ -329,6 +319,18 @@ def _style_sheet(ws, title_row=1, header_row=4, money_cols=None, percent_cols=No
             CellIsRule(operator="notEqual", formula=['"Matched"'], fill=PatternFill("solid",fgColor=red)))
 
 
+def _highlight_mapping_required_rows(ws, row_flags, header_row=4):
+    """Presentation-only V46A highlight. row_flags aligns with exported data rows."""
+    fill = PatternFill("solid", fgColor="FCE4D6")
+    dark_orange = "9C5700"
+    for offset, required in enumerate(row_flags, start=header_row + 1):
+        if not bool(required):
+            continue
+        for col in range(1, ws.max_column + 1):
+            ws.cell(offset, col).fill = fill
+        ws.cell(offset, 1).font = Font(bold=True, color=dark_orange)
+
+
 def create_reconciliation_pack(result, tolerance=1.0):
     tx = transaction_reconciliation(result)
     exceptions = tx[tx["Status"]!="Matched"].copy()
@@ -336,6 +338,13 @@ def create_reconciliation_pack(result, tolerance=1.0):
     payment = payment_summary(tx)
     settlement = settlement_commission(tx)
     delay = settlement_delay(tx)
+
+    # V46A: keep formatting identity internally, never expose the raw flag in Excel.
+    _mapping_flag = "Merchant Mapping Required"
+    store_mapping_flags = store[_mapping_flag].tolist() if _mapping_flag in store.columns else [False] * len(store)
+    settlement_mapping_flags = settlement[_mapping_flag].tolist() if _mapping_flag in settlement.columns else [False] * len(settlement)
+    store = store.drop(columns=[_mapping_flag], errors="ignore")
+    settlement = settlement.drop(columns=[_mapping_flag], errors="ignore")
 
     total=len(tx)
     matched=int((tx["Status"]=="Matched").sum()) if total else 0
@@ -390,6 +399,7 @@ def create_reconciliation_pack(result, tolerance=1.0):
         ws=writer.book["Store_Summary"]
         _write_title(ws,"Store Summary",f"Generated {stamp}",len(store.columns))
         _style_sheet(ws,header_row=4)
+        _highlight_mapping_required_rows(ws, store_mapping_flags, header_row=4)
         for col in range(2,ws.max_column):
             letter=get_column_letter(col)
             for c in ws[letter][4:]: c.number_format='#,##0.00'
@@ -407,6 +417,7 @@ def create_reconciliation_pack(result, tolerance=1.0):
         ws=writer.book["Settlement_Commission"]
         _write_title(ws,"Settlement & Commission",f"Generated {stamp}",7)
         _style_sheet(ws,header_row=4)
+        _highlight_mapping_required_rows(ws, settlement_mapping_flags, header_row=4)
         for col in ["D","E","F","G"]:
             for c in ws[col][4:]: c.number_format='#,##0.00'
 
