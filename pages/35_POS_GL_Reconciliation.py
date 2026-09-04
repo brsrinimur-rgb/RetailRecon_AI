@@ -686,6 +686,11 @@ if r:
         # The wide run/control KPIs remain on the Streamlit dashboard; the
         # Excel Summary contains only the two Finance management views the
         # user asked for: Store-wise and full GL-wise comparison.
+        # V42.4: GL-wise now carries the same Status verdict as Store-wise
+        # (same tolerance rule); both tables get OK/REVIEW conditional
+        # formatting and an explicit Total row so the tie-out that's
+        # already proven internally is visible in the workbook itself,
+        # not just provable by manually summing the rows.
         _store_summary = r.get("store_summary", pd.DataFrame())
         _gl_summary = r.get("gl_summary", pd.DataFrame())
         _store_summary.to_excel(w,index=False,sheet_name="Summary",startrow=2,startcol=0)
@@ -693,21 +698,84 @@ if r:
         _ws = w.sheets["Summary"]
         _ws["A1"] = "STORE-WISE SUMMARY"
         _ws["G1"] = "GL-WISE SUMMARY"
+
+        # Row directly below each table's last data row, for the Total line.
+        _store_total_row = 4 + len(_store_summary)
+        _gl_total_row = 4 + len(_gl_summary)
+
+        if not _store_summary.empty:
+            _ws.cell(row=_store_total_row, column=1, value="TOTAL")
+            _ws.cell(row=_store_total_row, column=2, value=float(_store_summary["POS Total"].sum()))
+            _ws.cell(row=_store_total_row, column=3, value=float(_store_summary["GL Total"].sum()))
+            _ws.cell(row=_store_total_row, column=4, value=float(_store_summary["Difference"].sum()))
+        if not _gl_summary.empty:
+            _ws.cell(row=_gl_total_row, column=7, value="TOTAL")
+            _ws.cell(row=_gl_total_row, column=9, value=float(_gl_summary["GL Total"].sum()))
+            _ws.cell(row=_gl_total_row, column=10, value=float(_gl_summary["POS Total"].sum()))
+            _ws.cell(row=_gl_total_row, column=11, value=float(_gl_summary["Difference"].sum()))
+
         try:
-            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
             _title_fill = PatternFill("solid", fgColor="1F4E78")
             _head_fill = PatternFill("solid", fgColor="D9EAF7")
+            _ok_fill = PatternFill("solid", fgColor="C6EFCE")
+            _review_fill = PatternFill("solid", fgColor="FFC7CE")
+            _ok_font = Font(color="006100")
+            _review_font = Font(color="9C0006")
+            _total_border = Border(top=Side(style="thin"))
+
             for _cell in (_ws["A1"], _ws["G1"]):
                 _cell.font = Font(bold=True, color="FFFFFF")
                 _cell.fill = _title_fill
-            for _cell in list(_ws[3])[0:5] + list(_ws[3])[6:11]:
+
+            # Header row now spans 6 columns per table (Status added to
+            # GL-wise): A:E (store-wise) and G:L (GL-wise, was G:K).
+            for _cell in list(_ws[3])[0:5] + list(_ws[3])[6:12]:
                 _cell.font = Font(bold=True)
                 _cell.fill = _head_fill
                 _cell.alignment = Alignment(horizontal="center")
-            for _row in _ws.iter_rows(min_row=4, max_row=_ws.max_row):
+
+            for _row in _ws.iter_rows(min_row=4, max_row=max(_store_total_row, _gl_total_row)):
                 for _cell in (_row[1:4] + _row[8:11]):
                     if _cell.value is not None and isinstance(_cell.value, (int, float)):
                         _cell.number_format = '#,##0.00;[Red]-#,##0.00'
+
+            # OK/REVIEW conditional formatting: Store-wise Status is column
+            # E (index 5), GL-wise Status is column L (index 12) now that
+            # it carries the same verdict as Store-wise.
+            if not _store_summary.empty:
+                for _r in range(4, _store_total_row):
+                    _cell = _ws.cell(row=_r, column=5)
+                    if _cell.value == "OK":
+                        _cell.fill, _cell.font = _ok_fill, _ok_font
+                    elif _cell.value == "REVIEW":
+                        _cell.fill, _cell.font = _review_fill, _review_font
+            if not _gl_summary.empty:
+                for _r in range(4, _gl_total_row):
+                    _cell = _ws.cell(row=_r, column=12)
+                    if _cell.value == "OK":
+                        _cell.fill, _cell.font = _ok_fill, _ok_font
+                    elif _cell.value == "REVIEW":
+                        _cell.fill, _cell.font = _review_fill, _review_font
+
+            # Bold the Total rows and give them a top border to set them
+            # apart from the data above.
+            if not _store_summary.empty:
+                for _c in range(1, 6):
+                    _cell = _ws.cell(row=_store_total_row, column=_c)
+                    _cell.font = Font(bold=True)
+                    _cell.border = _total_border
+                    if isinstance(_cell.value, (int, float)):
+                        _cell.number_format = '#,##0.00;[Red]-#,##0.00'
+            if not _gl_summary.empty:
+                for _c in range(7, 13):
+                    _cell = _ws.cell(row=_gl_total_row, column=_c)
+                    _cell.font = Font(bold=True)
+                    _cell.border = _total_border
+                    if isinstance(_cell.value, (int, float)):
+                        _cell.number_format = '#,##0.00;[Red]-#,##0.00'
+
             _ws.column_dimensions["A"].width = 12
             _ws.column_dimensions["B"].width = 16
             _ws.column_dimensions["C"].width = 16
@@ -718,6 +786,7 @@ if r:
             _ws.column_dimensions["I"].width = 16
             _ws.column_dimensions["J"].width = 16
             _ws.column_dimensions["K"].width = 16
+            _ws.column_dimensions["L"].width = 11
         except Exception:
             # Formatting must never block the reconciliation download.
             pass
