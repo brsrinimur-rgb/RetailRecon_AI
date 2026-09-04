@@ -2080,6 +2080,16 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
             "Difference": _pos_amt - _gl_amt,
         })
     gl_summary = pd.DataFrame(_gl_summary_rows, columns=["GL Account", "GL Name", "GL Total", "POS Total", "Difference"])
+    if not gl_summary.empty:
+        # Same tolerance rule as store_summary's Status, so both compact
+        # tables give Finance the same quick verdict. Uses the same
+        # max_bucket_tolerance already configured for this run -- no new
+        # threshold introduced.
+        gl_summary["Status"] = gl_summary["Difference"].abs().apply(
+            lambda x: "OK" if float(x) <= float(max_bucket_tolerance) else "REVIEW"
+        )
+    else:
+        gl_summary["Status"] = pd.Series(dtype="object")
 
     chronic_stores = detect_chronic_exception_stores(bucket_summary)
     duplicate_dates = detect_duplicate_date_signature(bucket_summary)
