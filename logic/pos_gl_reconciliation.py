@@ -1743,8 +1743,17 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
                      f"POS row(s) in this bucket had a blank Provider value and could not be attributed to a "
                      f"specific clearing account.")
         return base
-    merged["bucket_reason"] = merged.apply(_reason, axis=1)
-    merged["store_swap_with"] = merged.apply(lambda r: swap_map.get((r["store_code"], r["bucket_gl_date"]), ""), axis=1)
+    # V42.3 robustness: pandas DataFrame.apply(axis=1) can return an
+    # unexpected empty DataFrame for a zero-row frame, which cannot be
+    # assigned to one column. Keep the output schema explicit instead.
+    if merged.empty:
+        merged["bucket_reason"] = pd.Series(index=merged.index, dtype="object")
+        merged["store_swap_with"] = pd.Series(index=merged.index, dtype="object")
+    else:
+        merged["bucket_reason"] = merged.apply(_reason, axis=1)
+        merged["store_swap_with"] = merged.apply(
+            lambda r: swap_map.get((r["store_code"], r["bucket_gl_date"]), ""), axis=1
+        )
 
     # Materiality tag (PASS 7) -- only meaningful for GL AMOUNT EXCEPTION
     # buckets; everything else is blank. When the reason fell through to the
@@ -1753,10 +1762,13 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
     # not only in a separate column someone has to notice. This is the FULL
     # variance (pos_total vs gl_total, the whole bucket) -- V41 item 7 adds a
     # second tag below for the narrower accounting-only residual.
-    merged["severity"] = merged.apply(
-        lambda r: _severity(r["pos_total"], r["gl_total"], r["bucket_diff"])
-        if r["bucket_status"] == "GL AMOUNT EXCEPTION" else "", axis=1
-    )
+    if merged.empty:
+        merged["severity"] = pd.Series(index=merged.index, dtype="object")
+    else:
+        merged["severity"] = merged.apply(
+            lambda r: _severity(r["pos_total"], r["gl_total"], r["bucket_diff"])
+            if r["bucket_status"] == "GL AMOUNT EXCEPTION" else "", axis=1
+        )
     # V41 item 7: a bucket's FULL variance can look EXTREME purely because
     # most of it is uncovered (missing-provider) GL activity, even though
     # the actual covered-account accounting residual (pos_total vs
@@ -1768,10 +1780,13 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
     # covered_diff alone, so a bucket that only LOOKS extreme because of an
     # upload gap doesn't read the same as one whose real accounting
     # difference is actually that large.
-    merged["accounting_residual_severity"] = merged.apply(
-        lambda r: _severity(r["pos_total"], r["gl_total_covered"], r["covered_diff"])
-        if r["bucket_status"] == "GL AMOUNT EXCEPTION" else "", axis=1
-    )
+    if merged.empty:
+        merged["accounting_residual_severity"] = pd.Series(index=merged.index, dtype="object")
+    else:
+        merged["accounting_residual_severity"] = merged.apply(
+            lambda r: _severity(r["pos_total"], r["gl_total_covered"], r["covered_diff"])
+            if r["bucket_status"] == "GL AMOUNT EXCEPTION" else "", axis=1
+        )
     merged.loc[
         (merged["severity"] == "EXTREME") & merged["bucket_reason"].str.startswith("Amount variance has no obvious cause"),
         "bucket_reason"
@@ -1821,7 +1836,20 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
             "Severity": "",
         })
 
-    d = pd.DataFrame(rows)
+    _detail_columns = [
+        "POS Row", "Merchant ID", "Store Code", "Provider", "POS Reference", "POS Date", "POS Amount",
+        "GL Row", "GL Main Account", "GL Voucher", "GL Journal", "GL Date", "Match Level",
+        "Bucket POS Total", "Bucket GL Total", "Bucket Difference", "Status", "Match Rule", "Reason",
+        "GL Source File", "Bucket POS Rows", "Bucket GL Rows", "Bucket Tolerance",
+        "Is Duplicate POS Row", "Store Swap Suspected With", "Severity",
+    ]
+    # V42.3 robustness (continued): pd.DataFrame([]) on a genuinely empty
+    # `rows` list produces a DataFrame with ZERO COLUMNS, not just zero
+    # rows -- pandas only infers column names from the dicts it's given.
+    # d.Status below would then raise AttributeError rather than returning
+    # an empty match/exception split. Explicit columns keep the schema
+    # correct even when there's nothing to reconcile.
+    d = pd.DataFrame(rows, columns=_detail_columns) if rows else pd.DataFrame(columns=_detail_columns)
     # Matched/exception status here is at POS-row grain (useful for
     # drill-down and the Excel "GL Matched"/"Exceptions" tabs), but the
     # summary counts below are bucket-level -- see the docstring note on
@@ -1961,9 +1989,102 @@ def reconcile_pos_to_gl_by_bucket(pos, gl, tolerance=0.50, settlement_lag_days=0
     summary["POS Rows"] = summary["POS Transaction Rows"]
     summary["GL Rows"] = summary["GL Line Rows"]
 
+    # V42.2 compact Finance summaries for the Excel Summary sheet.
+    # These are presentation summaries only; they do NOT participate in
+    # Store+Date matching or change any reconciliation status above.
+    #
+    # Store-wise Status is deliberately based on the store's aggregate
+    # monetary difference against the configured hard tolerance ceiling.
+    # The previous workbook implementation effectively made Status a
+    # constant REVIEW, which meant even a zero-difference store appeared
+    # unresolved.
+    store_summary = (bucket_summary.groupby("Store Code", dropna=False, as_index=False)
+                     .agg({"POS Total": "sum", "GL Total": "sum"}))
+    if not store_summary.empty:
+        store_summary["Difference"] = store_summary["POS Total"] - store_summary["GL Total"]
+        store_summary["Status"] = store_summary["Difference"].abs().apply(
+            lambda x: "OK" if float(x) <= float(max_bucket_tolerance) else "REVIEW"
+        )
+        store_summary = store_summary[["Store Code", "POS Total", "GL Total", "Difference", "Status"]]
+        store_summary = store_summary.sort_values("Store Code").reset_index(drop=True)
+
+    # Full GL-wise comparison, not just unmatched GL. POS is allocated to
+    # the GL account(s) configured for its provider. When a provider has a
+    # legitimate multi-account mapping for a store (e.g. Store 613 TAP),
+    # those accounts are shown as one composite row rather than duplicating
+    # the POS amount across two GL rows. Every POS amount and every GL amount
+    # is therefore counted once in this management summary.
+    _override_cache_summary = provider_gl_mapping.load_override_map(provider_mapping_db_path)
+    _pos_gl_rows = []
+    _multi_groups_by_store = {}
+    for _, _p in pos_sum_src.iterrows():
+        _store = str(_p.get("store_code", "") or "").strip()
+        _prov = str(_p.get("provider", "") or "").strip()
+        try:
+            _accts, _ = provider_gl_mapping.expected_accounts_for_provider(
+                _prov, _store, core_fn=core._gl_expected_account_for_tender,
+                _override_cache=_override_cache_summary,
+            )
+        except Exception:
+            _accts = set()
+        _accts = sorted({str(a).strip() for a in _accts if str(a).strip()})
+        if len(_accts) == 1:
+            _key = _accts[0]
+        elif len(_accts) > 1:
+            _key = " + ".join(_accts)
+            _multi_groups_by_store.setdefault(_store, []).append(frozenset(_accts))
+        else:
+            _key = "UNMAPPED"
+        _pos_gl_rows.append((_key, float(_p.get("pos_amount", 0) or 0)))
+
+    _pos_by_gl = {}
+    for _key, _amt in _pos_gl_rows:
+        _pos_by_gl[_key] = _pos_by_gl.get(_key, 0.0) + _amt
+
+    # Deduplicate the per-store multi-account sets before assigning GL rows.
+    for _store, _groups in list(_multi_groups_by_store.items()):
+        _multi_groups_by_store[_store] = list(dict.fromkeys(_groups))
+
+    _gl_by_key = {}
+    for _, _g in gl_sum_src.iterrows():
+        _store = str(_g.get("store_code", "") or "").strip()
+        _acct = str(_g.get("main_account", "") or "").strip() or "UNMAPPED GL"
+        _candidates = [grp for grp in _multi_groups_by_store.get(_store, []) if _acct in grp]
+        if len(_candidates) == 1:
+            _key = " + ".join(sorted(_candidates[0]))
+        else:
+            _key = _acct
+        _gl_by_key[_key] = _gl_by_key.get(_key, 0.0) + float(_g.get("gl_signed_amount", 0) or 0)
+
+    _keys = sorted(set(_pos_by_gl) | set(_gl_by_key))
+    _gl_summary_rows = []
+    for _key in _keys:
+        if _key == "UNMAPPED":
+            _name = "Unmapped POS Provider"
+        elif _key == "UNMAPPED GL":
+            _name = "Unmapped GL Account"
+        else:
+            _parts = [x.strip() for x in _key.split("+")]
+            _names = []
+            for _acct in _parts:
+                _info = core.D365_CLEARING_ACCOUNT_MAP.get(_acct, {})
+                _names.append(_info.get("account_name", _acct))
+            _name = " / ".join(_names)
+        _pos_amt = float(_pos_by_gl.get(_key, 0.0))
+        _gl_amt = float(_gl_by_key.get(_key, 0.0))
+        _gl_summary_rows.append({
+            "GL Account": _key,
+            "GL Name": _name,
+            "GL Total": _gl_amt,
+            "POS Total": _pos_amt,
+            "Difference": _pos_amt - _gl_amt,
+        })
+    gl_summary = pd.DataFrame(_gl_summary_rows, columns=["GL Account", "GL Name", "GL Total", "POS Total", "Difference"])
+
     chronic_stores = detect_chronic_exception_stores(bucket_summary)
     duplicate_dates = detect_duplicate_date_signature(bucket_summary)
 
     return {"detail": d, "matched": matched, "exceptions": exc, "unmatched_gl": unmatched_gl,
             "bucket_summary": bucket_summary, "top_exceptions": top_exceptions, "summary": summary,
+            "store_summary": store_summary, "gl_summary": gl_summary,
             "chronic_stores": chronic_stores, "duplicate_dates": duplicate_dates}
