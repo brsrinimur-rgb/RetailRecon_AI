@@ -175,16 +175,6 @@ def validate_commission_transactions(
             else 0.0
         )
 
-        # Keep the existing commission status semantics first.
-        if commission_variance > tolerance:
-            return "OVERCHARGED"
-        if commission_variance < -tolerance:
-            return "UNDERCHARGED"
-
-        # V46B adds VAT to the same finance control status.
-        if abs(vat_variance) > tolerance:
-            return "VAT VARIANCE"
-
         if (
             float(row["Actual Commission"]) == 0.0
             and float(row["Expected Commission"]) > tolerance
@@ -197,6 +187,12 @@ def validate_commission_transactions(
             and float(row["Expected VAT"]) > tolerance
         ):
             return "SOURCE VAT MISSING"
+
+        if abs(commission_variance) > tolerance:
+            return "COMMISSION VARIANCE — REVIEW"
+
+        if abs(vat_variance) > tolerance:
+            return "VAT VARIANCE"
 
         return "OK"
 
