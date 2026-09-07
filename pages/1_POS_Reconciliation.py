@@ -16,6 +16,13 @@ try:
 except Exception:
     pos_auto_mapper = None
 
+# Store 613 TAP Gateway rule is an additive reconciliation extension.
+# core.reconcile() remains unchanged/frozen.
+try:
+    import store613_logic
+except Exception:
+    store613_logic = None
+
 
 st.set_page_config(
     page_title="POS Reconciliation - Retail Control Tower",
@@ -50,11 +57,12 @@ _core_hash = hashlib.sha1(
 _uses_old_parser = "pd.read_csv" in _core_source
 
 with st.expander("🛠️ Deployment Diagnostic", expanded=False):
-    d1, d2, d3, d4 = st.columns(4)
+    d1, d2, d3, d4, d5 = st.columns(5)
     d1.metric("Page Build", DEPLOYMENT_BUILD)
     d2.metric("core.py Hash", _core_hash)
     d3.metric("Old pd.read_csv Path", "YES ❌" if _uses_old_parser else "NO ✅")
     d4.metric("Universal POS Mapper", "LOADED ✅" if pos_auto_mapper else "MISSING ❌")
+    d5.metric("Store 613 TAP Rule", "LOADED ✅" if store613_logic else "MISSING ❌")
 
     st.write("**Loaded core.py:**")
     st.code(str(_core_file))
@@ -206,6 +214,260 @@ def _normalize_pos_universal(df, source_file: str, forced=None):
     }
 
 
+
+# ---------------------------------------------------------------------
+# Store 613 TAP Gateway additive pre-match
+# ---------------------------------------------------------------------
+def _tap613_provider_mask(pos: pd.DataFrame) -> pd.Series:
+    """Identify normalized Store 613 TAP-provider rows without changing them."""
+    if pos is None or pos.empty:
+        return pd.Series(False, index=getattr(pos, "index", pd.Index([])), dtype=bool)
+
+    store = pos.get("POS Store", pd.Series("", index=pos.index)).astype(str).str.strip()
+    provider = pos.get("Provider", pd.Series("", index=pos.index)).astype(str).str.strip().str.upper()
+    payment = pos.get("POS Payment", pd.Series("", index=pos.index)).astype(str).str.strip().str.upper()
+    source = pos.get("Source File", pd.Series("", index=pos.index)).astype(str).str.upper()
+
+    is_tap = (
+        provider.eq("TAP")
+        | payment.eq("TAP")
+        | source.str.contains(r"(^|[^A-Z])TAP([^A-Z]|$)", regex=True, na=False)
+        | source.str.contains("CHARGE_", regex=False, na=False)
+    )
+    return store.eq("613") & is_tap
+
+
+def _tap613_match_row(s, p, tap_result):
+    """
+    Build one standard matched row after BOTH controls are proven:
+      1) TAP reference_order -> D365 Sales Details Receipt ID
+         and TAP gross = Sales Details Net x 1.15
+      2) The same Receipt ID resolves to exactly one D365 Store Tender row
+         whose amount is within the page's approved reconciliation tolerance.
+    """
+    payment = core._norm_payment(s.get("D365 Payment", ""))
+    d365_amount = float(pd.to_numeric(pd.Series([s.get("D365 Amount")]), errors="coerce").iloc[0])
+    pos_amount = float(pd.to_numeric(pd.Series([p.get("POS Amount")]), errors="coerce").iloc[0])
+    diff = round(d365_amount - pos_amount, 2)
+
+    return {
+        "Unique Transaction ID": s.get("Unique Transaction ID", ""),
+        "Store Code": s.get("Store Code", ""),
+        "Date": s.get("Date", pd.NaT),
+        "Receipt ID": s.get("Receipt ID", ""),
+        "Auth Code": s.get("Auth Code", ""),
+        "Sales Order": s.get("Sales Order", ""),
+        "SalesDetails Bridge Status": s.get("SalesDetails Bridge Status", ""),
+        "SalesDetails Source": s.get("SalesDetails Source", ""),
+        "StoreTender Reference": s.get("StoreTender Reference", ""),
+        "Provider Reference": p.get("Provider Reference", p.get("Auth Code", "")),
+        "Provider Reference Key": str(p.get("Provider Reference", p.get("Auth Code", ""))).strip(),
+        "Payment Type": payment,
+        "D365 Amount": s.get("D365 Amount"),
+        "POS Amount": p.get("POS Amount"),
+        "Net Amount": p.get("Net Amount"),
+        "Commission": p.get("Commission", 0.0),
+        "VAT": p.get("VAT", 0.0),
+        "Difference": diff,
+        "Status": "Matched",
+        "Match Rule": (
+            "TAP Store 613: reference_order -> D365 Receipt ID + "
+            "SalesDetails Net x 1.15 + D365 Tender Amount"
+        ),
+        "Auto Resolution Status": "Store 613 TAP Evidence Rule",
+        "POS Date": p.get("POS Date", pd.NaT),
+        "Posting Date": p.get("Posting Date", pd.NaT),
+        "Settlement Delay Days": p.get("Settlement Delay Days", pd.NA),
+        "Terminal ID": p.get("Terminal ID", ""),
+        "Source File": p.get("Source File", ""),
+        "D365 Duplicate": bool(s.get("D365 Duplicate", False)),
+        "POS Duplicate": bool(p.get("POS Duplicate", False)),
+        "Exact POS Repeat Count": p.get("Exact POS Repeat Count", 1),
+        "Exact POS Repeat Collapsed": p.get("Exact POS Repeat Collapsed", False),
+        "Bank Settled": False,
+        "Bank Name": "",
+        "Bank Date": pd.NaT,
+        "Bank Amount": pd.NA,
+        # Additive audit evidence.
+        "TAP 613 Status": tap_result.get("Status", ""),
+        "TAP Reference Order": tap_result.get("TAP Reference Order", ""),
+        "D365 SalesDetails Net Amount": tap_result.get("D365 Net Amount"),
+        "Expected TAP Gross": tap_result.get("Expected TAP Gross"),
+        "TAP Gross Difference": tap_result.get("Amount Difference"),
+    }
+
+
+def _apply_store613_tap_pre_match(tender, pos, sales_details, tolerance):
+    """
+    Resolve the evidence-backed Store 613 TAP cases BEFORE the frozen
+    core.reconcile() call.
+
+    Clean proven matches are consumed and appended back to the final Matched
+    result. TAP amount-review / posting-window cases are held out of the
+    legacy matcher so they cannot be accidentally auto-matched by a weaker
+    Date + Amount fallback.
+
+    Returns:
+        special_matched,
+        tender_for_legacy,
+        pos_for_legacy,
+        special_unmatched_pos,
+        audit
+    """
+    empty = pd.DataFrame()
+
+    if (
+        store613_logic is None
+        or tender is None or tender.empty
+        or pos is None or pos.empty
+        or sales_details is None or sales_details.empty
+    ):
+        return empty, tender, pos, empty, empty
+
+    mask = _tap613_provider_mask(pos)
+    tap_pos = pos[mask].copy()
+    if tap_pos.empty:
+        return empty, tender, pos, empty, empty
+
+    # The matcher consumes business-column names. Provider Reference preserves
+    # the original TAP reference_order from core.normalize_pos().
+    tap_input = pd.DataFrame({
+        "Store Code": tap_pos["POS Store"].astype(str).str.strip(),
+        "reference_order": tap_pos.get(
+            "Provider Reference",
+            tap_pos.get("Auth Code", pd.Series("", index=tap_pos.index))
+        ).astype(str).str.strip(),
+        "Amount": pd.to_numeric(tap_pos["POS Amount"], errors="coerce"),
+        "Transaction Date": pd.to_datetime(tap_pos.get("POS Date"), errors="coerce"),
+    })
+
+    sd613 = sales_details[
+        sales_details["Store Code"].astype(str).str.strip().eq("613")
+    ].copy()
+
+    audit = store613_logic.match_tap_gateway(
+        tap_input.reset_index(drop=True),
+        sd613.reset_index(drop=True),
+        amount_tolerance=0.02,
+    )
+
+    if audit is None or audit.empty:
+        return empty, tender, pos, empty, empty
+
+    audit = audit.reset_index(drop=True)
+    audit["POS Source Index"] = list(tap_pos.index)
+    audit["Source File"] = [
+        tap_pos.loc[i].get("Source File", "") for i in tap_pos.index
+    ]
+
+    consumed_tender = set()
+    consumed_pos = set()
+    held_pos = set()
+    special_rows = []
+    audit_status = []
+    audit_reason = []
+
+    for _, a in audit.iterrows():
+        pos_idx = a["POS Source Index"]
+        p = pos.loc[pos_idx]
+        status = str(a.get("Status", "")).strip()
+
+        if status != "MATCHED_TAP_ORDER_GROSS":
+            held_pos.add(pos_idx)
+            audit_status.append(status)
+            audit_reason.append(str(a.get("Reason", "")))
+            continue
+
+        receipt = str(a.get("D365 Receipt ID", "")).strip()
+        candidates = tender[
+            (~tender.index.isin(consumed_tender))
+            & tender["Store Code"].astype(str).str.strip().eq("613")
+            & tender["Receipt ID"].astype(str).str.strip().str.upper().eq(receipt.upper())
+        ].copy()
+
+        # Final accounting control: Sales Details evidence must resolve to one
+        # D365 Store Tender amount compatible with the TAP gross amount.
+        if not candidates.empty:
+            candidates["_TAP_DIFF"] = (
+                pd.to_numeric(candidates["D365 Amount"], errors="coerce")
+                - float(p.get("POS Amount", 0.0))
+            ).abs()
+            within = candidates[candidates["_TAP_DIFF"] <= float(tolerance)].copy()
+        else:
+            within = pd.DataFrame()
+
+        if len(within) == 1:
+            tender_idx = within.index[0]
+            s = tender.loc[tender_idx]
+            special_rows.append(_tap613_match_row(s, p, a))
+            consumed_tender.add(tender_idx)
+            consumed_pos.add(pos_idx)
+            audit_status.append("MATCHED_TAP_ORDER_GROSS")
+            audit_reason.append("Sales Details proof linked uniquely to D365 Store Tender.")
+        else:
+            # Do not guess when Receipt ID maps to zero/multiple eligible tender rows.
+            held_pos.add(pos_idx)
+            audit_status.append("REVIEW_D365_TENDER_LINK")
+            if candidates.empty:
+                audit_reason.append(
+                    "TAP/Sales Details match is proven, but no Store 613 D365 Store Tender "
+                    "row was found for the Receipt ID."
+                )
+            elif len(within) == 0:
+                audit_reason.append(
+                    "TAP/Sales Details match is proven, but D365 Store Tender amount "
+                    "does not satisfy the approved reconciliation tolerance."
+                )
+            else:
+                audit_reason.append(
+                    "TAP/Sales Details match is proven, but multiple D365 Store Tender "
+                    "rows satisfy the same Receipt ID and amount."
+                )
+
+    audit["Final TAP 613 Status"] = audit_status
+    audit["Final TAP 613 Reason"] = audit_reason
+
+    special_matched = pd.DataFrame(special_rows)
+
+    tender_for_legacy = tender.drop(index=list(consumed_tender), errors="ignore").copy()
+    pos_for_legacy = pos.drop(
+        index=list(consumed_pos | held_pos), errors="ignore"
+    ).copy()
+
+    # Hold specialized exceptions out of the weaker legacy fallback and return
+    # them as explicit finance exceptions.
+    held_rows = []
+    for _, a in audit.iterrows():
+        final_status = str(a.get("Final TAP 613 Status", "")).strip()
+        if final_status == "MATCHED_TAP_ORDER_GROSS":
+            continue
+
+        pos_idx = a["POS Source Index"]
+        if pos_idx not in pos.index:
+            continue
+
+        rr = pos.loc[pos_idx].to_dict()
+        rr["TAP 613 Status"] = final_status
+        rr["Exception Status"] = final_status
+        rr["Reason"] = a.get("Final TAP 613 Reason", a.get("Reason", ""))
+        rr["TAP Reference Order"] = a.get("TAP Reference Order", "")
+        rr["D365 Receipt ID"] = a.get("D365 Receipt ID", "")
+        rr["D365 SalesDetails Net Amount"] = a.get("D365 Net Amount")
+        rr["Expected TAP Gross"] = a.get("Expected TAP Gross")
+        rr["TAP Gross Difference"] = a.get("Amount Difference")
+        held_rows.append(rr)
+
+    special_unmatched_pos = pd.DataFrame(held_rows)
+
+    return (
+        special_matched,
+        tender_for_legacy,
+        pos_for_legacy,
+        special_unmatched_pos,
+        audit,
+    )
+
+
 # ---------------------------------------------------------------------
 # Navigation / control center
 # ---------------------------------------------------------------------
@@ -353,11 +615,13 @@ st.info(
     "Universal POS Import is active on this page. Existing formats run through "
     "the proven parser first. Confirmed ADCB / NBK / ANB HIVE adapters are additive "
     "fallbacks. Unknown layouts are processed only when Auth + Amount are mapped "
-    "and confidence is at least 70%. The reconciliation engine itself is unchanged."
+    "and confidence is at least 70%. Store 613 TAP Gateway uses the additive "
+    "reference_order → D365 Receipt ID + Net Amount × 1.15 evidence rule when "
+    "D365 Sales Details are uploaded. The frozen core.reconcile() engine remains unchanged."
 )
 
 uploads = st.file_uploader(
-    "Upload D365 Store Tender + POS/AMEX/Tabby/Tamara/Tap/Universal POS files",
+    "Upload D365 Store Tender + D365 Sales Details + POS/AMEX/Tabby/Tamara/Tap/Universal POS files",
     type=["xlsx", "xls", "csv"],
     accept_multiple_files=True,
 )
@@ -375,6 +639,7 @@ prev_cf = st.file_uploader(
 if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
     try:
         tender_parts = []
+        sales_details_parts = []
         pos_parts = []
         quarantine = []
         import_audit = []
@@ -404,6 +669,38 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
                         "Rows": len(df),
                         "Safety": "Tender source",
                     })
+                    continue
+
+                if typ == "D365 SALES DETAILS":
+                    if store613_logic is None:
+                        quarantine.append({
+                            "File": f.name,
+                            "Sheet": sheet,
+                            "Type": "STORE613_EXTENSION_MISSING",
+                            "Reason": (
+                                "D365 Sales Details detected but store613_logic.py "
+                                "is not loaded on this deployment."
+                            ),
+                        })
+                    else:
+                        sd = store613_logic.normalize_sales_details(
+                            df, source=f"{f.name}-{sheet}"
+                        )
+                        if sd is not None and not sd.empty:
+                            sales_details_parts.append(sd)
+                        import_audit.append({
+                            "File": f.name,
+                            "Sheet": sheet,
+                            "Classified As": typ,
+                            "Import Mode": "D365 SALES DETAILS PARSER",
+                            "Detected Format": "D365 SALES DETAILS",
+                            "Confidence": 100.0,
+                            "Rows": len(sd) if sd is not None else 0,
+                            "Safety": (
+                                "Store 613 additive bridge; Net Amount preserved "
+                                "for TAP gross validation"
+                            ),
+                        })
                     continue
 
                 # Existing recognized POS/provider types.
@@ -487,7 +784,22 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
             )
 
         tender = pd.concat(tender_parts, ignore_index=True)
+        sales_details = (
+            pd.concat(sales_details_parts, ignore_index=True)
+            if sales_details_parts else pd.DataFrame()
+        )
         pos = pd.concat(pos_parts, ignore_index=True) if pos_parts else pd.DataFrame()
+
+        # Existing Store 613 Sales Order -> Sales Details enrichment remains intact.
+        sales_details_bridge_audit = pd.DataFrame()
+        if (
+            store613_logic is not None
+            and not tender.empty
+            and not sales_details.empty
+        ):
+            tender, sales_details_bridge_audit = store613_logic.enrich_tender(
+                tender, sales_details
+            )
 
         # Existing store-resolution priority remains unchanged.
         store_master = db.load_store_mapping_master()
@@ -502,8 +814,44 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
         if not pos.empty:
             pos = core.apply_terminal_master(pos, terminal_master)
 
-        # FROZEN ACCOUNTING MATCH ENGINE.
-        matched, us, up = core.reconcile(tender, pos, tolerance)
+        # -------------------------------------------------------------
+        # ADDITIVE Store 613 TAP evidence rule.
+        # Clean proven Store 613 TAP rows are resolved first; review/pending
+        # rows are protected from weaker legacy fallbacks.
+        # core.reconcile() itself remains unchanged/frozen.
+        # -------------------------------------------------------------
+        (
+            tap613_matched,
+            tender_for_legacy,
+            pos_for_legacy,
+            tap613_unmatched_pos,
+            tap613_audit,
+        ) = _apply_store613_tap_pre_match(
+            tender, pos, sales_details, tolerance
+        )
+
+        # FROZEN ACCOUNTING MATCH ENGINE for every remaining transaction.
+        matched_legacy, us, up_legacy = core.reconcile(
+            tender_for_legacy, pos_for_legacy, tolerance
+        )
+
+        matched_parts = [
+            x for x in (tap613_matched, matched_legacy)
+            if x is not None and not x.empty
+        ]
+        matched = (
+            pd.concat(matched_parts, ignore_index=True, sort=False)
+            if matched_parts else pd.DataFrame()
+        )
+
+        unmatched_pos_parts = [
+            x for x in (tap613_unmatched_pos, up_legacy)
+            if x is not None and not x.empty
+        ]
+        up = (
+            pd.concat(unmatched_pos_parts, ignore_index=True, sort=False)
+            if unmatched_pos_parts else pd.DataFrame()
+        )
 
         banks = []
         bank_skipped = []
@@ -564,6 +912,9 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
             "bank": bank,
             "quarantine": qdf,
             "pos_import_audit": import_audit_df,
+            "sales_details": sales_details,
+            "sales_details_bridge_audit": sales_details_bridge_audit,
+            "tap613_audit": tap613_audit,
         }
         st.success(
             "Reconciliation completed. Universal POS import audit is available below."
@@ -579,6 +930,8 @@ if r:
     us = r["unmatched_sales"]
     up = r["unmatched_pos"]
     ia = r.get("pos_import_audit", pd.DataFrame())
+    tap613_audit = r.get("tap613_audit", pd.DataFrame())
+    sd_bridge_audit = r.get("sales_details_bridge_audit", pd.DataFrame())
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Matched / Review", len(m))
@@ -607,6 +960,24 @@ if r:
             if "Detected Format" in ia.columns else 0,
         )
 
+    if not tap613_audit.empty:
+        st.subheader("Store 613 TAP Gateway Control")
+        t1, t2, t3, t4 = st.columns(4)
+        final_status = tap613_audit["Final TAP 613 Status"].astype(str)
+        t1.metric("TAP 613 Rows", len(tap613_audit))
+        t2.metric(
+            "Order + Gross Matched",
+            int(final_status.eq("MATCHED_TAP_ORDER_GROSS").sum()),
+        )
+        t3.metric(
+            "Amount Review",
+            int(final_status.eq("REVIEW_TAP_AMOUNT").sum()),
+        )
+        t4.metric(
+            "Pending D365 Posting",
+            int(final_status.eq("PENDING_D365_POSTING").sum()),
+        )
+
     tabs = st.tabs([
         "Matched",
         "Unmatched D365",
@@ -614,6 +985,8 @@ if r:
         "Carry Forward",
         "Quarantine",
         "POS Import Audit",
+        "TAP 613 Audit",
+        "SalesDetails Bridge Audit",
     ])
 
     with tabs[0]:
@@ -628,6 +1001,10 @@ if r:
         st.dataframe(r["quarantine"], use_container_width=True, hide_index=True)
     with tabs[5]:
         st.dataframe(ia, use_container_width=True, hide_index=True)
+    with tabs[6]:
+        st.dataframe(tap613_audit, use_container_width=True, hide_index=True)
+    with tabs[7]:
+        st.dataframe(sd_bridge_audit, use_container_width=True, hide_index=True)
 
     blob = report_export.create_reconciliation_pack(r, tolerance)
     st.download_button(
