@@ -7,9 +7,16 @@ New Store 613 logic extends this module without removing the proven bridge.
 TAP Gateway evidence-backed rule:
     TAP reference_order -> D365 Sales Details Receipt ID
     TAP Amount ~= D365 Net Amount * 1.15
+
+Important:
+    core.py remains unchanged.
+    Existing normalize/enrichment behavior is preserved.
+    This facade only adds the Sales Details Net Amount needed for the
+    TAP Store 613 gross-amount validation.
 """
 from __future__ import annotations
 
+import pandas as pd
 import core
 
 from tap_store613_matcher import (
@@ -22,9 +29,67 @@ from tap_store613_matcher import (
 
 def normalize_sales_details(df, source="D365 Sales Details"):
     """
-    Preserve the existing Store 613 Sales Details normalization.
+    Preserve core.normalize_sales_details() and add D365 Net Amount.
+
+    The existing core normalizer intentionally owns the proven Store 613
+    Sales Order / Receipt / Auth bridge. We call it first and do not replace
+    any of its logic.
+
+    Additional evidence retained here:
+        Net Amount
+
+    The value is copied from the same raw Sales Details source row by using
+    the existing "SalesDetails Row" audit identifier, so no transaction is
+    guessed or re-keyed.
     """
-    return core.normalize_sales_details(df, source)
+    out = core.normalize_sales_details(df, source)
+
+    if out is None:
+        return out
+
+    out = out.copy()
+
+    # Always expose a stable column for the TAP matcher.
+    if "Net Amount" not in out.columns:
+        out["Net Amount"] = pd.NA
+
+    if df is None or getattr(df, "empty", True) or out.empty:
+        return out
+
+    # Use the same column-normalization helpers already used by core.py.
+    d = core.norm_cols(df)
+
+    net_col = core.find(
+        d,
+        [
+            "net amount",
+            "net_amount",
+            "sales net amount",
+            "net sales amount",
+            "line net amount",
+            "net",
+        ],
+    )
+
+    # If this Sales Details layout has no Net Amount, preserve legacy output
+    # and leave the new field blank. The TAP matcher will classify the row
+    # for amount review rather than guessing.
+    if not net_col:
+        return out
+
+    net_by_source_row = {}
+    for i, r in d.iterrows():
+        value = core.amount(r.get(net_col))
+        net_by_source_row[i + 1] = value
+
+    if "SalesDetails Row" in out.columns:
+        out["Net Amount"] = out["SalesDetails Row"].map(net_by_source_row)
+    else:
+        # Defensive fallback only. Current core normalizer includes this field.
+        # Do not perform a business-key merge that could create false matches.
+        out["Net Amount"] = pd.NA
+
+    return out
 
 
 def enrich_tender(tender, sales_details):
@@ -98,6 +163,7 @@ def engine_health():
         "legacy_preserved": True,
         "bridge_key": "Store Code 613 + Sales Order",
         "extension_mode": "wrapper / additive",
+        "sales_details_net_amount_preserved": True,
         "tap_store613_enabled": True,
         "tap_match_key": "TAP reference_order -> D365 Receipt ID",
         "tap_amount_rule": "D365 Net Amount x 1.15",
