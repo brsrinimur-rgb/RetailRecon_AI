@@ -43,7 +43,7 @@ st.markdown(
 # ---------------------------------------------------------------------
 # DEPLOYMENT DIAGNOSTIC
 # ---------------------------------------------------------------------
-DEPLOYMENT_BUILD = "POS_RECON_TAP613_MERCHANT301086_2026_09_08_V2"
+DEPLOYMENT_BUILD = "POS_RECON_TAP613_MERCHANT301086_2026_09_08_V3"
 
 try:
     _core_source = inspect.getsource(core.read_upload)
@@ -810,54 +810,86 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
         if not pos.empty:
             pos = core.apply_merchant_master(pos, merchant_master)
 
+        terminal_master = db.load_terminal_master()
+        if not pos.empty:
+            pos = core.apply_terminal_master(pos, terminal_master)
+
             # CONFIRMED TAP MERCHANT FALLBACK - additive evidence rule.
+            #
+            # Important correction:
+            # Existing mapping controls can populate unresolved rows with the
+            # literal sentinel "⚠ MERCHANT MAPPING REQUIRED" instead of leaving
+            # POS Store blank. Therefore this rule must run AFTER the normal
+            # merchant + terminal mapping controls and treat that sentinel as
+            # unresolved.
+            #
             # Merchant 301086 belongs to Store 613 (Aigner KSA Online).
-            # Apply only when the normal Merchant ID Master has not already
-            # resolved the row. Merchant 301090 and all other merchants remain
-            # untouched and continue through the existing mapping controls.
+            # Merchant 301090 and all other merchants remain untouched.
+            _store = pos.get(
+                "POS Store", pd.Series("", index=pos.index)
+            ).fillna("").astype(str).str.strip()
+
+            _unresolved_store = (
+                _store.eq("")
+                | _store.str.upper().str.contains(
+                    "MERCHANT MAPPING REQUIRED", regex=False, na=False
+                )
+                | _store.str.upper().str.contains(
+                    "MAPPING REQUIRED", regex=False, na=False
+                )
+                | _store.str.upper().eq("UNMAPPED")
+            )
+
             if "Merchant ID" in pos.columns:
                 _merchant = (
                     pos["Merchant ID"]
+                    .fillna("")
                     .astype(str)
                     .str.strip()
                     .str.replace(r"\.0$", "", regex=True)
                 )
-                _store = pos.get(
-                    "POS Store", pd.Series("", index=pos.index)
-                ).fillna("").astype(str).str.strip()
+                _merchant_301086 = _merchant.eq("301086")
+            else:
+                _merchant_301086 = pd.Series(False, index=pos.index)
 
-                _m301086 = _merchant.eq("301086") & _store.eq("")
-                if _m301086.any():
-                    pos.loc[_m301086, "POS Store"] = "613"
+            # Defensive evidence fallback: the confirmed TAP charge filename
+            # itself contains merchant 301086. This is used only when the
+            # normalized Merchant ID column did not retain the value.
+            _source = pos.get(
+                "Source File", pd.Series("", index=pos.index)
+            ).fillna("").astype(str).str.strip()
+            _source_301086 = _source.str.contains(
+                "_301086_", regex=False, na=False
+            )
 
-                    if "Store Mapping Source" not in pos.columns:
-                        pos["Store Mapping Source"] = ""
-                    pos.loc[
-                        _m301086, "Store Mapping Source"
-                    ] = "CONFIRMED TAP MERCHANT 301086 -> STORE 613"
+            _m301086 = (_merchant_301086 | _source_301086) & _unresolved_store
 
-                    if "Store Mapping Status" in pos.columns:
-                        pos.loc[
-                            _m301086, "Store Mapping Status"
-                        ] = "Mapped"
+            if _m301086.any():
+                pos.loc[_m301086, "POS Store"] = "613"
 
-                    import_audit.append({
-                        "File": "Confirmed Merchant Mapping",
-                        "Sheet": "Runtime Control",
-                        "Classified As": "STORE MAPPING",
-                        "Import Mode": "CONFIRMED MERCHANT FALLBACK",
-                        "Detected Format": "TAP MERCHANT 301086",
-                        "Confidence": 100.0,
-                        "Rows": int(_m301086.sum()),
-                        "Safety": (
-                            "301086 -> Store 613 only when existing mapping "
-                            "has not already resolved the POS Store"
-                        ),
-                    })
+                if "Store Mapping Source" not in pos.columns:
+                    pos["Store Mapping Source"] = ""
+                pos.loc[
+                    _m301086, "Store Mapping Source"
+                ] = "CONFIRMED TAP MERCHANT 301086 -> STORE 613"
 
-        terminal_master = db.load_terminal_master()
-        if not pos.empty:
-            pos = core.apply_terminal_master(pos, terminal_master)
+                if "Store Mapping Status" not in pos.columns:
+                    pos["Store Mapping Status"] = ""
+                pos.loc[_m301086, "Store Mapping Status"] = "Mapped"
+
+                import_audit.append({
+                    "File": "Confirmed Merchant Mapping",
+                    "Sheet": "Runtime Control",
+                    "Classified As": "STORE MAPPING",
+                    "Import Mode": "CONFIRMED MERCHANT FALLBACK",
+                    "Detected Format": "TAP MERCHANT 301086",
+                    "Confidence": 100.0,
+                    "Rows": int(_m301086.sum()),
+                    "Safety": (
+                        "301086 -> Store 613 after normal merchant/terminal mapping; "
+                        "only unresolved mapping-required rows are changed"
+                    ),
+                })
 
         # -------------------------------------------------------------
         # ADDITIVE Store 613 TAP evidence rule.
