@@ -43,7 +43,7 @@ st.markdown(
 # ---------------------------------------------------------------------
 # DEPLOYMENT DIAGNOSTIC
 # ---------------------------------------------------------------------
-DEPLOYMENT_BUILD = "POS_RECON_UNIVERSAL_IMPORT_2026_08_28_V1"
+DEPLOYMENT_BUILD = "POS_RECON_TAP613_MERCHANT301086_2026_09_08_V2"
 
 try:
     _core_source = inspect.getsource(core.read_upload)
@@ -809,6 +809,51 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
         merchant_master = db.load_merchant_master()
         if not pos.empty:
             pos = core.apply_merchant_master(pos, merchant_master)
+
+            # CONFIRMED TAP MERCHANT FALLBACK - additive evidence rule.
+            # Merchant 301086 belongs to Store 613 (Aigner KSA Online).
+            # Apply only when the normal Merchant ID Master has not already
+            # resolved the row. Merchant 301090 and all other merchants remain
+            # untouched and continue through the existing mapping controls.
+            if "Merchant ID" in pos.columns:
+                _merchant = (
+                    pos["Merchant ID"]
+                    .astype(str)
+                    .str.strip()
+                    .str.replace(r"\.0$", "", regex=True)
+                )
+                _store = pos.get(
+                    "POS Store", pd.Series("", index=pos.index)
+                ).fillna("").astype(str).str.strip()
+
+                _m301086 = _merchant.eq("301086") & _store.eq("")
+                if _m301086.any():
+                    pos.loc[_m301086, "POS Store"] = "613"
+
+                    if "Store Mapping Source" not in pos.columns:
+                        pos["Store Mapping Source"] = ""
+                    pos.loc[
+                        _m301086, "Store Mapping Source"
+                    ] = "CONFIRMED TAP MERCHANT 301086 -> STORE 613"
+
+                    if "Store Mapping Status" in pos.columns:
+                        pos.loc[
+                            _m301086, "Store Mapping Status"
+                        ] = "Mapped"
+
+                    import_audit.append({
+                        "File": "Confirmed Merchant Mapping",
+                        "Sheet": "Runtime Control",
+                        "Classified As": "STORE MAPPING",
+                        "Import Mode": "CONFIRMED MERCHANT FALLBACK",
+                        "Detected Format": "TAP MERCHANT 301086",
+                        "Confidence": 100.0,
+                        "Rows": int(_m301086.sum()),
+                        "Safety": (
+                            "301086 -> Store 613 only when existing mapping "
+                            "has not already resolved the POS Store"
+                        ),
+                    })
 
         terminal_master = db.load_terminal_master()
         if not pos.empty:
