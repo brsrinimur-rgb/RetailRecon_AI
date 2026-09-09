@@ -43,7 +43,7 @@ st.markdown(
 # ---------------------------------------------------------------------
 # DEPLOYMENT DIAGNOSTIC
 # ---------------------------------------------------------------------
-DEPLOYMENT_BUILD = "POS_RECON_TAP613_AGG_NET_SALESORDER_2026_09_08_V4"
+DEPLOYMENT_BUILD = "POS_RECON_TAP613_MERCHANT301086_2026_09_08_V3"
 
 try:
     _core_source = inspect.getsource(core.read_upload)
@@ -241,10 +241,9 @@ def _tap613_match_row(s, p, tap_result):
     """
     Build one standard matched row after BOTH controls are proven:
       1) TAP reference_order -> D365 Sales Details Receipt ID
-         and TAP gross = SUM(Sales Details Net) x 1.15
-      2) Sales Details provides the D365 Sales Order.
-      3) Store 613 + Sales Order resolves to exactly one eligible D365
-         Store Tender row whose amount satisfies the approved tolerance.
+         and TAP gross = Sales Details Net x 1.15
+      2) The same Receipt ID resolves to exactly one D365 Store Tender row
+         whose amount is within the page's approved reconciliation tolerance.
     """
     payment = core._norm_payment(s.get("D365 Payment", ""))
     d365_amount = float(pd.to_numeric(pd.Series([s.get("D365 Amount")]), errors="coerce").iloc[0])
@@ -273,7 +272,7 @@ def _tap613_match_row(s, p, tap_result):
         "Status": "Matched",
         "Match Rule": (
             "TAP Store 613: reference_order -> D365 Receipt ID + "
-            "SUM(SalesDetails Net) x 1.15 + Store 613/Sales Order -> D365 Tender"
+            "SalesDetails Net x 1.15 + D365 Tender Amount"
         ),
         "Auto Resolution Status": "Store 613 TAP Evidence Rule",
         "POS Date": p.get("POS Date", pd.NaT),
@@ -293,8 +292,6 @@ def _tap613_match_row(s, p, tap_result):
         "TAP 613 Status": tap_result.get("Status", ""),
         "TAP Reference Order": tap_result.get("TAP Reference Order", ""),
         "D365 SalesDetails Net Amount": tap_result.get("D365 Net Amount"),
-        "D365 Sales Order": tap_result.get("D365 Sales Order", ""),
-        "SalesDetails Line Count": tap_result.get("SalesDetails Line Count", pd.NA),
         "Expected TAP Gross": tap_result.get("Expected TAP Gross"),
         "TAP Gross Difference": tap_result.get("Amount Difference"),
     }
@@ -381,34 +378,21 @@ def _apply_store613_tap_pre_match(tender, pos, sales_details, tolerance):
             audit_reason.append(str(a.get("Reason", "")))
             continue
 
-        sales_order = str(a.get("D365 Sales Order", "") or "").strip()
+        receipt = str(a.get("D365 Receipt ID", "")).strip()
+        candidates = tender[
+            (~tender.index.isin(consumed_tender))
+            & tender["Store Code"].astype(str).str.strip().eq("613")
+            & tender["Receipt ID"].astype(str).str.strip().str.upper().eq(receipt.upper())
+        ].copy()
 
-        # Confirmed Store 613 bridge:
-        # Sales Details Sales Order -> Store Tender Sales Order.
-        #
-        # Do NOT use Store Tender Receipt ID here: for Store 613 the proven
-        # accounting evidence is Store Code + Sales Order.
-        if sales_order and "Sales Order" in tender.columns:
-            candidates = tender[
-                (~tender.index.isin(consumed_tender))
-                & tender["Store Code"].astype(str).str.strip().eq("613")
-                & tender["Sales Order"].fillna("").astype(str).str.strip().str.upper().eq(
-                    sales_order.upper()
-                )
-            ].copy()
-        else:
-            candidates = pd.DataFrame()
-
-        # Final accounting control: the Sales Order bridge must resolve to one
-        # Store Tender row whose accounting amount agrees with the TAP gross.
+        # Final accounting control: Sales Details evidence must resolve to one
+        # D365 Store Tender amount compatible with the TAP gross amount.
         if not candidates.empty:
             candidates["_TAP_DIFF"] = (
                 pd.to_numeric(candidates["D365 Amount"], errors="coerce")
                 - float(p.get("POS Amount", 0.0))
             ).abs()
-            within = candidates[
-                candidates["_TAP_DIFF"] <= float(tolerance)
-            ].copy()
+            within = candidates[candidates["_TAP_DIFF"] <= float(tolerance)].copy()
         else:
             within = pd.DataFrame()
 
@@ -419,34 +403,25 @@ def _apply_store613_tap_pre_match(tender, pos, sales_details, tolerance):
             consumed_tender.add(tender_idx)
             consumed_pos.add(pos_idx)
             audit_status.append("MATCHED_TAP_ORDER_GROSS")
-            audit_reason.append(
-                "TAP Receipt/gross proof linked uniquely to D365 Store Tender "
-                "through Store 613 + Sales Order."
-            )
+            audit_reason.append("Sales Details proof linked uniquely to D365 Store Tender.")
         else:
-            # Never guess zero or multiple accounting candidates.
+            # Do not guess when Receipt ID maps to zero/multiple eligible tender rows.
             held_pos.add(pos_idx)
             audit_status.append("REVIEW_D365_TENDER_LINK")
-
-            if not sales_order:
+            if candidates.empty:
                 audit_reason.append(
-                    "TAP/Sales Details gross proof is present, but a unique D365 "
-                    "Sales Order could not be derived from Sales Details."
-                )
-            elif candidates.empty:
-                audit_reason.append(
-                    "TAP/Sales Details gross proof is present, but no Store 613 "
-                    f"D365 Store Tender row was found for Sales Order {sales_order}."
+                    "TAP/Sales Details match is proven, but no Store 613 D365 Store Tender "
+                    "row was found for the Receipt ID."
                 )
             elif len(within) == 0:
                 audit_reason.append(
-                    "Store 613 + Sales Order was found in D365 Store Tender, but "
-                    "the Store Tender amount does not satisfy the approved tolerance."
+                    "TAP/Sales Details match is proven, but D365 Store Tender amount "
+                    "does not satisfy the approved reconciliation tolerance."
                 )
             else:
                 audit_reason.append(
-                    "Multiple Store 613 D365 Store Tender rows satisfy the same "
-                    "Sales Order and amount; no row was guessed."
+                    "TAP/Sales Details match is proven, but multiple D365 Store Tender "
+                    "rows satisfy the same Receipt ID and amount."
                 )
 
     audit["Final TAP 613 Status"] = audit_status
@@ -477,8 +452,6 @@ def _apply_store613_tap_pre_match(tender, pos, sales_details, tolerance):
         rr["Reason"] = a.get("Final TAP 613 Reason", a.get("Reason", ""))
         rr["TAP Reference Order"] = a.get("TAP Reference Order", "")
         rr["D365 Receipt ID"] = a.get("D365 Receipt ID", "")
-        rr["D365 Sales Order"] = a.get("D365 Sales Order", "")
-        rr["SalesDetails Line Count"] = a.get("SalesDetails Line Count", pd.NA)
         rr["D365 SalesDetails Net Amount"] = a.get("D365 Net Amount")
         rr["Expected TAP Gross"] = a.get("Expected TAP Gross")
         rr["TAP Gross Difference"] = a.get("Amount Difference")
@@ -643,9 +616,8 @@ st.info(
     "the proven parser first. Confirmed ADCB / NBK / ANB HIVE adapters are additive "
     "fallbacks. Unknown layouts are processed only when Auth + Amount are mapped "
     "and confidence is at least 70%. Store 613 TAP Gateway uses the additive "
-    "reference_order → D365 Receipt ID → aggregated Net Amount × 1.15 → "
-    "Store 613 + Sales Order → D365 Store Tender evidence chain when Sales Details "
-    "are uploaded. The frozen core.reconcile() engine remains unchanged."
+    "reference_order → D365 Receipt ID + Net Amount × 1.15 evidence rule when "
+    "D365 Sales Details are uploaded. The frozen core.reconcile() engine remains unchanged."
 )
 
 uploads = st.file_uploader(
