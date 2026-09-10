@@ -9,7 +9,6 @@ import streamlit as st
 
 import auth, theme, core, db
 import report_export
-import report_payment_mismatch_overlay
 
 # Universal POS import is an IMPORT-LAYER extension only.
 # It does NOT replace or change core.reconcile().
@@ -51,7 +50,7 @@ st.markdown(
 # ---------------------------------------------------------------------
 # DEPLOYMENT DIAGNOSTIC
 # ---------------------------------------------------------------------
-DEPLOYMENT_BUILD = "POS_RECON_V3B_EXPORT_PAYMENT_MISMATCH_2026_09_10"
+DEPLOYMENT_BUILD = "POS_RECON_CONTENT_BASED_TAP_AUTH_BRIDGE_2026_09_10_V3C"
 
 try:
     _core_source = inspect.getsource(core.read_upload)
@@ -223,6 +222,161 @@ def _normalize_pos_universal(df, source_file: str, forced=None):
     }
 
 
+
+
+
+# ---------------------------------------------------------------------
+# Provider content identity + strong D365 evidence store bridge
+# ---------------------------------------------------------------------
+def _norm_provider_ref(v):
+    """Comparison-only normalization. Original reference remains unchanged."""
+    if pd.isna(v):
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(v).upper().strip())
+
+
+def _is_tap_content(df: pd.DataFrame) -> bool:
+    """
+    Identify TAP from file CONTENT, never from the downloaded filename.
+    Requires a characteristic TAP column signature.
+    """
+    if df is None or df.empty:
+        return False
+    cols = {str(c).strip().lower() for c in df.columns}
+    strong = {
+        "charge_id", "charge_date", "reference_transaction",
+        "reference_order", "payment_method", "payment_scheme",
+        "amount", "net_amount"
+    }
+    return len(strong.intersection(cols)) >= 6 and (
+        "reference_transaction" in cols or "reference_order" in cols
+    )
+
+
+def _bridge_unmapped_tap_store_from_d365(pos: pd.DataFrame, tender: pd.DataFrame):
+    """
+    Safe additive bridge for TAP rows whose store is unresolved.
+
+    Resolve POS Store from D365 only when there is exactly ONE D365 candidate
+    with:
+        normalized Auth/reference + TAP + exact amount (<= 0.005)
+
+    No filename parsing. No merchant-name hardcoding. No date-only matching.
+    Ambiguous/no-candidate rows remain mapping-required.
+    """
+    if pos is None or pos.empty or tender is None or tender.empty:
+        return pos, pd.DataFrame()
+
+    out = pos.copy()
+    audit = []
+
+    def col(df, name, default=""):
+        return df[name] if name in df.columns else pd.Series(default, index=df.index)
+
+    pos_pay = col(out, "POS Payment").fillna("").astype(str).str.upper().str.strip()
+    pos_amt = pd.to_numeric(col(out, "POS Amount", 0), errors="coerce").fillna(0.0)
+    pos_ref = col(out, "POS Auth").map(_norm_provider_ref)
+    if not pos_ref.astype(bool).any():
+        # compatibility with alternative normalized provider schemas
+        for candidate in ("Auth Code", "Provider Reference", "Transaction Reference"):
+            if candidate in out.columns:
+                alt = out[candidate].map(_norm_provider_ref)
+                pos_ref = pos_ref.where(pos_ref.astype(bool), alt)
+
+    pos_store = col(out, "POS Store").fillna("").astype(str).str.strip()
+    merchant_req = (
+        out["Merchant Mapping Required"].fillna(False).astype(bool)
+        if "Merchant Mapping Required" in out.columns
+        else pd.Series(False, index=out.index)
+    )
+    store_req = (
+        out["Store Mapping Required"].fillna(False).astype(bool)
+        if "Store Mapping Required" in out.columns
+        else pd.Series(False, index=out.index)
+    )
+
+    unresolved = pos_pay.eq("TAP") & (
+        pos_store.eq("") |
+        pos_store.str.upper().isin({"NAN", "NONE", "UNMAPPED", "MAPPING REQUIRED"}) |
+        merchant_req | store_req
+    )
+
+    t_pay = col(tender, "D365 Payment").fillna("").astype(str).str.upper().str.strip()
+    t_amt = pd.to_numeric(col(tender, "D365 Amount", 0), errors="coerce").fillna(0.0)
+    t_auth = col(tender, "Auth Code").map(_norm_provider_ref)
+    t_store = col(tender, "Store Code").fillna("").astype(str).str.strip()
+
+    # Some normalizers use alternate names; use them only if canonical is absent.
+    if not t_auth.astype(bool).any():
+        for candidate in ("D365 Auth", "Tender Auth", "Authorization"):
+            if candidate in tender.columns:
+                alt = tender[candidate].map(_norm_provider_ref)
+                t_auth = t_auth.where(t_auth.astype(bool), alt)
+
+    for idx in out.index[unresolved]:
+        ref = pos_ref.loc[idx]
+        amount = float(pos_amt.loc[idx])
+        if not ref or amount <= 0:
+            continue
+
+        candidates = tender[
+            t_pay.eq("TAP")
+            & t_auth.eq(ref)
+            & ((t_amt - amount).abs() <= 0.005)
+            & t_store.ne("")
+        ]
+
+        stores = sorted({
+            str(x).strip() for x in candidates.get(
+                "Store Code", pd.Series(dtype=str)
+            ).dropna()
+            if str(x).strip()
+        })
+
+        if len(candidates) == 1 and len(stores) == 1:
+            store = stores[0]
+            old_store = pos_store.loc[idx]
+
+            out.at[idx, "POS Store"] = store
+            if "Merchant Mapping Required" not in out.columns:
+                out["Merchant Mapping Required"] = False
+            if "Store Mapping Required" not in out.columns:
+                out["Store Mapping Required"] = False
+            out.at[idx, "Merchant Mapping Required"] = False
+            out.at[idx, "Store Mapping Required"] = False
+
+            if "Store Mapping Source" not in out.columns:
+                out["Store Mapping Source"] = ""
+            if "Store Mapping Status" not in out.columns:
+                out["Store Mapping Status"] = ""
+            out.at[idx, "Store Mapping Source"] = (
+                "D365 STRONG EVIDENCE: TAP + NORMALIZED AUTH + EXACT AMOUNT"
+            )
+            out.at[idx, "Store Mapping Status"] = "Mapped from D365 evidence"
+
+            audit.append({
+                "POS Index": idx,
+                "Original POS Store": old_store,
+                "Resolved Store": store,
+                "Normalized Reference": ref,
+                "POS Amount": amount,
+                "D365 Candidate Count": len(candidates),
+                "Rule": "TAP + normalized Auth + exact amount + unique D365 candidate",
+                "Result": "STORE RESOLVED; MAPPING BLOCKERS CLEARED",
+            })
+        elif len(candidates) > 1:
+            audit.append({
+                "POS Index": idx,
+                "Original POS Store": pos_store.loc[idx],
+                "Resolved Store": "",
+                "Normalized Reference": ref,
+                "POS Amount": amount,
+                "D365 Candidate Count": len(candidates),
+                "Rule": "TAP + normalized Auth + exact amount + unique D365 candidate",
+                "Result": "AMBIGUOUS - LEFT FOR REVIEW",
+            })
+
+    return out, pd.DataFrame(audit)
 
 
 # ---------------------------------------------------------------------
@@ -1018,6 +1172,14 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
         if not pos.empty:
             pos, tap301086_control_audit = _apply_confirmed_tap_301086_controls(pos)
 
+        # Strong provider-to-D365 store bridge.
+        # Independent of provider filename and merchant number in filename.
+        tap_d365_store_bridge_audit = pd.DataFrame()
+        if not pos.empty and not tender.empty:
+            pos, tap_d365_store_bridge_audit = _bridge_unmapped_tap_store_from_d365(
+                pos, tender
+            )
+
         # -------------------------------------------------------------
         # D365 TenderCash_Reco generic Credit Card resolution.
         # Only unique Store + Auth + exact Amount POS evidence can resolve
@@ -1138,6 +1300,7 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
             "tap613_audit": tap613_audit,
             "d365_credit_card_audit": d365_credit_card_audit,
             "tap301086_control_audit": tap301086_control_audit,
+            "tap_d365_store_bridge_audit": tap_d365_store_bridge_audit,
         }
         st.success(
             "Reconciliation completed. Universal POS import audit is available below."
@@ -1157,6 +1320,7 @@ if r:
     sd_bridge_audit = r.get("sales_details_bridge_audit", pd.DataFrame())
     d365_cc_audit = r.get("d365_credit_card_audit", pd.DataFrame())
     tap301086_control_audit = r.get("tap301086_control_audit", pd.DataFrame())
+    tap_d365_store_bridge_audit = r.get("tap_d365_store_bridge_audit", pd.DataFrame())
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Matched / Review", len(m))
@@ -1214,6 +1378,7 @@ if r:
         "SalesDetails Bridge Audit",
         "D365 Credit Card Audit",
         "TAP 301086 Control Audit",
+        "TAP D365 Store Bridge",
     ])
 
     with tabs[0]:
@@ -1236,8 +1401,10 @@ if r:
         st.dataframe(d365_cc_audit, use_container_width=True, hide_index=True)
     with tabs[9]:
         st.dataframe(tap301086_control_audit, use_container_width=True, hide_index=True)
+    with tabs[10]:
+        st.dataframe(tap_d365_store_bridge_audit, use_container_width=True, hide_index=True)
 
-    blob = report_payment_mismatch_overlay.create_reconciliation_pack(r, tolerance)
+    blob = report_export.create_reconciliation_pack(r, tolerance)
     st.download_button(
         "DOWNLOAD RECONCILIATION PACK",
         blob,
