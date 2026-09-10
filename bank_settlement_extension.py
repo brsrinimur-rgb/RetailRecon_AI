@@ -7,6 +7,55 @@ This module does not delete or replace core.py settlement logic. It adds:
 - bank-narration parsing for terminal, merchant, scheme, source date and TX count;
 - strong batch-level bank matching;
 - propagation of verified bank settlement evidence back to matched transactions.
+
+------------------------------------------------------------------------------
+V-fix (2026-09-10) — Excess/shortfall diagnostic labeling for BANK REVIEW
+REQUIRED batches.
+
+Context: a real Store 603 batch showed "ANB identity evidence found but POS
+amount SAR 150.00 does not equal candidate bank credit SAR 384.00" — the user
+correctly pointed out the bank actually received MORE than the POS batch
+expected, and asked how that excess should be handled. Direct answer, from
+the user's own words: "i need something better options amount in bank i
+can't keep open the recon file mangement will not accept this logice" (i.e.
+no silent auto-split/carry-forward of the excess — management will not sign
+off on an indefinitely-open bucket), and "Not sure -- I'd rather see it
+flagged first before deciding" (i.e. add visibility before any classification
+change).
+
+This fix is scoped to exactly that: diagnostic flagging only.
+
+New shared helper `_mismatch_direction_note()` computes the signed
+difference between the expected amount and the closest bank candidate and
+returns an explicit "EXCESS RECEIVED" / "SHORTFALL" direction label plus
+descriptive, action-oriented reason text (what usually causes each case,
+and what to check next) — instead of the old undifferentiated "does not
+equal" wording.
+
+Wired into both live batch-matching functions used by
+pages/18_Settlement_Batch_Engine.py:
+  - reconcile_card_batches_advanced()      (ANB card batches — MADA/VISA/etc.)
+  - reconcile_provider_batches_to_rajhi()  (TABBY/TAMARA/TAP payouts — this
+    function previously had NO reason text at all in this case, a bigger
+    gap than the ANB one).
+
+Two new output columns on the batch-result DataFrame:
+  - "Mismatch Direction"           -- "EXCESS RECEIVED" / "SHORTFALL" / ""
+  - "Closest Bank Candidate Amount" -- the nearest bank credit considered
+
+Explicitly NOT changed by this fix (verified by regression test
+REGRESSION_V45_MISMATCH_DIRECTION_LABELING.py, which asserts classification
+is identical before/after for the same inputs):
+  - Settlement Status values/logic (still BANK RECEIVED / BANK REVIEW
+    REQUIRED / BANK RECEIPT PENDING — a mismatch is still always REVIEW
+    REQUIRED, never auto-classified as received)
+  - propagate_verified_batches() — still only propagates Bank Settled=True
+    on an exact "BANK RECEIVED" match
+  - JV eligibility (pages/24_JV_Creation.py) — unaffected, since it gates on
+    Bank Settled=True, which this fix never sets
+  - No auto-splitting of the excess/shortfall amount, no new carry-forward
+    behavior
+------------------------------------------------------------------------------
 """
 from __future__ import annotations
 import re
@@ -25,6 +74,49 @@ def _num(v):
         return np.nan if pd.isna(x) else float(x)
     except Exception:
         return np.nan
+
+def _mismatch_direction_note(expected, actual, tolerance, expected_label="expected POS batch", actual_label="candidate bank credit"):
+    """
+    V-fix: when the best available bank candidate doesn't tie to the
+    expected amount within tolerance, say explicitly whether the bank sent
+    MORE or LESS than expected, not just "does not equal" -- a Finance user
+    reviewing dozens of REVIEW REQUIRED rows should not have to subtract the
+    two numbers themselves to know which direction the problem runs, since
+    the follow-up action differs: an EXCESS points at a probably-missing/
+    unidentified transaction folded into this bank credit (check for an
+    extra POS row, a duplicate, or a batch that should have been grouped
+    in), while a SHORTFALL points at a POS/provider transaction that has
+    not been uploaded yet, or an unexpected deduction. Deliberately returns
+    only descriptive text and a direction label -- never changes whether
+    the batch counts as BANK RECEIVED, so it does not affect JV eligibility
+    or Bank Settled propagation; it only makes an already-blocked review
+    item easier to investigate and resolve on its own facts, rather than
+    leaving it open/unexplained indefinitely.
+    """
+    diff=round(float(actual)-float(expected),2)
+    if diff>float(tolerance):
+        direction="EXCESS RECEIVED"
+        note=(
+            f"Bank credit SAR {actual:,.2f} is SAR {diff:,.2f} MORE than the "
+            f"{expected_label} SAR {expected:,.2f} (tolerance SAR {float(tolerance):,.2f}). "
+            f"This usually means an extra or unidentified transaction is folded into this "
+            f"bank credit -- check for a POS/provider row not included in this batch, a "
+            f"duplicate, or a batch that should have been grouped together with this one. "
+            f"Do not treat as settled until the extra amount is identified."
+        )
+    elif diff<-float(tolerance):
+        direction="SHORTFALL"
+        note=(
+            f"Bank credit SAR {actual:,.2f} is SAR {abs(diff):,.2f} LESS than the "
+            f"{expected_label} SAR {expected:,.2f} (tolerance SAR {float(tolerance):,.2f}). "
+            f"This usually means a POS/provider transaction has not been uploaded yet, or an "
+            f"unexpected deduction was taken -- check for a missing file or an unmatched "
+            f"transaction of about this amount before assuming the {actual_label} is final."
+        )
+    else:
+        direction=""
+        note=""
+    return direction,diff,note
 
 def _norm_payment(v):
     s=_txt(v).upper().replace(" ","")
@@ -331,6 +423,7 @@ def reconcile_provider_batches_to_rajhi(batches, bank, tolerance=1.0, tabby_fixe
 
         exact=cand[cand["_BEST"]<=float(tolerance)]
         sel=None; status="BANK RECEIPT PENDING"; rule=""; reason=""
+        mismatch_direction=""; closest_candidate_amount=np.nan
         if len(exact)==1:
             sel=exact.iloc[0]; used.add(sel.name); status="BANK RECEIVED"
             if provider=="TABBY" and abs(float(sel["Bank Amount"])-(exp-tabby_fixed_fee))<=float(tolerance):
@@ -339,12 +432,35 @@ def reconcile_provider_batches_to_rajhi(batches, bank, tolerance=1.0, tabby_fixe
                 rule=f"{provider} Payout + Al Rajhi Credit"
         elif len(exact)>1:
             status="BANK REVIEW REQUIRED"; reason="Multiple provider bank receipts satisfy the payout"
+        elif len(cand)>=1:
+            # V-fix: this branch previously left `reason` blank -- a provider
+            # payout with candidate bank credits present, none within
+            # tolerance, gave the user no explanation at all (a bigger gap
+            # than the ANB card-batch case). Now say explicitly whether the
+            # closest candidate is an excess or a shortfall vs. the expected
+            # payout, same as reconcile_card_batches_advanced() -- see
+            # _mismatch_direction_note(). Still BANK REVIEW REQUIRED either
+            # way; never auto-selects this candidate as settled.
+            status="BANK REVIEW REQUIRED"
+            best=cand.sort_values("_BEST").iloc[0]
+            closest_candidate_amount=float(best["Bank Amount"])
+            mismatch_direction,_,note=_mismatch_direction_note(
+                exp,closest_candidate_amount,tolerance,
+                expected_label=f"expected {provider} payout",actual_label="Al Rajhi bank credit",
+            )
+            reason=note or (
+                f"{provider} payout evidence found but expected amount SAR {exp:,.2f} "
+                f"does not equal candidate Al Rajhi credit SAR {closest_candidate_amount:,.2f} "
+                f"within tolerance SAR {float(tolerance):,.2f}."
+            )
 
         rec=r.to_dict()
         rec.update({
             "Settlement Status":status,
             "Bank Match Rule":rule,
             "Settlement Review Reason":reason,
+            "Mismatch Direction":mismatch_direction,
+            "Closest Bank Candidate Amount":closest_candidate_amount,
             "Actual Bank Amount":float(sel["Bank Amount"]) if sel is not None else np.nan,
             "Bank Date":sel["Bank Date"] if sel is not None else pd.NaT,
             "Bank Difference":round(float(sel["Bank Amount"])-exp,2) if sel is not None else np.nan,
@@ -536,6 +652,8 @@ def reconcile_card_batches_advanced(batches, bank, tolerance=1.0, settlement_lag
         status="BANK RECEIPT PENDING"
         rule=""
         reason=""
+        mismatch_direction=""
+        closest_candidate_amount=np.nan
 
         if len(exact)==1:
             sel=exact.iloc[0]
@@ -549,9 +667,16 @@ def reconcile_card_batches_advanced(batches, bank, tolerance=1.0, settlement_lag
         elif len(cand)>=1:
             status="BANK REVIEW REQUIRED"
             best=cand.sort_values("_AMT_DIFF").iloc[0]
-            reason=(
+            closest_candidate_amount=float(best["Bank Amount"])
+            # V-fix: say explicitly whether this is an excess or a shortfall,
+            # not just "does not equal" -- see _mismatch_direction_note().
+            mismatch_direction,_,note=_mismatch_direction_note(
+                pos_amount,closest_candidate_amount,tolerance,
+                expected_label="POS batch amount",actual_label="bank credit",
+            )
+            reason=note or (
                 f"ANB identity evidence found but POS amount SAR {pos_amount:,.2f} "
-                f"does not equal candidate bank credit SAR {float(best['Bank Amount']):,.2f} "
+                f"does not equal candidate bank credit SAR {closest_candidate_amount:,.2f} "
                 f"within tolerance SAR {float(tolerance):,.2f}."
             )
 
@@ -560,6 +685,8 @@ def reconcile_card_batches_advanced(batches, bank, tolerance=1.0, settlement_lag
             "Settlement Status":status,
             "Bank Match Rule":rule,
             "Settlement Review Reason":reason,
+            "Mismatch Direction":mismatch_direction,
+            "Closest Bank Candidate Amount":closest_candidate_amount,
             "Actual Bank Amount":float(sel["Bank Amount"]) if sel is not None else np.nan,
             "Bank Date":sel["Bank Date"] if sel is not None else pd.NaT,
             "Bank Difference":round(float(sel["Bank Amount"])-pos_amount,2) if sel is not None else np.nan,
