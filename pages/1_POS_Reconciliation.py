@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import re
 
 import pandas as pd
 import streamlit as st
@@ -49,7 +50,7 @@ st.markdown(
 # ---------------------------------------------------------------------
 # DEPLOYMENT DIAGNOSTIC
 # ---------------------------------------------------------------------
-DEPLOYMENT_BUILD = "POS_RECON_D365_DUAL_TENDER_FORMAT_2026_09_10_V3A"
+DEPLOYMENT_BUILD = "POS_RECON_D365_DUAL_TENDER_TAP301086_2026_09_10_V3B"
 
 try:
     _core_source = inspect.getsource(core.read_upload)
@@ -220,6 +221,157 @@ def _normalize_pos_universal(df, source_file: str, forced=None):
         ),
     }
 
+
+
+
+# ---------------------------------------------------------------------
+# Confirmed TAP merchant 301086 normalization
+# ---------------------------------------------------------------------
+def _apply_confirmed_tap_301086_controls(pos: pd.DataFrame):
+    """
+    Additive control for the confirmed TAP Gateway merchant 301086 only.
+
+    Evidence:
+      - merchant 301086 belongs to Store 613;
+      - core.reconcile() excludes rows while Merchant Mapping Required=True;
+      - source filename period YYMMDD_to_YYMMDD is authoritative when the
+        parsed provider date falls outside that period.
+
+    This function does NOT change core.reconcile() and does NOT touch 301090.
+    """
+    if pos is None or pos.empty:
+        return pos, pd.DataFrame()
+
+    out = pos.copy()
+
+    merchant = (
+        out.get("Merchant ID", pd.Series("", index=out.index))
+        .fillna("").astype(str).str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+    source = (
+        out.get("Source File", pd.Series("", index=out.index))
+        .fillna("").astype(str).str.strip()
+    )
+
+    confirmed = merchant.eq("301086") | source.str.contains(
+        "_301086_", regex=False, na=False
+    )
+    if not confirmed.any():
+        return out, pd.DataFrame()
+
+    audit_rows = []
+
+    # Confirmed store evidence. Clear the boolean blockers at the same time;
+    # setting POS Store alone is insufficient because core.reconcile() filters
+    # Merchant Mapping Required rows before matching.
+    out.loc[confirmed, "POS Store"] = "613"
+
+    if "Merchant Store Mapped" not in out.columns:
+        out["Merchant Store Mapped"] = False
+    out.loc[confirmed, "Merchant Store Mapped"] = True
+
+    if "Merchant Mapping Required" not in out.columns:
+        out["Merchant Mapping Required"] = False
+    out.loc[confirmed, "Merchant Mapping Required"] = False
+
+    if "Store Mapping Required" not in out.columns:
+        out["Store Mapping Required"] = False
+    out.loc[confirmed, "Store Mapping Required"] = False
+
+    if "Store Mapping Source" not in out.columns:
+        out["Store Mapping Source"] = ""
+    out.loc[confirmed, "Store Mapping Source"] = (
+        "CONFIRMED TAP MERCHANT 301086 -> STORE 613"
+    )
+
+    if "Store Mapping Status" not in out.columns:
+        out["Store Mapping Status"] = ""
+    out.loc[confirmed, "Store Mapping Status"] = "Mapped"
+
+    # Date correction is deliberately conservative:
+    # Parse the source filename period YYMMDD_to_YYMMDD. If a provider date
+    # is outside that period, use date evidence embedded in the ASA reference
+    # (ASAyymmdd...) only when that date is inside the source period.
+    period_re = re.compile(
+        r"_(\d{6})_to_(\d{6})",
+        flags=re.IGNORECASE,
+    )
+    asa_re = re.compile(r"ASA(\d{6})", flags=re.IGNORECASE)
+
+    for idx in out.index[confirmed]:
+        src_name = str(out.at[idx, "Source File"]) if "Source File" in out.columns else ""
+        pm = period_re.search(src_name)
+        date_action = "UNCHANGED"
+        old_date = out.at[idx, "POS Date"] if "POS Date" in out.columns else pd.NaT
+        new_date = old_date
+
+        if pm:
+            start = pd.to_datetime(pm.group(1), format="%y%m%d", errors="coerce")
+            end = pd.to_datetime(pm.group(2), format="%y%m%d", errors="coerce")
+            parsed = pd.to_datetime(old_date, errors="coerce")
+
+            in_period = (
+                pd.notna(parsed) and pd.notna(start) and pd.notna(end)
+                and start.normalize() <= parsed.normalize() <= end.normalize()
+            )
+
+            if not in_period:
+                ref_candidates = []
+                for col in ("Auth Code", "Provider Reference", "Transaction Reference"):
+                    if col in out.columns:
+                        ref_candidates.append(str(out.at[idx, col] or ""))
+
+                ref_date = pd.NaT
+                for txt in ref_candidates:
+                    am = asa_re.search(txt)
+                    if am:
+                        candidate = pd.to_datetime(
+                            am.group(1), format="%y%m%d", errors="coerce"
+                        )
+                        if (
+                            pd.notna(candidate) and pd.notna(start) and pd.notna(end)
+                            and start.normalize() <= candidate.normalize() <= end.normalize()
+                        ):
+                            ref_date = candidate.normalize()
+                            break
+
+                if pd.notna(ref_date):
+                    # Preserve transaction time when the original value carries one.
+                    parsed_old = pd.to_datetime(old_date, errors="coerce")
+                    if pd.notna(parsed_old):
+                        time_delta = parsed_old - parsed_old.normalize()
+                        new_date = ref_date + time_delta
+                    else:
+                        new_date = ref_date
+
+                    if "POS Date" in out.columns:
+                        out.at[idx, "POS Date"] = new_date
+                    date_action = "CORRECTED_FROM_ASA_REFERENCE_WITHIN_SOURCE_PERIOD"
+                else:
+                    date_action = "OUTSIDE_SOURCE_PERIOD_REVIEW"
+
+        audit_rows.append({
+            "POS Index": idx,
+            "Merchant ID": merchant.loc[idx],
+            "Store Code": "613",
+            "Source File": src_name,
+            "Old POS Date": old_date,
+            "New POS Date": new_date,
+            "Date Action": date_action,
+            "Merchant Mapping Required": bool(
+                out.at[idx, "Merchant Mapping Required"]
+            ),
+            "Store Mapping Required": bool(
+                out.at[idx, "Store Mapping Required"]
+            ),
+            "Rule": (
+                "Confirmed merchant 301086 -> Store 613; clear mapping blockers; "
+                "date correction only from ASA YYMMDD evidence inside filename period"
+            ),
+        })
+
+    return out, pd.DataFrame(audit_rows)
 
 
 # ---------------------------------------------------------------------
@@ -856,82 +1008,14 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
         if not pos.empty:
             pos = core.apply_terminal_master(pos, terminal_master)
 
-            # CONFIRMED TAP MERCHANT FALLBACK - additive evidence rule.
-            #
-            # Important correction:
-            # Existing mapping controls can populate unresolved rows with the
-            # literal sentinel "⚠ MERCHANT MAPPING REQUIRED" instead of leaving
-            # POS Store blank. Therefore this rule must run AFTER the normal
-            # merchant + terminal mapping controls and treat that sentinel as
-            # unresolved.
-            #
-            # Merchant 301086 belongs to Store 613 (Aigner KSA Online).
-            # Merchant 301090 and all other merchants remain untouched.
-            _store = pos.get(
-                "POS Store", pd.Series("", index=pos.index)
-            ).fillna("").astype(str).str.strip()
+            # Confirmed TAP 301086 controls run below after all normal
+            # merchant/terminal mapping controls have completed.
 
-            _unresolved_store = (
-                _store.eq("")
-                | _store.str.upper().str.contains(
-                    "MERCHANT MAPPING REQUIRED", regex=False, na=False
-                )
-                | _store.str.upper().str.contains(
-                    "MAPPING REQUIRED", regex=False, na=False
-                )
-                | _store.str.upper().eq("UNMAPPED")
-            )
-
-            if "Merchant ID" in pos.columns:
-                _merchant = (
-                    pos["Merchant ID"]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    .str.replace(r"\.0$", "", regex=True)
-                )
-                _merchant_301086 = _merchant.eq("301086")
-            else:
-                _merchant_301086 = pd.Series(False, index=pos.index)
-
-            # Defensive evidence fallback: the confirmed TAP charge filename
-            # itself contains merchant 301086. This is used only when the
-            # normalized Merchant ID column did not retain the value.
-            _source = pos.get(
-                "Source File", pd.Series("", index=pos.index)
-            ).fillna("").astype(str).str.strip()
-            _source_301086 = _source.str.contains(
-                "_301086_", regex=False, na=False
-            )
-
-            _m301086 = (_merchant_301086 | _source_301086) & _unresolved_store
-
-            if _m301086.any():
-                pos.loc[_m301086, "POS Store"] = "613"
-
-                if "Store Mapping Source" not in pos.columns:
-                    pos["Store Mapping Source"] = ""
-                pos.loc[
-                    _m301086, "Store Mapping Source"
-                ] = "CONFIRMED TAP MERCHANT 301086 -> STORE 613"
-
-                if "Store Mapping Status" not in pos.columns:
-                    pos["Store Mapping Status"] = ""
-                pos.loc[_m301086, "Store Mapping Status"] = "Mapped"
-
-                import_audit.append({
-                    "File": "Confirmed Merchant Mapping",
-                    "Sheet": "Runtime Control",
-                    "Classified As": "STORE MAPPING",
-                    "Import Mode": "CONFIRMED MERCHANT FALLBACK",
-                    "Detected Format": "TAP MERCHANT 301086",
-                    "Confidence": 100.0,
-                    "Rows": int(_m301086.sum()),
-                    "Safety": (
-                        "301086 -> Store 613 after normal merchant/terminal mapping; "
-                        "only unresolved mapping-required rows are changed"
-                    ),
-                })
+        # Confirmed merchant 301086 -> Store 613, clear mapping blockers,
+        # and correct only demonstrably mis-parsed dates using source evidence.
+        tap301086_control_audit = pd.DataFrame()
+        if not pos.empty:
+            pos, tap301086_control_audit = _apply_confirmed_tap_301086_controls(pos)
 
         # -------------------------------------------------------------
         # D365 TenderCash_Reco generic Credit Card resolution.
@@ -1052,6 +1136,7 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
             "sales_details_bridge_audit": sales_details_bridge_audit,
             "tap613_audit": tap613_audit,
             "d365_credit_card_audit": d365_credit_card_audit,
+            "tap301086_control_audit": tap301086_control_audit,
         }
         st.success(
             "Reconciliation completed. Universal POS import audit is available below."
@@ -1070,6 +1155,7 @@ if r:
     tap613_audit = r.get("tap613_audit", pd.DataFrame())
     sd_bridge_audit = r.get("sales_details_bridge_audit", pd.DataFrame())
     d365_cc_audit = r.get("d365_credit_card_audit", pd.DataFrame())
+    tap301086_control_audit = r.get("tap301086_control_audit", pd.DataFrame())
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Matched / Review", len(m))
@@ -1126,6 +1212,7 @@ if r:
         "TAP 613 Audit",
         "SalesDetails Bridge Audit",
         "D365 Credit Card Audit",
+        "TAP 301086 Control Audit",
     ])
 
     with tabs[0]:
@@ -1146,6 +1233,8 @@ if r:
         st.dataframe(sd_bridge_audit, use_container_width=True, hide_index=True)
     with tabs[8]:
         st.dataframe(d365_cc_audit, use_container_width=True, hide_index=True)
+    with tabs[9]:
+        st.dataframe(tap301086_control_audit, use_container_width=True, hide_index=True)
 
     blob = report_export.create_reconciliation_pack(r, tolerance)
     st.download_button(
