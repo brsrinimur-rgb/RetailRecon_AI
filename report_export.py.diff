@@ -1,0 +1,175 @@
+--- repo_clone/report_export.py	2026-09-10 09:50:29.101823234 +0000
++++ deliver/report_export.py	2026-09-10 09:52:33.553830632 +0000
+@@ -64,7 +64,129 @@
+     return d
+ 
+ 
+-def transaction_reconciliation(result):
++def _find_payment_method_mismatches(us, up, tolerance=1.0):
++    """
++    Additive, conservative pre-pass over `unmatched_sales` (us, D365-side-
++    only rows) and `unmatched_pos` (up, POS-side-only rows), run BEFORE the
++    existing Missing POS / Missing D365 loops below.
++
++    Finds a D365-side row and a POS-side row sharing the same Store Code +
++    Auth Code where the payment/tender type differs but the Amount matches
++    within `tolerance` -- e.g. D365 posts a transaction as TAP while the
++    POS/provider side records the identical Auth Code and Amount under
++    TAMARA. That is a payment-method tagging mismatch, not a missing
++    transaction and not a date problem, but before this fix it was reported
++    as two disconnected, misleading exceptions: the D365 side read
++    "Missing POS" ("D365 transaction found but no matching POS settlement"
++    -- false, a matching settlement exists just under a different tender)
++    and the POS side read whatever `core.reconcile()` sets on it (often
++    "Date Validation Required", also not the real issue).
++
++    Confirmed on real exports before this fix: 13 of 15 total mismatches
++    found in one export were the identical Store 613 D365=TAP / POS=TAMARA
++    pattern -- a systemic tagging pattern for that store, not an isolated
++    slip.
++
++    Mirrors the existing SAME-tender-different-amount merge already done
++    for `matched` transactions above (one combined row, tagged "Review")
++    -- this is the missing DIFFERENT-tender-same-amount counterpart.
++
++    Deliberately conservative, same discipline as this app's other
++    additive evidence bridges (e.g. the Store 613 TAP D365-evidence bridge
++    only resolving a store when exactly one D365 candidate matches): only
++    resolves a clean 1:1 pairing per (Store Code, Auth Code). If either
++    side has more than one candidate for that key, or the tender is
++    actually the same (already handled as "Review"), nothing is merged and
++    both sides fall through to the existing Missing POS / Missing D365
++    handling completely unchanged. core.reconcile() itself is never
++    touched by this function.
++
++    Returns (merged_rows: list[dict matching TX_COLUMNS], us_idx_consumed:
++    set of `us` index labels to skip in the loop below, up_idx_consumed:
++    set of `up` index labels to skip in the loop below).
++    """
++    merged_rows = []
++    us_consumed = set()
++    up_consumed = set()
++
++    if us is None or us.empty or up is None or up.empty:
++        return merged_rows, us_consumed, up_consumed
++    if "Auth Code" not in us.columns or "Auth Code" not in up.columns:
++        return merged_rows, us_consumed, up_consumed
++
++    us_g = us.copy()
++    us_g["_store"] = us_g.get("Store Code", "").astype(str).str.strip()
++    us_g["_auth"] = us_g.get("Auth Code", "").astype(str).str.strip()
++
++    up_g = up.copy()
++    up_g["_store"] = up_g.get("POS Store", "").astype(str).str.strip()
++    up_g["_auth"] = up_g.get("Auth Code", "").astype(str).str.strip()
++
++    for (store, auth), us_rows in us_g[us_g["_auth"] != ""].groupby(["_store", "_auth"]):
++        if len(us_rows) != 1:
++            continue  # ambiguous D365 side for this Store+Auth -- never guess
++        up_rows = up_g[(up_g["_store"] == store) & (up_g["_auth"] == auth)]
++        if len(up_rows) != 1:
++            continue  # ambiguous or absent POS side -- never guess
++
++        u = us_rows.iloc[0]
++        p_row = up_rows.iloc[0]
++
++        d_tender = _master_name(u.get("D365 Payment"))
++        p_tender = _master_name(p_row.get("POS Payment"))
++        if not d_tender or not p_tender or d_tender == p_tender:
++            continue  # same tender (or unresolved) -- not this case
++
++        try:
++            d365_amt = float(u.get("D365 Amount", 0) or 0)
++            pos_amt = float(p_row.get("POS Amount", 0) or 0)
++        except (TypeError, ValueError):
++            continue
++        if abs(d365_amt - pos_amt) > tolerance:
++            continue
++
++        x = _zero_tx()
++        x.update({
++            "Store Code": u.get("Store Code", ""),
++            "Date": u.get("Date", pd.NaT),
++            "Receipt ID": u.get("Receipt ID", ""),
++            "Auth Code": auth,
++            "D365 Source Type": "Store Tender",
++            "D365 Total": d365_amt,
++            "POS Total": pos_amt,
++            "Total Difference": round(d365_amt - pos_amt, 2),
++            "D365 Tender": d_tender,
++            "POS Tender": p_tender,
++            "POS Date": p_row.get("POS Date", pd.NaT),
++            "Posting Date": p_row.get("Posting Date", pd.NaT),
++            "Terminal ID": p_row.get("Terminal ID", ""),
++            "Commission": float(p_row.get("Commission", 0) or 0),
++            "VAT": float(p_row.get("VAT", 0) or 0),
++            "Net Amount": float(p_row.get("Net Amount", 0) or 0),
++            "Source": p_row.get("Source File", ""),
++            "Status": "Payment Method Mismatch",
++            "Remarks": (
++                f"Auth Code and Amount (SAR {pos_amt:,.2f}) match exactly between D365 (posted as "
++                f"{d_tender}) and POS/provider (recorded as {p_tender}) -- this is not a missing "
++                f"transaction and not a date issue. Confirm the correct payment method with the "
++                f"provider/bank and correct the tagging at source."
++            ),
++        })
++        if d_tender in PAYMENTS:
++            x[f"D365 {d_tender}"] = d365_amt
++            x[f"Diff {d_tender}"] = d365_amt
++        if p_tender in PAYMENTS:
++            x[f"POS {p_tender}"] = pos_amt
++            x[f"Diff {p_tender}"] = -pos_amt
++
++        merged_rows.append(x)
++        us_consumed.add(u.name)
++        up_consumed.add(p_row.name)
++
++    return merged_rows, us_consumed, up_consumed
++
++
++def transaction_reconciliation(result, tolerance=1.0):
+     rows = []
+ 
+     m = result.get("matched", pd.DataFrame())
+@@ -125,7 +247,19 @@
+         rows.append(x)
+ 
+     us = result.get("unmatched_sales", pd.DataFrame())
+-    for _, r in us.iterrows():
++    up = result.get("unmatched_pos", pd.DataFrame())
++
++    # Payment Method Mismatch pre-pass -- consumes any clean 1:1 cross-
++    # tender, same-amount pairs BEFORE the two loops below see them, so a
++    # pair caught here no longer also produces a separate, misleading
++    # "Missing POS" row and "Missing D365"/"Date Validation Required" row
++    # for what is really one transaction tagged under two payment methods.
++    pmm_rows, pmm_us_consumed, pmm_up_consumed = _find_payment_method_mismatches(us, up, tolerance=tolerance)
++    rows.extend(pmm_rows)
++
++    for idx, r in us.iterrows():
++        if idx in pmm_us_consumed:
++            continue
+         x = _zero_tx()
+         p = _master_name(r.get("D365 Payment"))
+         d365 = float(r.get("D365 Amount", 0) or 0)
+@@ -149,8 +283,9 @@
+             x[f"Diff {p}"] = d365
+         rows.append(x)
+ 
+-    up = result.get("unmatched_pos", pd.DataFrame())
+-    for _, r in up.iterrows():
++    for idx, r in up.iterrows():
++        if idx in pmm_up_consumed:
++            continue
+         x = _zero_tx()
+         p = _master_name(r.get("POS Payment"))
+         pos = float(r.get("POS Amount", 0) or 0)
+@@ -509,7 +644,7 @@
+ 
+ 
+ def create_reconciliation_pack(result, tolerance=1.0):
+-    tx = transaction_reconciliation(result)
++    tx = transaction_reconciliation(result, tolerance=tolerance)
+     exceptions = tx[tx["Status"] != "Matched"].copy()
+     store = store_summary(tx)
+     payment = payment_summary(tx)
