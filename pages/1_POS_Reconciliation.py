@@ -23,6 +23,12 @@ try:
 except Exception:
     store613_logic = None
 
+# Additive D365 tender-format adapter. Standard StoreTender remains unchanged.
+try:
+    import d365_tender_formats
+except Exception:
+    d365_tender_formats = None
+
 
 st.set_page_config(
     page_title="POS Reconciliation - Retail Control Tower",
@@ -43,7 +49,7 @@ st.markdown(
 # ---------------------------------------------------------------------
 # DEPLOYMENT DIAGNOSTIC
 # ---------------------------------------------------------------------
-DEPLOYMENT_BUILD = "POS_RECON_TAP613_MERCHANT301086_2026_09_08_V3"
+DEPLOYMENT_BUILD = "POS_RECON_D365_DUAL_TENDER_FORMAT_2026_09_10_V3A"
 
 try:
     _core_source = inspect.getsource(core.read_upload)
@@ -57,12 +63,13 @@ _core_hash = hashlib.sha1(
 _uses_old_parser = "pd.read_csv" in _core_source
 
 with st.expander("🛠️ Deployment Diagnostic", expanded=False):
-    d1, d2, d3, d4, d5 = st.columns(5)
+    d1, d2, d3, d4, d5, d6 = st.columns(6)
     d1.metric("Page Build", DEPLOYMENT_BUILD)
     d2.metric("core.py Hash", _core_hash)
     d3.metric("Old pd.read_csv Path", "YES ❌" if _uses_old_parser else "NO ✅")
     d4.metric("Universal POS Mapper", "LOADED ✅" if pos_auto_mapper else "MISSING ❌")
     d5.metric("Store 613 TAP Rule", "LOADED ✅" if store613_logic else "MISSING ❌")
+    d6.metric("D365 Dual Tender", "LOADED ✅" if d365_tender_formats else "MISSING ❌")
 
     st.write("**Loaded core.py:**")
     st.code(str(_core_file))
@@ -617,7 +624,8 @@ st.info(
     "fallbacks. Unknown layouts are processed only when Auth + Amount are mapped "
     "and confidence is at least 70%. Store 613 TAP Gateway uses the additive "
     "reference_order → D365 Receipt ID + Net Amount × 1.15 evidence rule when "
-    "D365 Sales Details are uploaded. The frozen core.reconcile() engine remains unchanged."
+    "D365 Sales Details are uploaded. Both classic D365 StoreTender and compact "
+    "D365 TenderCash_Reco formats are supported. The frozen core.reconcile() engine remains unchanged."
 )
 
 uploads = st.file_uploader(
@@ -655,6 +663,31 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
                 raise
 
             for sheet, df in _sheets.items():
+                # Additive compact D365 TenderCash_Reco detection runs BEFORE
+                # the generic classifier because this format has no classic
+                # Receiptid column header and would otherwise look like POS.
+                if (
+                    d365_tender_formats is not None
+                    and d365_tender_formats.is_tender_cash_reco(f.name, df)
+                ):
+                    n = d365_tender_formats.normalize_tender_cash_reco(df, core)
+                    if n is not None and not n.empty:
+                        tender_parts.append(n)
+                    import_audit.append({
+                        "File": f.name,
+                        "Sheet": sheet,
+                        "Classified As": "D365 STORE TENDER",
+                        "Import Mode": "D365 COMPACT TENDER ADAPTER",
+                        "Detected Format": "D365_TENDERCASH_RECO",
+                        "Confidence": 100.0,
+                        "Rows": len(n) if n is not None else 0,
+                        "Safety": (
+                            "Additive adapter; Ref -> Receipt ID; SO / Receipt -> Sales Order; "
+                            "core.reconcile() unchanged"
+                        ),
+                    })
+                    continue
+
                 typ = core.classify(f"{f.name}-{sheet}", df)
 
                 if typ == "D365 STORE TENDER":
@@ -750,6 +783,15 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
             for f in uploads or []:
                 _sheets = core.read_upload(f)
                 for sheet, df in _sheets.items():
+                    if (
+                        d365_tender_formats is not None
+                        and d365_tender_formats.is_tender_cash_reco(f.name, df)
+                    ):
+                        n = d365_tender_formats.normalize_tender_cash_reco(df, core)
+                        if n is not None and not n.empty:
+                            tender_parts.append(n)
+                        continue
+
                     d = core.norm_cols(df)
                     has_store = core.find(d, ["store", "store code", "store name"])
                     has_date = core.find(
@@ -892,6 +934,23 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
                 })
 
         # -------------------------------------------------------------
+        # D365 TenderCash_Reco generic Credit Card resolution.
+        # Only unique Store + Auth + exact Amount POS evidence can resolve
+        # CREDIT_CARD to VISA or MASTERCARD. No weak guessing is allowed.
+        # -------------------------------------------------------------
+        d365_credit_card_audit = pd.DataFrame()
+        if (
+            d365_tender_formats is not None
+            and not tender.empty
+            and not pos.empty
+        ):
+            tender, d365_credit_card_audit = (
+                d365_tender_formats.resolve_generic_credit_card(
+                    tender, pos, core
+                )
+            )
+
+        # -------------------------------------------------------------
         # ADDITIVE Store 613 TAP evidence rule.
         # Clean proven Store 613 TAP rows are resolved first; review/pending
         # rows are protected from weaker legacy fallbacks.
@@ -992,6 +1051,7 @@ if st.button("RUN RECONCILIATION", type="primary", use_container_width=True):
             "sales_details": sales_details,
             "sales_details_bridge_audit": sales_details_bridge_audit,
             "tap613_audit": tap613_audit,
+            "d365_credit_card_audit": d365_credit_card_audit,
         }
         st.success(
             "Reconciliation completed. Universal POS import audit is available below."
@@ -1009,6 +1069,7 @@ if r:
     ia = r.get("pos_import_audit", pd.DataFrame())
     tap613_audit = r.get("tap613_audit", pd.DataFrame())
     sd_bridge_audit = r.get("sales_details_bridge_audit", pd.DataFrame())
+    d365_cc_audit = r.get("d365_credit_card_audit", pd.DataFrame())
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Matched / Review", len(m))
@@ -1064,6 +1125,7 @@ if r:
         "POS Import Audit",
         "TAP 613 Audit",
         "SalesDetails Bridge Audit",
+        "D365 Credit Card Audit",
     ])
 
     with tabs[0]:
@@ -1082,6 +1144,8 @@ if r:
         st.dataframe(tap613_audit, use_container_width=True, hide_index=True)
     with tabs[7]:
         st.dataframe(sd_bridge_audit, use_container_width=True, hide_index=True)
+    with tabs[8]:
+        st.dataframe(d365_cc_audit, use_container_width=True, hide_index=True)
 
     blob = report_export.create_reconciliation_pack(r, tolerance)
     st.download_button(
