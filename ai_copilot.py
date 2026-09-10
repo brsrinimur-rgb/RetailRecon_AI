@@ -1,5 +1,64 @@
 from __future__ import annotations
 
+"""
+FIX (2026-09-10) -- sticky-scope conversation bug reported against a real
+production run. Real transcript: a "cash sales" question early on caused
+every later, completely unrelated question ("total sales", "i need mada
+card", "show top 10 risks", "show settlement status", ...) to keep coming
+back with the same stale "I couldn't find Cash transactions..." message.
+
+Root causes, all in interpret_query()/answer_question() below:
+  1. The CASH-sticky intent branch fired on ANY of a long list of ordinary
+     finance words ("sales","top","highest","net","details","transactions",
+     "trend","daily",...) whenever ctx.payment happened to be CASH -- and
+     ctx.payment persists indefinitely across turns by design (like store/
+     date scope), so one real cash question early in a conversation could
+     hijack every later question containing any of those common words, for
+     the rest of the session. Now requires the literal word "cash" in the
+     CURRENT question; a short, immediate follow-up ("show highest",
+     "daily trend") is still handled by the existing
+     prior.last_intent=="cash_report" continuation check, which naturally
+     expires once any other intent is resolved in between.
+  2. "need all store cash sales" -- "all store(s)" was not recognized as an
+     explicit instruction to clear store scope, so it silently kept
+     whatever single store an earlier (often accidentally-misrouted)
+     question had pinned.
+  3. The blind final intent fallback ("nothing else matched -> reuse
+     whatever intent the LAST turn resolved to") could reactivate
+     cash_report even when the current question named a clearly different
+     payment method ("mada") -- and the cash_report handler then forces
+     ctx.payment back to CASH, discarding the payment the user just typed.
+     Now a newly-named, non-CASH payment is treated as a plain sales
+     question for that payment instead of blindly repeating the last report.
+  4. The "sales" intent (reached only when the CURRENT question's own text
+     says "sales"/"revenue"/"tender" -- a self-contained, non-continuation
+     classification) was still being force-routed to the cash-specific
+     analytics report whenever ctx.payment was sticky-CASH, so a
+     self-contained question like "603 sales 2 sep 2026" got the wrong
+     report shape and wrong wording. Removed; _sales_answer already applies
+     ctx.payment as a plain, correctly-labeled filter.
+  5. "show top 10 risks" (the app's OWN "Top 10 risks" quick-question
+     button) never matched the "top risk(s)" phrase check because of the
+     inserted "10" -- added a regex fallback for "top N risk(s)".
+
+Verified: all pre-existing AI Copilot regression suites
+(REGRESSION_AI_FINANCE_COPILOT, REGRESSION_AI_CASH_ROUTING_FOLLOWUP,
+REGRESSION_AI_COPILOT_ADVANCED, REGRESSION_AI_CASH_ADVANCED,
+REGRESSION_AI_MATCHED_UNMATCHED_INTENT, REGRESSION_AI_RISK_ROLE_AWARE,
+REGRESSION_AI_STORE_NAME_OUTPUT, REGRESSION_AI_FINANCE_CONTROL_V12) still
+pass unchanged, plus a new REGRESSION_V13_COPILOT_STICKY_SCOPE.py that
+reproduces the exact reported conversation end-to-end.
+
+Note: payment/store/date scope still persists across turns by design (same
+as before this fix, and required by several of the tests above) -- e.g. a
+plain "603 sales" asked while a payment filter is still active from an
+earlier turn will still report against that filter, same as it would for a
+persisted store or date filter. What's fixed is the MISROUTING into the
+wrong specialized report and the discarding of an explicitly-typed new
+payment -- not scope persistence itself, which mirrors how store/date scope
+already works throughout this file.
+"""
+
 import re
 import difflib
 from datetime import datetime, timedelta
@@ -339,10 +398,24 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
     stores=_find_store_codes(q)
     if not stores:
         stores=_find_store_codes_by_name(q,db_module)
-    if not stores:
+    # V-fix (sticky-scope bug): "all store(s)" is an explicit instruction to
+    # broaden scope to every store, not silence about which store is meant.
+    # Previously this fell straight through to prior.store_codes.copy() just
+    # like an ordinary question that never mentions a store, so e.g. "need
+    # all store cash sales" asked right after a Store 603 question stayed
+    # silently pinned to Store 603 instead of clearing to all stores.
+    if not stores and re.search(r"\ball stores?\b", ql):
+        stores=[]
+    elif not stores:
         stores=prior.store_codes.copy()
 
-    payment=_find_payment(q) or prior.payment
+    # V-fix: keep the RAW per-turn payment detection (before falling back to
+    # the sticky prior.payment) so the intent classifier below can tell "this
+    # turn explicitly named a payment method" apart from "payment is just
+    # carried over from an earlier turn" -- see the cash_report branch and
+    # the final fallback for why that distinction matters.
+    raw_payment=_find_payment(q)
+    payment=raw_payment or prior.payment
     d1,d2,dmode=_parse_date_scope(q,data_min,data_max,prior)
 
     # intent
@@ -383,7 +456,12 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
         "biggest risk","highest risk","risk today","risks today","top risk","top risks",
         "priority exception","priority exceptions","what needs attention","needs attention",
         "anomaly","anomalies","control risk"
-    ]):
+    ]) or re.search(r"\btop\s+\d+\s+risks?\b", ql):
+        # V-fix: the plain substring checks above require "top risk(s)" as an
+        # exact contiguous phrase, so a perfectly natural "top 10 risks" (the
+        # app's OWN "Top 10 risks" quick-question button generates exactly
+        # this text) never matched and fell through to the fallback logic
+        # below instead.
         intent="risk"
     elif any(x in ql for x in ["store performance","store score","store control score","which store is worst","which store needs attention"]):
         intent="store_performance"
@@ -419,14 +497,25 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
         "what's the date","whats the date"
     ]):
         intent="date_range"
-    elif (
-        payment=="CASH"
-        and any(x in ql for x in [
-            "cash","sales","sale","refund","refunds","net","highest","lowest",
-            "top","rank","ranking","average","largest","details","transactions",
-            "trend","daily","all store","all stores"
-        ])
-    ):
+    elif re.search(r"\bcash\b", ql):
+        # V-fix (the dominant sticky-scope bug): this used to fire on ANY of
+        # a long list of ordinary finance words ("sales","top","highest",
+        # "net","details","transactions","trend","daily",...) whenever
+        # ctx.payment happened to be CASH -- and ctx.payment, once set,
+        # persists indefinitely across turns (by design, like store/date
+        # scope). The result: a real cash question early in a conversation
+        # permanently hijacked every later, completely unrelated question
+        # that happened to contain any of those common words ("total sales",
+        # "show top 10 risks", "show settlement status" after a follow-up
+        # touched "sales") into this cash-specific report, for the rest of
+        # the conversation. Now this branch requires the CURRENT question to
+        # actually say "cash". A short, immediate follow-up right after a
+        # cash answer ("show highest", "daily trend", "603 sales" the turn
+        # right after a cash question) is still handled by the
+        # prior.last_intent=="cash_report" check in the fallback below --
+        # but unlike this branch, that check naturally expires the moment
+        # any other intent gets resolved in between, instead of persisting
+        # for the rest of the session.
         intent="cash_report"
     elif any(x in ql for x in ["refund","refunds"]):
         intent="refunds"
@@ -442,11 +531,27 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
     elif any(x in ql for x in ["summary","briefing","overview","dashboard"]):
         intent="summary"
     else:
-        if prior.last_intent=="cash_report" and any(x in ql for x in [
-            "highest","lowest","top","rank","ranking","details","transactions",
-            "show","only","daily","trend","store"
-        ]):
+        if (
+            prior.last_intent=="cash_report"
+            and raw_payment in (None,"CASH")
+            and any(x in ql for x in [
+                "highest","lowest","top","rank","ranking","details","transactions",
+                "show","only","daily","trend","store"
+            ])
+        ):
             intent="cash_report"
+        elif raw_payment and raw_payment!="CASH":
+            # V-fix: this turn explicitly named a DIFFERENT payment method
+            # than whatever the conversation was previously about (e.g.
+            # "i need mada card" right after a cash question, or after any
+            # other unrelated report). Blindly reusing prior.last_intent
+            # here (the old behavior) could silently re-run a completely
+            # unrelated report -- and for "...cash_report" specifically, the
+            # cash_report handler forces ctx.payment back to CASH,
+            # discarding the payment the user just typed entirely. Treat it
+            # as a plain sales/tender question for the named payment
+            # instead.
+            intent="sales"
         else:
             intent=prior.last_intent or "summary"
 
@@ -1419,13 +1524,19 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
     elif intent=="reconciliation_status":
         payload=_reconciliation_status_answer(result,ctx,question,db_module)
     elif intent=="sales":
-        # A CASH-scoped "sales" question is a cash query and must always go
-        # through the Advanced Cash Report, never the generic tender-total
-        # line ("CASH total is SAR X across Y transaction line(s)").
-        if ctx.payment=="CASH":
-            payload=_cash_report(result,ctx,question,db_module)
-        else:
-            payload=_sales_answer(result,ctx,detail=False,db_module=db_module)
+        # V-fix (sticky-scope bug): this used to route to the Advanced Cash
+        # Report whenever ctx.payment was sticky-CASH, even for a
+        # self-contained, information-rich question like "603 sales 2 sep
+        # 2026" that never mentions cash at all -- intent only resolves to
+        # "sales" here when the CURRENT question's own text asked about
+        # sales/revenue/tender (interpret_query's dedicated "cash" check
+        # runs first and would already have produced "cash_report" if the
+        # question said "cash"). _sales_answer already applies ctx.payment
+        # as a plain filter and reports it correctly ("CASH total is SAR X")
+        # on the rare case it IS still genuinely CASH-scoped, so there is no
+        # loss of information -- just no forced reinterpretation as the
+        # heavier cash-specific analytics report.
+        payload=_sales_answer(result,ctx,detail=False,db_module=db_module)
     elif intent=="date_range":
         payload=_date_range_answer(result,ctx)
     elif intent=="transactions":
