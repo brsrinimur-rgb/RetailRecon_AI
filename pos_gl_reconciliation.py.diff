@@ -1,0 +1,130 @@
+--- /home/claude/repo_clone/logic/pos_gl_reconciliation.py	2026-09-10 09:50:29.094293143 +0000
++++ /home/claude/deliver/logic/pos_gl_reconciliation.py	2026-09-10 10:25:14.533135574 +0000
+@@ -6,6 +6,30 @@
+ real, evidence-based problem. Read this before changing the matching logic
+ again.
+ 
++PASS 11 / V43 "GL Accounts In Bucket" (2026-09-10) -- user reported "I can't
++see GL code in this report" against a real production export. Two real
++things were true at once: (a) the GL-wise account breakdown (GL Account,
++GL Name, GL Total, POS Total, Difference, Status) has been in the Summary
++sheet's "GL-WISE SUMMARY" block since V42.2, but sits to the right of the
++Store-wise table (columns G onward) rather than in its own sheet, so it's
++easy to miss on a quick look; (b) more concretely, the row-level "POS to
++GL" / "GL Matched" / "Exceptions" sheets had "GL Main Account" blank on
++EVERY row, with no other GL account visibility at that grain at all --
++confirmed against the user's real export (786 exception rows, 89 GL Matched
++rows, all blank). (b) is a real, structural gap: bucket matching sums
++possibly-many GL rows against possibly-many POS rows for a Store+Date, so
++there genuinely is no single GL row a given POS row "matched" -- but that's
++a reason "GL Main Account" specifically can't be filled in per row, not a
++reason no GL account information belongs on those rows at all. Added a new
++"GL Accounts In Bucket" column to the row-level sheets and "GL Accounts In
++This Bucket" to Store Date Buckets/Top 20 Exceptions: every GL account
++posted in that Store+Date bucket, each with its own signed SAR total (e.g.
++"11020904 (SAR 200.00), 11020908 (SAR 100.00)"). Purely additive labeling --
++does not read into bucket_status, bucket_diff, tolerance, or any other
++matching decision; reuses the same per-bucket GL-by-account grouping V42
++item 6 already computed for the "Uncovered GL Accounts" column, just
++un-filtered to all accounts instead of only the uncovered subset.
++
+ PASS 10 / V42 "Audit Integrity & Master Data" (2026-08-28) -- a small,
+ focused set of fixes from the user's review of the actual V41 files, again
+ explicitly NOT touching the reconciliation mathematics:
+@@ -1601,10 +1625,38 @@
+         gl_uncovered_accts = (gl_by_account[~gl_by_account["covered"]]
+                               .groupby(["store_code", "bucket_gl_date"])["main_account"]
+                               .apply(lambda s: sorted(set(s))))
++        # V43 item 1: the row-level detail sheets (POS to GL / GL Matched /
++        # Exceptions) never carried a GL account code per row -- by
++        # construction, bucket matching sums possibly-many GL rows against
++        # possibly-many POS rows for a Store+Date, so there is no single GL
++        # row/account a given POS row can be said to correspond to (see the
++        # "Match Level" note below). That's still true and unchanged here.
++        # But leaving "GL Main Account" blank on literally every exported
++        # row read, to a real user checking a real export, as "this report
++        # has no GL code in it" -- which is not true, the GL-wise account
++        # breakdown has always been in the Summary sheet's "GL-WISE SUMMARY"
++        # block (columns G onward), it's just easy to miss since it sits to
++        # the right of the Store-wise table rather than in its own sheet.
++        # This adds the SAME per-bucket account information (all accounts
++        # posted in this Store+Date bucket, with each account's signed GL
++        # total, not just the uncovered subset above) as an explicit column
++        # on every row-level sheet and on Store Date Buckets/Top 20
++        # Exceptions -- purely additive labeling, does not change
++        # bucket_status, bucket_diff, tolerance, or any other matching
++        # decision.
++        gl_all_accts_fmt = (
++            gl_by_account[gl_by_account["main_account"] != ""]
++            .groupby(["store_code", "bucket_gl_date"])
++            .apply(lambda g: ", ".join(
++                f"{a} (SAR {t:,.2f})"
++                for a, t in sorted(g.groupby("main_account")["gl_signed_amount"].sum().items())
++            ))
++        )
+     else:
+         gl_covered = pd.Series(dtype=float)
+         gl_uncovered = pd.Series(dtype=float)
+         gl_uncovered_accts = pd.Series(dtype=object)
++        gl_all_accts_fmt = pd.Series(dtype=object)
+ 
+     # V41 item 5 (correctness fix): covered_diff must compare GL Total
+     # (Covered By POS) against the POS total restricted to MAPPABLE
+@@ -1665,6 +1717,9 @@
+         pos_unattributed_sum = pd.Series(dtype=float)
+ 
+     _bkt_key = list(zip(merged["store_code"], merged["bucket_gl_date"]))
++    # V43 item 1: all GL accounts posted in this bucket, formatted for
++    # display -- see the comment above gl_all_accts_fmt for why this exists.
++    merged["gl_accounts_in_bucket_str"] = [gl_all_accts_fmt.get(k, "") for k in _bkt_key]
+     merged["gl_total_covered"] = [float(gl_covered.get(k, 0.0)) for k in _bkt_key]
+     merged["gl_total_uncovered"] = [float(gl_uncovered.get(k, 0.0)) for k in _bkt_key]
+     merged["gl_uncovered_accounts"] = [gl_uncovered_accts.get(k, []) for k in _bkt_key]
+@@ -1813,6 +1868,11 @@
+             "Match Level": "STORE + DATE (BUCKET SUM)",
+             "Bucket POS Total": float(b["pos_total"]), "Bucket GL Total": float(b["gl_total"]),
+             "Bucket Difference": float(b["bucket_diff"]),
++            # V43 item 1: which GL account(s) actually posted in this
++            # Store+Date bucket, with each account's own signed total --
++            # not which single GL row this POS row matched (bucket matching
++            # has no such 1:1 pairing; see "Match Level" above).
++            "GL Accounts In Bucket": b["gl_accounts_in_bucket_str"],
+             "Status": b["bucket_status"], "Match Rule": "Store + Date (Bucket Sum)",
+             "Reason": b["bucket_reason"], "GL Source File": "",
+             "Bucket POS Rows": int(b["pos_count"]), "Bucket GL Rows": int(b["gl_count"]),
+@@ -1830,6 +1890,7 @@
+             "GL Row": "", "GL Main Account": "", "GL Voucher": "", "GL Journal": "",
+             "GL Date": pd.NaT, "Match Level": "", "Bucket POS Total": float("nan"),
+             "Bucket GL Total": float("nan"), "Bucket Difference": float("nan"),
++            "GL Accounts In Bucket": "",
+             "Status": status, "Match Rule": "", "Reason": reason, "GL Source File": "",
+             "Bucket POS Rows": 0, "Bucket GL Rows": 0, "Bucket Tolerance": float("nan"),
+             "Is Duplicate POS Row": bool(p.get("is_duplicate_pos", False)), "Store Swap Suspected With": "",
+@@ -1839,7 +1900,8 @@
+     _detail_columns = [
+         "POS Row", "Merchant ID", "Store Code", "Provider", "POS Reference", "POS Date", "POS Amount",
+         "GL Row", "GL Main Account", "GL Voucher", "GL Journal", "GL Date", "Match Level",
+-        "Bucket POS Total", "Bucket GL Total", "Bucket Difference", "Status", "Match Rule", "Reason",
++        "Bucket POS Total", "Bucket GL Total", "Bucket Difference", "GL Accounts In Bucket",
++        "Status", "Match Rule", "Reason",
+         "GL Source File", "Bucket POS Rows", "Bucket GL Rows", "Bucket Tolerance",
+         "Is Duplicate POS Row", "Store Swap Suspected With", "Severity",
+     ]
+@@ -1878,6 +1940,7 @@
+         "store_swap_with": "Store Swap Suspected With",
+         "severity": "Full Variance Severity", "accounting_residual_severity": "Accounting Residual Severity",
+         "gl_total_covered": "GL Total (Covered By POS)", "gl_total_uncovered": "GL Total (No POS Provider This Date)",
++        "gl_accounts_in_bucket_str": "GL Accounts In This Bucket",
+         "gl_uncovered_accounts_str": "Uncovered GL Accounts", "unmapped_providers_str": "Unmapped Providers",
+         # V42 item 5: blank-provider POS activity as its own visible columns
+         # -- not a new bucket status, just a count/amount Finance can see
+@@ -1886,7 +1949,8 @@
+         "pos_unattributed_amount": "POS Amount With Blank Provider (SAR)",
+     })[["Store Code", "Date", "POS Rows", "POS Total", "GL Rows", "GL Total", "Difference",
+         "Bucket Tolerance", "Duplicate POS Rows Excluded", "Duplicate GL Rows Excluded",
+-        "GL Total (Covered By POS)", "GL Total (No POS Provider This Date)", "Uncovered GL Accounts",
++        "GL Total (Covered By POS)", "GL Total (No POS Provider This Date)", "GL Accounts In This Bucket",
++        "Uncovered GL Accounts",
+         "Unmapped Providers", "POS Rows With Blank Provider", "POS Amount With Blank Provider (SAR)",
+         "Store Swap Suspected With", "Full Variance Severity",
+         "Accounting Residual Severity", "Status", "Reason"]].copy()
