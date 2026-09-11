@@ -1,0 +1,19 @@
+--- /home/claude/repo_clone/logic/ai_llm_router.py	2026-09-11 20:01:21.596126768 +0000
++++ /home/claude/deliver_copilot2/logic/ai_llm_router.py	2026-09-11 19:55:26.448105657 +0000
+@@ -81,7 +81,7 @@
+     "settlement_intelligence", "commission_intelligence", "refund_intelligence",
+     "data_quality", "source_evidence", "copilot_help", "exceptions",
+     "date_range", "cash_report", "refunds", "compare", "lookup",
+-    "transactions", "sales", "summary", "unknown",
++    "highest_transaction", "transactions", "sales", "summary", "unknown",
+ ]
+ 
+ _INTENT_DESCRIPTIONS = {
+@@ -114,6 +114,7 @@
+     "refunds": "A simple refunds question (count/list), not the deeper refund_intelligence analytics.",
+     "compare": "Comparing two specific things against each other.",
+     "lookup": "Looking up one specific transaction by receipt/auth/authorization number.",
++    "highest_transaction": "The single highest-value (or largest/biggest/maximum) transaction within scope -- one specific transaction, not an aggregate total or a per-store breakdown.",
+     "transactions": "Requesting transaction-level detail/drill-down, not a summary.",
+     "sales": "A general sales/revenue/tender question -- the right default for 'how much did we sell'.",
+     "summary": "A generic overview/briefing/dashboard request, or anything that doesn't clearly fit a category above.",
