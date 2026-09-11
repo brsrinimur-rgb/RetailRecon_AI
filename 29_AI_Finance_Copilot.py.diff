@@ -1,0 +1,27 @@
+--- /home/claude/repo_clone/pages/29_AI_Finance_Copilot.py	2026-09-10 09:50:29.099543041 +0000
++++ /home/claude/deliver_copilot3/pages/29_AI_Finance_Copilot.py	2026-09-11 19:05:46.345393495 +0000
+@@ -54,17 +54,13 @@
+ if "copilot_messages" not in st.session_state:
+     st.session_state.copilot_messages=[]
+ 
+-# Daily finance briefing.
+-# Deliberately NOT passed the sticky chat context: this is a fixed, always-neutral
+-# overview, not a conversational turn. Reusing st.session_state.copilot_context here
+-# previously leaked whatever the user was drilling into in chat (e.g. after asking a
+-# cash question, this box kept re-rendering the old CASH-scoped tender-total line on
+-# every rerun instead of a true overall summary).
+-with st.expander("☀️ Daily Finance Briefing",expanded=True):
+-    briefing=answer_question("give me a finance summary",result,db,None,user_context=st.session_state.get("user"))
+-    st.markdown(briefing["text"])
+-    if isinstance(briefing.get("table"),pd.DataFrame) and not briefing["table"].empty:
+-        st.dataframe(briefing["table"],use_container_width=True,hide_index=True)
++# V-fix (2026-09-11): removed the always-visible "Daily Finance Briefing"
++# expander at the user's request. It used to auto-run a fixed "finance
++# summary" question and render it above the chat every time this page
++# loaded. The "Finance briefing" quick-question button below (in the "Try
++# asking" grid) still gives access to the exact same summary on demand,
++# through the normal chat flow, if it's ever wanted -- this only removes
++# the box that always appeared, unasked, at the top of the page.
+ 
+ st.markdown("#### Try asking")
+ q1,q2,q3,q4=st.columns(4)
