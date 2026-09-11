@@ -659,7 +659,24 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             "tell date","tell me the date","what date","which date","what dates","which dates",
             "date range","what period","which period","show date","current date range",
             "what's the date","whats the date"
-        ]):
+        ]) or re.search(r"\bwh\w*\s+(?:is\s+)?(?:the\s+)?dates?\s*\??$", ql) or re.search(r"\btell\b(?:\s+\S+){0,4}\s+dates?\s*\??$", ql):
+            # BUG FIX (2026-09-11): real reported case -- "tell me date whihc
+            # date" (a typo'd "tell me date, which date") matched NONE of the
+            # exact phrases above ("whihc" breaks "which date"; "tell me
+            # date" isn't "tell date" or "tell me the date"), so it fell all
+            # the way through this whole chain to the blind final fallback
+            # (`intent=prior.last_intent or "summary"`) and silently
+            # repeated the PREVIOUS turn's entire sales answer verbatim
+            # instead of ever answering the date question. Added two regex
+            # fallbacks, anchored to the END of the question so they only
+            # fire when "date(s)" is genuinely the last real word being
+            # asked about (not, say, "what dates are duplicate" -- a
+            # data-quality question that happens to also contain "date"):
+            #   - any "wh..." word (what/which/whats/whihc/...) directly
+            #     followed by "date(s)" at the end of the question.
+            #   - "tell" ... "date(s)" at the end of the question, catching
+            #     "tell me date" the same way "tell date"/"tell me the
+            #     date" already are above.
             intent="date_range"
         elif re.search(r"\bcash\b", ql):
             # V-fix (the dominant sticky-scope bug): this used to fire on ANY of

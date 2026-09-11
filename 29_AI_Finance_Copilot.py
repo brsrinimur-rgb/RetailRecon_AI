@@ -57,52 +57,16 @@ if "copilot_messages" not in st.session_state:
 # V-fix (2026-09-11): removed the always-visible "Daily Finance Briefing"
 # expander at the user's request. It used to auto-run a fixed "finance
 # summary" question and render it above the chat every time this page
-# loaded. The "Finance briefing" quick-question button below (in the "Try
-# asking" grid) still gives access to the exact same summary on demand,
-# through the normal chat flow, if it's ever wanted -- this only removes
-# the box that always appeared, unasked, at the top of the page.
-
-st.markdown("#### Try asking")
-q1,q2,q3,q4=st.columns(4)
-quick=None
-if q1.button("All store cash sales",use_container_width=True):
-    quick="need all store cash sales"
-if q2.button("601 sales as of 9 Aug 2026",use_container_width=True):
-    quick="601 sales as of 9 Aug 2026"
-if q3.button("Which transactions are not settled?",use_container_width=True):
-    quick="which transactions are not settled?"
-if q4.button("Show pending corrections",use_container_width=True):
-    quick="show pending corrections"
-
-r1,r2,r3,r4=st.columns(4)
-if r1.button("What needs attention?",use_container_width=True):
-    quick="what needs attention?"
-if r2.button("Store performance",use_container_width=True):
-    quick="show store performance"
-if r3.button("Provider performance",use_container_width=True):
-    quick="show provider performance"
-if r4.button("Top 10 risks",use_container_width=True):
-    quick="show top 10 risks"
-
-g1,g2,g3,g4=st.columns(4)
-if g1.button("D365 GL status",use_container_width=True):
-    quick="show d365 gl status"
-if g2.button("GL exceptions",use_container_width=True):
-    quick="show gl exceptions"
-if g3.button("Clearing movement",use_container_width=True):
-    quick="show clearing movement"
-if g4.button("Unexplained GL",use_container_width=True):
-    quick="show unexplained gl"
-
-s1,s2,s3,s4=st.columns(4)
-if s1.button("Finance briefing",use_container_width=True):
-    quick="give me a finance briefing"
-if s2.button("Settlement status",use_container_width=True):
-    quick="show settlement status"
-if s3.button("Data quality",use_container_width=True):
-    quick="check data quality"
-if s4.button("Close readiness",use_container_width=True):
-    quick="can I close the period?"
+# loaded. This only removed the box that always appeared, unasked, at the
+# top of the page -- the same summary is still reachable by simply typing
+# a question for it in the chat box below.
+#
+# V-fix (2026-09-11, same day): also removed the entire "Try asking"
+# quick-question button grid (16 buttons across 4 rows) at the user's
+# explicit request ("remove the details from AI Ask"). `quick` is gone
+# along with it -- the chat input below (`prompt=st.chat_input(...)`) is
+# completely unaffected and is still the only way to ask a question, exactly
+# as it already was for anything not covered by one of these buttons.
 
 for msg in st.session_state.copilot_messages:
     with st.chat_message(msg["role"]):
@@ -115,8 +79,6 @@ for msg in st.session_state.copilot_messages:
 prompt=st.chat_input(
     "Ask RetailRecon AI… e.g. '601 sales as of 9 Aug 2026', 'only MADA', 'which are unsettled?', 'show transactions'"
 )
-if quick:
-    prompt=quick
 
 if prompt:
     st.session_state.copilot_messages.append({"role":"user","text":prompt})

@@ -1,5 +1,5 @@
 --- /home/claude/repo_clone/ai_copilot.py	2026-09-11 18:07:31.087794416 +0000
-+++ /home/claude/deliver_copilot2/ai_copilot.py	2026-09-11 18:43:10.918222725 +0000
++++ /home/claude/deliver_copilot2/ai_copilot.py	2026-09-11 19:20:08.402827441 +0000
 @@ -59,6 +59,36 @@
  already works throughout this file.
  """
@@ -151,7 +151,7 @@
  
      # V-fix: keep the RAW per-turn payment detection (before falling back to
      # the sticky prior.payment) so the intent classifier below can tell "this
-@@ -415,145 +520,214 @@
+@@ -415,145 +520,231 @@
      # carried over from an earlier turn" -- see the cash_report branch and
      # the final fallback for why that distinction matters.
      raw_payment=_find_payment(q)
@@ -414,7 +414,24 @@
 +            "tell date","tell me the date","what date","which date","what dates","which dates",
 +            "date range","what period","which period","show date","current date range",
 +            "what's the date","whats the date"
-+        ]):
++        ]) or re.search(r"\bwh\w*\s+(?:is\s+)?(?:the\s+)?dates?\s*\??$", ql) or re.search(r"\btell\b(?:\s+\S+){0,4}\s+dates?\s*\??$", ql):
++            # BUG FIX (2026-09-11): real reported case -- "tell me date whihc
++            # date" (a typo'd "tell me date, which date") matched NONE of the
++            # exact phrases above ("whihc" breaks "which date"; "tell me
++            # date" isn't "tell date" or "tell me the date"), so it fell all
++            # the way through this whole chain to the blind final fallback
++            # (`intent=prior.last_intent or "summary"`) and silently
++            # repeated the PREVIOUS turn's entire sales answer verbatim
++            # instead of ever answering the date question. Added two regex
++            # fallbacks, anchored to the END of the question so they only
++            # fire when "date(s)" is genuinely the last real word being
++            # asked about (not, say, "what dates are duplicate" -- a
++            # data-quality question that happens to also contain "date"):
++            #   - any "wh..." word (what/which/whats/whihc/...) directly
++            #     followed by "date(s)" at the end of the question.
++            #   - "tell" ... "date(s)" at the end of the question, catching
++            #     "tell me date" the same way "tell date"/"tell me the
++            #     date" already are above.
 +            intent="date_range"
 +        elif re.search(r"\bcash\b", ql):
 +            # V-fix (the dominant sticky-scope bug): this used to fire on ANY of
