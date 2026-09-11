@@ -619,7 +619,18 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             intent="greeting"
         elif any(x in ql for x in ["pending correction","correction approval","corrections pending"]):
             intent="corrections"
-        elif any(x in ql for x in ["jv status","journal status","ready for d365","ready to post","posting status"]):
+        elif any(x in ql for x in ["jv status","journal status","ready for d365","ready to post","posting status"]) or (re.search(r"\bjv\b",ql) and "gl" not in ql):
+            # BUG FIX (2026-09-11): same bug class as the "i need bank
+            # details" fix just above -- a bare "jv" mention with no more
+            # specific phrase attached (e.g. "i need jv details", "show jv",
+            # "jv info") matched none of the exact phrases above, so it fell
+            # through to the generic "details"/"sales" catch-all further down
+            # instead -- on a follow-up turn, silently re-running whatever
+            # report was already active instead of ever showing JV status.
+            # The "gl" not in ql guard keeps gl_control's own, more specific
+            # "jv to gl"/"source to gl" phrases (checked further down) working
+            # exactly as before -- a bare "jv" only wins here when the
+            # question is NOT also about GL.
             intent="jv"
         elif any(x in ql for x in ["close status","month end"]):
             # BUG FIX (2026-09-11): "period close" and "ready to close" used to
@@ -699,7 +710,23 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             intent="close_readiness"
         elif any(x in ql for x in ["finance briefing","today's finance briefing","today finance briefing","management briefing","cfo briefing"]):
             intent="management_brief"
-        elif any(x in ql for x in ["bank settled","awaiting bank","settlement delay","oldest unsettled","settlement status","how much is settled"]):
+        elif any(x in ql for x in ["bank settled","awaiting bank","settlement delay","oldest unsettled","settlement status","how much is settled"]) or re.search(r"\bbank\b",ql):
+            # BUG FIX (2026-09-11): a bare, ordinary mention of "bank" with no
+            # more specific phrase attached (e.g. "i need bank details", "bank
+            # info", "show bank") used to match NONE of the specific phrases
+            # above, so it fell all the way through the chain to the generic
+            # "details" catch-all further down -- which, on a follow-up turn,
+            # just silently re-ran whatever report was already active (e.g.
+            # a TAMARA sales summary), completely ignoring that the user
+            # explicitly asked about the BANK side of things. Real user report
+            # (2026-09-11): "i need bank details" after a TAMARA sales
+            # question returned the exact same TAMARA sales answer, unchanged.
+            # A bare "bank" mention not already caught by a more specific
+            # phrase above is now routed to this bank/settlement intelligence
+            # report instead. This check runs AFTER every more specific
+            # bank-related phrase in unsettled/settlement_batch/this same list
+            # above, so none of those are affected -- only a previously-
+            # unhandled bare "bank" falls through to here.
             intent="settlement_intelligence"
         elif any(x in ql for x in ["commission error","commission errors","commission validation","commission amount","vat on commission","commission difference"]):
             intent="commission_intelligence"
