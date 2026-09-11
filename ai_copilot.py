@@ -300,6 +300,29 @@ def _find_payment(q):
             return _PAYMENT_FUZZY_CANDIDATES[match[0]]
     return None
 
+def _fuzzy_word_present(ql, target, cutoff=0.72):
+    """
+    Same typo-tolerance approach as _find_payment() above (same-first-letter
+    guard + difflib), reused for a small set of the highest-frequency plain
+    finance keywords ("sales","cash","refund","commission"...) that are NOT
+    payment-method names. Added 2026-09-11 after wide natural-language
+    coverage testing turned up real, everyday typos ("saels"/"slaes" for
+    sales, "cahs" for cash, "refudns" for refunds, "commision" for
+    commission) that fell all the way through the keyword chain to a
+    generic/wrong answer instead of the intended report. Only ever ADDS a
+    match on top of the existing exact-substring checks -- never removes or
+    changes one -- so correctly-spelled input (the normal, already-tested
+    case) is completely unaffected.
+    """
+    for tok in re.findall(r"[a-z]{3,}", ql):
+        if tok==target:
+            continue  # already handled by the exact-substring check
+        if tok[:1]!=target[:1]:
+            continue
+        if difflib.get_close_matches(tok, [target], n=1, cutoff=cutoff):
+            return True
+    return False
+
 def _parse_named_date(text, default_year=None):
     text=text.strip().lower().replace(","," ")
     year_default=int(default_year or pd.Timestamp.today().year)
@@ -584,20 +607,37 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
         intent=llm_intent
     else:
         greeting_match = (
-            re.search(r"\b(?:hello|hi|hey)\b", ql) is not None
+            re.search(r"\b(?:hello|hi+|hey+)\b", ql) is not None
             or any(x in ql for x in ["good morning","good afternoon","good evening"])
         )
+        # BUG FIX (2026-09-11): "hi+"/"hey+" (instead of the old exact "hi"/
+        # "hey") also catches the casual, very common "hii"/"hiii"/"heyy"
+        # typing style (found via wide natural-language coverage testing) --
+        # still word-bounded on both sides, so it cannot match "hi" or "hey"
+        # buried inside an unrelated word like "history" or "heyday".
         if greeting_match and len(ql.split())<=4:
             intent="greeting"
         elif any(x in ql for x in ["pending correction","correction approval","corrections pending"]):
             intent="corrections"
         elif any(x in ql for x in ["jv status","journal status","ready for d365","ready to post","posting status"]):
             intent="jv"
-        elif any(x in ql for x in ["close status","month end","period close","ready to close"]):
+        elif any(x in ql for x in ["close status","month end"]):
+            # BUG FIX (2026-09-11): "period close" and "ready to close" used to
+            # be listed here too, but they are ALSO listed (further down) under
+            # close_readiness's own keyword list -- and because this "close"
+            # check runs first in the chain, it always won that race, making
+            # close_readiness's own "period close"/"ready to close" entries
+            # permanently unreachable dead code. "ready to close" in particular
+            # reads far more naturally as a readiness QUESTION ("can we close?")
+            # than a request for the raw close-calendar listing, so both
+            # phrases are removed from here and left solely to close_readiness
+            # below, where they were clearly always intended to go. "close
+            # status"/"month end" (the only phrases any existing regression
+            # test actually depends on for this intent) are unaffected.
             intent="close"
         elif any(x in ql for x in ["merchant mapping","terminal mapping","store mapping","mapping required"]):
             intent="mapping"
-        elif any(x in ql for x in ["commission","fee","fees","vat","net amount"]):
+        elif any(x in ql for x in ["commission","fee","fees","vat","net amount"]) or _fuzzy_word_present(ql,"commission"):
             intent="commission"
         elif any(x in ql for x in ["not settled","unsettled","bank missing","money not received","not received","settlement delay","delayed"]):
             intent="unsettled"
@@ -616,6 +656,19 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             "which stores gl","gl not found","jv to gl","source to gl"
         ]):
             intent="gl_control"
+        elif any(x in ql for x in ["store performance","store score","store control score","which store is worst","which store needs attention"]):
+            # BUG FIX (2026-09-11): this store_performance check used to sit
+            # AFTER the risk check below, but risk's own list includes the
+            # generic substring "needs attention" -- which is also a substring
+            # of "which store needs attention", explicitly listed right here.
+            # Since the risk check ran first, it always intercepted that exact
+            # phrase, making this list's own "which store needs attention"
+            # entry permanently unreachable dead code (found via wide
+            # natural-language coverage testing). Moving this block earlier
+            # fixes that one specific phrase; it cannot change any other
+            # phrase's routing, since nothing else here overlaps with risk's
+            # keyword list.
+            intent="store_performance"
         elif any(x in ql for x in [
             "biggest risk","highest risk","risk today","risks today","top risk","top risks",
             "priority exception","priority exceptions","what needs attention","needs attention",
@@ -627,15 +680,20 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             # this text) never matched and fell through to the fallback logic
             # below instead.
             intent="risk"
-        elif any(x in ql for x in ["store performance","store score","store control score","which store is worst","which store needs attention"]):
-            intent="store_performance"
         elif any(x in ql for x in ["provider performance","provider score","payment performance","which provider","provider delay"]):
             intent="provider_performance"
         elif any(x in ql for x in [
             "matched and unmatched","matched & unmatched","match and unmatched","matched/unmatched",
             "reconciliation status","match status","match rate","how much matched","how much unmatched",
             "matched amount","unmatched amount"
-        ]):
+        ]) or re.search(r"\bhow much is\s+(?:matched|unmatched)\b",ql):
+            # BUG FIX (2026-09-11): "how much matched"/"how much unmatched" were
+            # already listed above, but the extremely natural, grammatically
+            # normal way most people actually phrase this -- "how much IS
+            # matched/unmatched" -- has an extra word breaking that exact
+            # substring match, so it fell through several unrelated checks and
+            # landed on the generic "exceptions" intent instead (found via wide
+            # natural-language coverage testing).
             intent="reconciliation_status"
         elif any(x in ql for x in ["can i close","ready to close","close readiness","can we close","period close"]):
             intent="close_readiness"
@@ -659,7 +717,16 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             "tell date","tell me the date","what date","which date","what dates","which dates",
             "date range","what period","which period","show date","current date range",
             "what's the date","whats the date"
-        ]) or re.search(r"\bwh\w*\s+(?:is\s+)?(?:the\s+)?dates?\s*\??$", ql) or re.search(r"\btell\b(?:\s+\S+){0,4}\s+dates?\s*\??$", ql):
+        ]) or re.search(r"\bwh\w*\s+(?:is\s+)?(?:the\s+)?dates?\s*\??$", ql) or re.search(r"\btell\b(?:\s+\S+){0,4}\s+dates?\s*\??$", ql) or re.search(r"\bwh\w*\s+dates?\s+is\s+it\b", ql):
+            # BUG FIX (2026-09-11): "what date is it"/"which date is it" is a
+            # completely ordinary, very common way to ask this, but "date" is
+            # not the LAST word (both existing end-anchored regexes above
+            # require that), so it fell through to "summary" instead (found
+            # via wide natural-language coverage testing). This third regex
+            # covers that one specific "...date is it" shape without loosening
+            # the end-anchor on the other two (which stay as-is, deliberately,
+            # to avoid re-introducing the "what dates are duplicate" false-
+            # positive risk already called out below).
             # BUG FIX (2026-09-11): real reported case -- "tell me date whihc
             # date" (a typo'd "tell me date, which date") matched NONE of the
             # exact phrases above ("whihc" breaks "which date"; "tell me
@@ -678,7 +745,7 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             #     "tell me date" the same way "tell date"/"tell me the
             #     date" already are above.
             intent="date_range"
-        elif re.search(r"\bcash\b", ql):
+        elif re.search(r"\bcash\b", ql) or _fuzzy_word_present(ql,"cash"):
             # V-fix (the dominant sticky-scope bug): this used to fire on ANY of
             # a long list of ordinary finance words ("sales","top","highest",
             # "net","details","transactions","trend","daily",...) whenever
@@ -698,16 +765,54 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             # any other intent gets resolved in between, instead of persisting
             # for the rest of the session.
             intent="cash_report"
-        elif any(x in ql for x in ["refund","refunds"]):
+        elif any(x in ql for x in ["refund","refunds"]) or _fuzzy_word_present(ql,"refund") or _fuzzy_word_present(ql,"refunds"):
             intent="refunds"
         elif any(x in ql for x in ["compare","comparison","versus"," vs "]):
             intent="compare"
-        elif re.search(r"\b(receipt|auth|authorization)\b",ql) and re.search(r"\d{5,}",ql):
+        elif (
+            re.search(r"\b(?:highest|largest|biggest|maximum|max)\b(?:\s+\S+){0,4}\s+(?:transaction|value|amount)s?\b",ql)
+            or re.search(r"\bsingle\s+(?:highest|largest|biggest)\b",ql)
+        ):
+            # Deliberately does NOT include bare "sale(s)" as a trigger word
+            # here (only "transaction(s)/value/amount") -- "which store has
+            # highest sales" should stay a store-ranking/aggregate question
+            # (handled elsewhere), not get redirected to a single-row lookup
+            # just because it contains "highest" near "sales".
+            # BUG FIX (2026-09-11): real reported case -- "tamara highest
+            # value for single transcation" (note the typo) matched NONE of
+            # the existing "highest X" checks (those all require a specific
+            # word like "risk" or "refund" right next to "highest" -- this
+            # question has neither), so it fell through everything to the
+            # blind fallback, which routed on the payment name alone
+            # ("TAMARA" -> raw_payment set -> intent="sales") and produced a
+            # generic store-wise sales SUMMARY table instead of the ONE
+            # transaction actually asked for. There was no answer capability
+            # for "the single highest-value transaction" at all before this
+            # fix -- see _highest_transaction_answer() below, a new,
+            # additive function; every existing report function/table is
+            # completely unchanged.
+            intent="highest_transaction"
+        elif re.search(r"\b(receipt|auth|authorization)\b",ql) and re.search(r"\b(?:\d{5,}|[a-z]+\d+|\d+[a-z]+)\b",ql):
+            # BUG FIX (2026-09-11): this used to require 5+ CONSECUTIVE digits
+            # anywhere in the question -- but this app's own real receipt/auth
+            # IDs (see every regression fixture: "601A","606A","R1","R2"...) are
+            # short alphanumeric codes, not long numeric-only strings. That
+            # meant a completely ordinary "find receipt 601A" or "find auth A2"
+            # could NEVER match this branch at all, and silently fell all the
+            # way through to the generic "summary" fallback (found via wide
+            # natural-language coverage testing) instead of ever looking the
+            # transaction up. Broadened to also accept a short letter+digit or
+            # digit+letter token (e.g. "601a","a2","r2") alongside the original
+            # 5+ digit form (kept for any genuinely long numeric receipt
+            # number). A bare, letter-less short number (e.g. "receipt 601")
+            # deliberately still does NOT match here, since 3-digit numbers in
+            # this app are overwhelmingly store codes, not receipt IDs -- that
+            # ambiguity is intentionally left alone.
             intent="lookup"
         elif any(x in ql for x in ["show transactions","transaction details","show details","details"]):
             # "sales details" should still be sales summary unless follow-up context is present
             intent="transactions" if prior.last_intent else "sales"
-        elif any(x in ql for x in ["sales","sale","revenue","tender","payment mix"]):
+        elif any(x in ql for x in ["sales","sale","revenue","tender","payment mix"]) or _fuzzy_word_present(ql,"sales") or _fuzzy_word_present(ql,"sale"):
             intent="sales"
         elif any(x in ql for x in ["summary","briefing","overview","dashboard"]):
             intent="summary"
@@ -809,12 +914,42 @@ def _scope_text(ctx):
         parts.append(f"up to {_fmt_date(ctx.date_to)}")
     return " | ".join(parts) if parts else "current loaded reconciliation"
 
+def _safe_col_or_zero(df,*names):
+    """
+    Same idea as DataFrame.get(name, default) but safe for the very common
+    downstream pattern pd.to_numeric(df.get(col,0),errors="coerce").fillna(...):
+    plain .get() falls back to whatever literal default it is given (usually
+    the int 0) the moment a column is missing, and pd.to_numeric(0) returns a
+    bare numpy scalar with no .fillna() method -- crashing outright with
+    "AttributeError: 'int' object has no attribute 'fillna'" whenever EVERY
+    one of the expected column names happens to be absent from that
+    particular DataFrame.
+
+    Found 2026-09-11 via wide natural-language coverage testing across every
+    Copilot question type: everyday questions like "any exceptions today",
+    "store performance", "how much is unmatched" and even plain "summary"
+    crashed the whole page outright whenever the loaded reconciliation's
+    unmatched-POS or matched rows did not carry one of the expected amount
+    column names (e.g. a provider file with no recognized "POS Amount"/
+    "POS Total" column). This is a pure, additive safety net -- when the
+    named column IS present (the normal, already-tested case for every
+    existing regression suite) this returns exactly the same Series
+    DataFrame.get() would have, with identical values; it only changes
+    behavior in the previously-crashing case, returning a same-length,
+    all-zero float Series instead of a bare int so every existing
+    pd.to_numeric(...).fillna(...) call site downstream keeps working.
+    """
+    for name in names:
+        if name in df.columns:
+            return df[name]
+    return pd.Series(0.0,index=df.index)
+
 def _sales_answer(result,ctx,detail=False,db_module=None):
     tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
     if tender.empty:
         return {"text":f"I couldn't find D365 Store Tender sales for {_scope_text(ctx)} in the active reconciliation.","table":pd.DataFrame()}
     tender=tender.copy()
-    tender["D365 Amount"]=pd.to_numeric(tender.get("D365 Amount",0),errors="coerce").fillna(0.0)
+    tender["D365 Amount"]=pd.to_numeric(_safe_col_or_zero(tender,"D365 Amount"),errors="coerce").fillna(0.0)
     if "Store Code" in tender.columns:
         tender["Store Code"]=tender["Store Code"].map(_norm_store)
         tender=_add_store_name_column(tender,db_module,"Store Code")
@@ -851,6 +986,51 @@ def _sales_answer(result,ctx,detail=False,db_module=None):
         summary=pd.DataFrame({"Payment Type":grp.index,"Amount":grp.values})
     return {"text":" ".join(lines),"table":summary}
 
+def _highest_transaction_answer(result,ctx,db_module=None):
+    """
+    New, additive report (2026-09-11): the single highest-value D365 Store
+    Tender transaction within the current scope (store/payment/date), e.g.
+    "tamara highest value for single transaction". Previously there was no
+    capability for this at all -- the question fell through to the generic
+    aggregate _sales_answer() summary instead. This never changes any
+    existing report; it only adds a new one.
+    """
+    tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
+    if tender.empty:
+        return {"text":f"I couldn't find D365 Store Tender sales for {_scope_text(ctx)} in the active reconciliation.","table":pd.DataFrame()}
+    tender=tender.copy()
+    tender["D365 Amount"]=pd.to_numeric(_safe_col_or_zero(tender,"D365 Amount"),errors="coerce").fillna(0.0)
+    if "Store Code" in tender.columns:
+        tender["Store Code"]=tender["Store Code"].map(_norm_store)
+        tender=_add_store_name_column(tender,db_module,"Store Code")
+
+    idx=tender["D365 Amount"].idxmax()
+    top=tender.loc[idx]
+    amount=float(top["D365 Amount"])
+
+    detail_parts=[]
+    if "Store Code" in tender.columns and str(top.get("Store Code","")).strip():
+        detail_parts.append(f"**{_store_label(top.get('Store Code',''),db_module)}**")
+    date_str=_fmt_date(top.get("Date")) if "Date" in tender.columns else ""
+    if date_str:
+        detail_parts.append(f"on **{date_str}**")
+    if "D365 Payment" in tender.columns and str(top.get("D365 Payment","")).strip():
+        detail_parts.append(f"payment type **{str(top['D365 Payment']).upper()}**")
+    if "Receipt ID" in tender.columns and str(top.get("Receipt ID","")).strip():
+        detail_parts.append(f"Receipt **{top['Receipt ID']}**")
+    if "Auth Code" in tender.columns and str(top.get("Auth Code","")).strip():
+        detail_parts.append(f"Auth **{top['Auth Code']}**")
+    detail_text=", ".join(detail_parts)
+
+    text=(
+        f"The single highest-value transaction for **{_scope_text(ctx)}** is **{_fmt_sar(amount)}**"
+        + (f" — {detail_text}" if detail_text else "")
+        + f", out of **{len(tender):,}** transaction(s) in scope."
+    )
+    cols=[c for c in ["Store Code","Store Name","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount"] if c in tender.columns]
+    table=tender.loc[[idx],cols]
+    return {"text":text,"table":table}
+
 def _cash_report(result,ctx,question="",db_module=None):
     """
     Advanced D365 Store Tender cash analytics.
@@ -883,7 +1063,7 @@ def _cash_report(result,ctx,question="",db_module=None):
     cash["Store Code"]=cash["Store Code"].map(_norm_store)
     cash["Date"]=pd.to_datetime(cash["Date"],errors="coerce")
     cash["Cash Signed Amount"]=pd.to_numeric(
-        cash.get("Cash Amount",cash.get("D365 Amount",0)),errors="coerce"
+        _safe_col_or_zero(cash,"Cash Amount","D365 Amount"),errors="coerce"
     ).fillna(0.0)
     cash["Cash Classification"]=np.where(
         cash["Cash Signed Amount"]>0,"Cash Sales",
@@ -919,7 +1099,7 @@ def _cash_report(result,ctx,question="",db_module=None):
     if not all_tender.empty:
         all_tender=all_tender.copy()
         all_tender["Store Code"]=all_tender["Store Code"].map(_norm_store)
-        all_tender["Amt"]=pd.to_numeric(all_tender.get("D365 Amount",0),errors="coerce").fillna(0.0)
+        all_tender["Amt"]=pd.to_numeric(_safe_col_or_zero(all_tender,"D365 Amount"),errors="coerce").fillna(0.0)
         positive_total_by_store=(
             all_tender[all_tender["Amt"]>0]
             .groupby("Store Code")["Amt"].sum()
@@ -1082,8 +1262,8 @@ def _date_range_answer(result,ctx):
 def _exceptions_answer(result,ctx):
     us=_filter_recon(result.get("unmatched_sales",pd.DataFrame()),ctx)
     up=_filter_recon(result.get("unmatched_pos",pd.DataFrame()),ctx,date_col="POS Date")
-    amount_us=pd.to_numeric(us.get("D365 Amount",us.get("D365 Total",0)),errors="coerce").fillna(0).abs().sum() if not us.empty else 0
-    amount_up=pd.to_numeric(up.get("POS Amount",up.get("POS Total",0)),errors="coerce").fillna(0).abs().sum() if not up.empty else 0
+    amount_us=pd.to_numeric(_safe_col_or_zero(us,"D365 Amount","D365 Total"),errors="coerce").fillna(0).abs().sum() if not us.empty else 0
+    amount_up=pd.to_numeric(_safe_col_or_zero(up,"POS Amount","POS Total"),errors="coerce").fillna(0).abs().sum() if not up.empty else 0
     text=(f"For **{_scope_text(ctx)}**, I found **{len(us):,} D365-side exception(s)** "
           f"worth about **{_fmt_sar(amount_us)}** and **{len(up):,} provider-side exception(s)** "
           f"worth about **{_fmt_sar(amount_up)}**.")
@@ -1100,7 +1280,7 @@ def _unsettled_answer(result,ctx):
     if "Bank Settled" not in m.columns:
         return {"text":"Bank settlement status is not available in the current reconciliation data.","table":pd.DataFrame()}
     unsettled=m[~m["Bank Settled"].fillna(False).astype(bool)].copy()
-    amt=pd.to_numeric(unsettled.get("Sales Amount",unsettled.get("D365 Amount",0)),errors="coerce").fillna(0).sum() if not unsettled.empty else 0
+    amt=pd.to_numeric(_safe_col_or_zero(unsettled,"Sales Amount","D365 Amount"),errors="coerce").fillna(0).sum() if not unsettled.empty else 0
     text=f"For **{_scope_text(ctx)}**, **{len(unsettled):,} matched transaction(s)** totaling **{_fmt_sar(amt)}** are not yet bank settled."
     return {"text":text,"table":unsettled.head(500)}
 
@@ -1108,9 +1288,9 @@ def _commission_answer(result,ctx):
     m=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
     if m.empty:
         return {"text":f"No matched settlement data is available for {_scope_text(ctx)}.","table":pd.DataFrame()}
-    commission=pd.to_numeric(m.get("Commission",0),errors="coerce").fillna(0).sum()
-    vat=pd.to_numeric(m.get("VAT",0),errors="coerce").fillna(0).sum()
-    net=pd.to_numeric(m.get("Net Amount",0),errors="coerce").fillna(0).sum()
+    commission=pd.to_numeric(_safe_col_or_zero(m,"Commission"),errors="coerce").fillna(0).sum()
+    vat=pd.to_numeric(_safe_col_or_zero(m,"VAT"),errors="coerce").fillna(0).sum()
+    net=pd.to_numeric(_safe_col_or_zero(m,"Net Amount"),errors="coerce").fillna(0).sum()
     text=(f"For **{_scope_text(ctx)}**, recorded commission is **{_fmt_sar(commission)}**, "
           f"VAT is **{_fmt_sar(vat)}**, and provider/bank net amount is **{_fmt_sar(net)}**.")
     cols=[c for c in ["Store Code","Date","Receipt ID","Auth Code","Payment Type","Sales Amount","Commission","VAT","Net Amount","Bank Settled"] if c in m.columns]
@@ -1120,7 +1300,7 @@ def _refunds_answer(result,ctx):
     tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
     if tender.empty:
         return {"text":f"No D365 tender data found for {_scope_text(ctx)}.","table":pd.DataFrame()}
-    amt=pd.to_numeric(tender.get("D365 Amount",0),errors="coerce").fillna(0)
+    amt=pd.to_numeric(_safe_col_or_zero(tender,"D365 Amount"),errors="coerce").fillna(0)
     refunds=tender[amt<0].copy()
     total=amt[amt<0].sum()
     return {"text":f"For **{_scope_text(ctx)}**, I found **{len(refunds):,} negative/refund tender line(s)** totaling **{_fmt_sar(total)}**.",
@@ -1130,7 +1310,21 @@ def _lookup_answer(result,ctx,question):
     upper=question.upper()
     # Prefer the token following receipt/auth wording, including short test/demo IDs.
     specific=re.search(r"\b(?:RECEIPT|AUTH|AUTHORIZATION)\s*(?:ID|CODE|NO|NUMBER)?\s*[:#-]?\s*([A-Z0-9-]{2,})\b",upper)
-    nums=re.findall(r"\b[A-Z0-9-]{5,}\b",upper)
+    # BUG FIX (2026-09-11): this used to accept ANY plain uppercase word of
+    # 5+ letters as a candidate token, with no requirement that it actually
+    # contain a digit -- so a totally ordinary question like "find receipt
+    # R2" matched "RECEIPT" itself (7 letters) as a "candidate", and since
+    # candidates are picked LAST-one-wins, that keyword swallowed the real,
+    # correctly-extracted ID ("R2") from `specific` right above. This bug was
+    # previously invisible because interpret_query's own "lookup" intent used
+    # to require 5+ CONSECUTIVE DIGITS to even reach this function at all --
+    # fixing that (this same session, via wide natural-language coverage
+    # testing) exposed this second, previously-dormant bug immediately
+    # afterward. Requiring at least one digit keeps genuine alphanumeric/
+    # numeric codes ("12345","606A","R2A1B2") while excluding plain English
+    # words ("RECEIPT","AUTHORIZATION","NUMBER","CODE"...) that happen to be
+    # long enough to otherwise match.
+    nums=[n for n in re.findall(r"\b[A-Z0-9-]{5,}\b",upper) if any(ch.isdigit() for ch in n)]
     candidates=([specific.group(1)] if specific else []) + [n for n in nums if not re.fullmatch(r"20\d{2}",n)]
     if not candidates:
         return {"text":"Please give me the Receipt ID or Auth Code you want me to investigate.","table":pd.DataFrame()}
@@ -1174,7 +1368,7 @@ def _compare_answer(result,ctx,question,db_module=None):
     for s in stores:
         c=CopilotContext(store_codes=[s],payment=ctx.payment,date_from=ctx.date_from,date_to=ctx.date_to,date_mode=ctx.date_mode)
         x=_filter_tender(tender,c)
-        amt=pd.to_numeric(x.get("D365 Amount",0),errors="coerce").fillna(0).sum() if not x.empty else 0
+        amt=pd.to_numeric(_safe_col_or_zero(x,"D365 Amount"),errors="coerce").fillna(0).sum() if not x.empty else 0
         rows.append({"Store Code":s,"Store Name":_best_store_name(s,db_module),"Sales/Tender Total":amt,"Transaction Lines":len(x)})
     table=pd.DataFrame(rows)
     best=table.sort_values("Sales/Tender Total",ascending=False).iloc[0]
@@ -1249,7 +1443,7 @@ def _risk_answer(result,ctx,question="",db_module=None):
 
     # Missing POS / provider settlement.
     if not us.empty:
-        amt=pd.to_numeric(us.get("D365 Amount",0),errors="coerce").fillna(0).abs()
+        amt=pd.to_numeric(_safe_col_or_zero(us,"D365 Amount"),errors="coerce").fillna(0).abs()
         for idx,r in us.iterrows():
             rows.append({
                 "Risk Type":"Missing POS/Provider",
@@ -1358,13 +1552,13 @@ def _store_performance_answer(result,ctx,db_module=None):
         ms=m[m["Store Code"].map(_norm_store)==s] if not m.empty and "Store Code" in m.columns else pd.DataFrame()
         uss=us[us["Store Code"].map(_norm_store)==s] if not us.empty and "Store Code" in us.columns else pd.DataFrame()
         ups=up[up["POS Store"].map(_norm_store)==s] if not up.empty and "POS Store" in up.columns else pd.DataFrame()
-        sales=float(pd.to_numeric(ts.get("D365 Amount",0),errors="coerce").fillna(0).sum()) if not ts.empty else 0
-        matched_amt=float(pd.to_numeric(ms.get("D365 Amount",0),errors="coerce").fillna(0).sum()) if not ms.empty else 0
+        sales=float(pd.to_numeric(_safe_col_or_zero(ts,"D365 Amount"),errors="coerce").fillna(0).sum()) if not ts.empty else 0
+        matched_amt=float(pd.to_numeric(_safe_col_or_zero(ms,"D365 Amount"),errors="coerce").fillna(0).sum()) if not ms.empty else 0
         open_amt=0.0
         if not uss.empty:
-            open_amt+=float(pd.to_numeric(uss.get("D365 Amount",0),errors="coerce").fillna(0).abs().sum())
+            open_amt+=float(pd.to_numeric(_safe_col_or_zero(uss,"D365 Amount"),errors="coerce").fillna(0).abs().sum())
         if not ups.empty:
-            open_amt+=float(pd.to_numeric(ups.get("POS Amount",0),errors="coerce").fillna(0).abs().sum())
+            open_amt+=float(pd.to_numeric(_safe_col_or_zero(ups,"POS Amount"),errors="coerce").fillna(0).abs().sum())
         bank_open=0
         if not ms.empty and "Bank Settled" in ms.columns:
             bank_open=int((~ms["Bank Settled"].fillna(False).astype(bool)).sum())
@@ -1418,8 +1612,8 @@ def _provider_performance_answer(result,ctx):
             "Awaiting Bank":max(total-settled,0),
             "Provider-side Exceptions":len(uu),
             "Average Settlement Delay Days":round(float(delay.mean()),2) if not delay.empty else np.nan,
-            "Commission":float(pd.to_numeric(mm.get("Commission",0),errors="coerce").fillna(0).sum()) if not mm.empty else 0.0,
-            "VAT":float(pd.to_numeric(mm.get("VAT",0),errors="coerce").fillna(0).sum()) if not mm.empty else 0.0,
+            "Commission":float(pd.to_numeric(_safe_col_or_zero(mm,"Commission"),errors="coerce").fillna(0).sum()) if not mm.empty else 0.0,
+            "VAT":float(pd.to_numeric(_safe_col_or_zero(mm,"VAT"),errors="coerce").fillna(0).sum()) if not mm.empty else 0.0,
         })
     table=pd.DataFrame(rows)
     if table.empty:
@@ -1523,7 +1717,7 @@ def _fc_commission(result,ctx,db_module=None):
 def _fc_refunds(result,ctx,db_module=None):
     tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
     if tender.empty:return {"text":f"I don't have D365 tender data for **{_scope_text(ctx)}**.","table":pd.DataFrame()}
-    x=tender.copy(); x["D365 Amount"]=pd.to_numeric(x.get("D365 Amount",0),errors="coerce").fillna(0)
+    x=tender.copy(); x["D365 Amount"]=pd.to_numeric(_safe_col_or_zero(x,"D365 Amount"),errors="coerce").fillna(0)
     r=x[x["D365 Amount"]<0].copy()
     amt=float(r["D365 Amount"].sum()); gross=float(x.loc[x["D365 Amount"]>0,"D365 Amount"].sum())
     ratio=(abs(amt)/gross*100) if gross else 0
@@ -1612,14 +1806,14 @@ def _gl_control_answer(result,ctx,question=""):
     clearing=scoped(clearing)
 
     if "exception" in ql or "mismatch" in ql or "not found" in ql or "unexplained" in ql:
-        amount=float(pd.to_numeric(exc.get("Amount",0),errors="coerce").fillna(0).sum()) if not exc.empty else 0
+        amount=float(pd.to_numeric(_safe_col_or_zero(exc,"Amount"),errors="coerce").fillna(0).sum()) if not exc.empty else 0
         return {
             "text":f"For **{_scope_text(ctx)}**, I found **{len(exc):,} D365 GL control exception(s)** with gross reviewed exposure of **{_fmt_sar(amount)}**.",
             "table":exc.head(500)
         }
 
     if "balance" in ql or "movement" in ql or "clearing" in ql:
-        net=float(pd.to_numeric(clearing.get("Net GL Movement",0),errors="coerce").fillna(0).sum()) if not clearing.empty else 0
+        net=float(pd.to_numeric(_safe_col_or_zero(clearing,"Net GL Movement"),errors="coerce").fillna(0).sum()) if not clearing.empty else 0
         return {
             "text":f"For **{_scope_text(ctx)}**, the uploaded D365 clearing extracts show net signed GL movement of **{_fmt_sar(net)}**. This is a movement control, not a certified closing balance unless the uploaded population is complete.",
             "table":clearing.head(500)
@@ -1658,15 +1852,15 @@ def _settlement_batch_answer(result,ctx,question=""):
 
     if "pending" in ql or "not received" in ql:
         y=x[x["Settlement Status"]!="BANK RECEIVED"].copy()
-        amt=float(pd.to_numeric(y.get("Expected Bank Amount",0),errors="coerce").fillna(0).sum()) if not y.empty else 0
+        amt=float(pd.to_numeric(_safe_col_or_zero(y,"Expected Bank Amount"),errors="coerce").fillna(0).sum()) if not y.empty else 0
         return {
             "text":f"For **{_scope_text(ctx)}**, **{len(y):,} settlement batch(es)** are not yet verified as BANK RECEIVED, representing expected receipts of **{_fmt_sar(amt)}**.",
             "table":y.head(500)
         }
 
     received=x[x["Settlement Status"]=="BANK RECEIVED"].copy()
-    expected=float(pd.to_numeric(x.get("Expected Bank Amount",0),errors="coerce").fillna(0).sum())
-    actual=float(pd.to_numeric(received.get("Actual Bank Amount",0),errors="coerce").fillna(0).sum()) if not received.empty else 0
+    expected=float(pd.to_numeric(_safe_col_or_zero(x,"Expected Bank Amount"),errors="coerce").fillna(0).sum())
+    actual=float(pd.to_numeric(_safe_col_or_zero(received,"Actual Bank Amount"),errors="coerce").fillna(0).sum()) if not received.empty else 0
     return {
         "text":(
             f"Settlement Batch Engine for **{_scope_text(ctx)}**: **{len(received):,}/{len(x):,} batch(es)** are BANK RECEIVED. "
@@ -1762,6 +1956,8 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
         payload=_refunds_answer(result,ctx)
     elif intent=="lookup":
         payload=_lookup_answer(result,ctx,question)
+    elif intent=="highest_transaction":
+        payload=_highest_transaction_answer(result,ctx,db_module)
     elif intent=="compare":
         payload=_compare_answer(result,ctx,question,db_module)
     elif intent=="corrections":
