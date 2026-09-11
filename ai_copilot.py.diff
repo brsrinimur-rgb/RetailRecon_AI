@@ -1,5 +1,5 @@
 --- /home/claude/repo_clone/ai_copilot.py	2026-09-11 18:07:31.087794416 +0000
-+++ /home/claude/deliver_copilot2/ai_copilot.py	2026-09-11 18:22:13.012744673 +0000
++++ /home/claude/deliver_copilot2/ai_copilot.py	2026-09-11 18:43:10.918222725 +0000
 @@ -59,6 +59,36 @@
  already works throughout this file.
  """
@@ -58,7 +58,39 @@
  PAYMENT_ALIASES = {
      "MADA": ["mada"],
      "VISA": ["visa", "visacard", "vc"],
-@@ -395,19 +439,58 @@
+@@ -228,8 +272,30 @@
+     # was chosen to catch realistic single/double-character typos on real
+     # payment names without matching ordinary finance vocabulary (checked
+     # against words like "sales","store","total","refund","settle", etc.).
++    #
++    # BUG FIX (2026-09-11): that check alone isn't enough. difflib's ratio()
++    # can score an ordinary English word as "close enough" (>=0.72) to a
++    # SHORT payment alias purely by chance -- found via real testing:
++    # "what came in through the tills" scored "came" at 0.75 against "amex"
++    # (their shared middle letters "ame" line up), which silently filtered
++    # an unrelated question down to AMEX-only. "cast"/"wash"/"dash" score
++    # similarly against "cash". A pure similarity-ratio cutoff cannot tell
++    # these apart from genuine typos of the SAME length and ratio (e.g.
++    # "vise" vs "visa" also scores exactly 0.75, and that fuzzy-correction
++    # is real, existing, intentional behavior this fix must not break).
++    #
++    # Fix: also require the token to share the payment alias's FIRST
++    # LETTER. A real typo of a word overwhelmingly preserves its first
++    # letter ("vise"/visa, "mastercart"/mastercard, "amx"/amex, "tammara"/
++    # tamara, "caash"/cash all keep letter 1) -- an unrelated English word
++    # that merely happens to share some interior letters with a payment
++    # name generally does not ("came" vs amex: c vs a; "wash"/"dash" vs
++    # cash: w/d vs c). This keeps every documented typo-tolerance case
++    # working (verified by REGRESSION_AI_COPILOT_ADVANCED's "mastercart"/
++    # "vise" assertions) while closing the real false-positive found above.
+     for tok in re.findall(r"[a-z]{3,}", ql):
+-        match=difflib.get_close_matches(tok, _PAYMENT_FUZZY_CANDIDATES.keys(), n=1, cutoff=0.72)
++        same_first_letter=[c for c in _PAYMENT_FUZZY_CANDIDATES if c[:1]==tok[:1]]
++        match=difflib.get_close_matches(tok, same_first_letter, n=1, cutoff=0.72)
+         if match:
+             return _PAYMENT_FUZZY_CANDIDATES[match[0]]
+     return None
+@@ -395,19 +461,58 @@
      data_min=all_dates.min().normalize() if not all_dates.empty else pd.NaT
      data_max=all_dates.max().normalize() if not all_dates.empty else pd.NaT
  
@@ -119,7 +151,7 @@
  
      # V-fix: keep the RAW per-turn payment detection (before falling back to
      # the sticky prior.payment) so the intent classifier below can tell "this
-@@ -415,145 +498,214 @@
+@@ -415,145 +520,214 @@
      # carried over from an earlier turn" -- see the cash_report branch and
      # the final fallback for why that distinction matters.
      raw_payment=_find_payment(q)
