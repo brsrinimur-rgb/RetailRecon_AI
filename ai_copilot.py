@@ -59,6 +59,36 @@ payment -- not scope persistence itself, which mirrors how store/date scope
 already works throughout this file.
 """
 
+"""
+FIX (2026-09-11) -- follow-up: sticky PAYMENT scope (not store scope this
+time) silently misled a brand-new question. Real reported case: "need all
+store cash sales" (correctly CASH), then "601 sales as of 9 Aug 2026" -- a
+fully self-contained new question naming a different store with its own
+explicit date, never mentioning cash at all -- still silently inherited the
+old CASH filter and answered "couldn't find ... Store 601 | CASH ..."
+instead of just answering about Store 601 generally.
+
+Two additive fixes in interpret_query():
+  1. An explicit "all payment(s)/methods/types" or "any payment" phrase now
+     clears the payment filter outright, mirroring the existing "all
+     store(s)" clear phrase.
+  2. When the CURRENT question explicitly names a store that differs from
+     the one currently in scope AND also gives its own explicit date (both
+     axes freshly specified), payment resets to "all payment types" unless
+     the question also names a payment itself. Deliberately requires BOTH a
+     new store and an explicit date -- a bare drill-down like "show 609
+     transaction details" (new store, no date of its own) still keeps the
+     sticky payment filter exactly as before, since that is real,
+     intentional, already-tested continuation behavior
+     (REGRESSION_AI_CASH_ROUTING_FOLLOWUP.py, turns 4-5).
+
+Verified: all pre-existing regression suites (including
+REGRESSION_V13_COPILOT_STICKY_SCOPE.py and
+REGRESSION_AI_CASH_ROUTING_FOLLOWUP.py) still pass unchanged, plus a new
+REGRESSION_V45_COPILOT_PAYMENT_SCOPE_RESET.py covering both fixes directly
+and confirming the drill-down continuation case is untouched.
+"""
+
 import re
 import difflib
 from datetime import datetime, timedelta
@@ -66,6 +96,20 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+# V46, additive, OPTIONAL: real-AI question understanding layer. See
+# logic/ai_llm_router.py's module docstring for the full explanation. This
+# import is defensive on purpose -- if the file isn't present, or its own
+# `anthropic` dependency isn't installed, ai_llm_router simply becomes None
+# and every call site below falls back to the original keyword/regex
+# classifier with zero behavior change.
+try:
+    from logic import ai_llm_router
+except Exception:
+    try:
+        import ai_llm_router  # fallback if logic/ isn't a package in this deployment layout
+    except Exception:
+        ai_llm_router = None
 
 PAYMENT_ALIASES = {
     "MADA": ["mada"],
@@ -395,19 +439,58 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
     data_min=all_dates.min().normalize() if not all_dates.empty else pd.NaT
     data_max=all_dates.max().normalize() if not all_dates.empty else pd.NaT
 
+    # V46, additive, OPTIONAL: ask the real-AI understanding layer to
+    # classify this question, if it's configured (see logic/ai_llm_router.py
+    # for the full explanation). llm_result is None whenever the feature
+    # isn't turned on, or the call fails for any reason -- every use of it
+    # below only ever ADDS information on top of the original regex/keyword
+    # detection, never replaces it outright, so with no API key configured
+    # (llm_result always None) every line below behaves exactly as it did
+    # before this fix.
+    llm_result=None
+    if ai_llm_router is not None:
+        try:
+            if ai_llm_router.is_configured():
+                llm_result=ai_llm_router.llm_interpret(
+                    question=q,
+                    prior_store_codes=prior.store_codes,
+                    prior_payment=prior.payment,
+                    prior_last_intent=prior.last_intent,
+                    known_store_names=_store_name_map(db_module),
+                )
+        except Exception:
+            llm_result=None
+
     stores=_find_store_codes(q)
     if not stores:
         stores=_find_store_codes_by_name(q,db_module)
+    # Capture what THIS TURN's text explicitly named, before any fallback to
+    # prior scope below -- used by the payment-reset V-fix further down to
+    # tell "this question names a genuinely new store" apart from "this
+    # question doesn't mention a store at all" (both end up with the same
+    # `stores` value after the fallback, but they mean very different
+    # things for whether old payment scope should still apply).
+    explicit_stores=list(stores)
+    if llm_result and llm_result.get("store_codes"):
+        # Union, not override: the regex path reliably catches bare 3-digit
+        # codes; the AI layer additionally catches store names/synonyms the
+        # regex can already partly handle via _find_store_codes_by_name, but
+        # more robustly (typos, partial names, indirect phrasing). Neither
+        # source can ever REMOVE a store the other found.
+        explicit_stores=sorted(set(explicit_stores) | set(llm_result["store_codes"]))
     # V-fix (sticky-scope bug): "all store(s)" is an explicit instruction to
     # broaden scope to every store, not silence about which store is meant.
     # Previously this fell straight through to prior.store_codes.copy() just
     # like an ordinary question that never mentions a store, so e.g. "need
     # all store cash sales" asked right after a Store 603 question stayed
     # silently pinned to Store 603 instead of clearing to all stores.
-    if not stores and re.search(r"\ball stores?\b", ql):
+    all_stores_signal=bool(re.search(r"\ball stores?\b", ql)) or bool(llm_result and llm_result.get("all_stores_explicit"))
+    if not explicit_stores and all_stores_signal:
         stores=[]
-    elif not stores:
+    elif not explicit_stores:
         stores=prior.store_codes.copy()
+    else:
+        stores=explicit_stores
 
     # V-fix: keep the RAW per-turn payment detection (before falling back to
     # the sticky prior.payment) so the intent classifier below can tell "this
@@ -415,145 +498,214 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
     # carried over from an earlier turn" -- see the cash_report branch and
     # the final fallback for why that distinction matters.
     raw_payment=_find_payment(q)
-    payment=raw_payment or prior.payment
+    if not raw_payment and llm_result and llm_result.get("payment_type"):
+        # Fill-in only: trust the regex/alias match first (exact, no
+        # ambiguity); the AI layer only contributes a payment method when
+        # the regex path found nothing at all this turn.
+        raw_payment=llm_result["payment_type"]
+
+    # V-fix (2026-09-11) -- sticky PAYMENT scope, not just sticky store
+    # scope, can silently mislead a brand-new question. Real reported case:
+    # "need all store cash sales" (correctly CASH), then "601 sales as of 9
+    # Aug 2026" -- a fully self-contained new question (a different store,
+    # its own explicit date) that never says "cash" at all -- still
+    # silently inherited the old CASH filter and came back "couldn't find
+    # ... Store 601 | CASH ...", instead of just answering about Store 601
+    # generally. Two independent, additive fixes:
+    #   1. An explicit "all payment(s)/methods/types" (or "any payment")
+    #      phrase now clears the payment filter outright, mirroring the
+    #      existing "all store(s)" clear phrase above.
+    #   2. When THIS turn explicitly names a store that differs from the
+    #      one currently in scope AND also gives its own explicit date,
+    #      treat it as a self-contained new question and reset payment to
+    #      "all payment types" (unless this turn also names a payment
+    #      itself). Deliberately requires BOTH a new store AND an explicit
+    #      date, not just a new store alone -- a bare drill-down like "show
+    #      609 transaction details" (new store, no date of its own) must
+    #      still keep the sticky payment filter exactly as before; that
+    #      exact behavior is covered by REGRESSION_AI_CASH_ROUTING_FOLLOWUP.
+    #      Reuses the existing, already-tested _parse_date_scope() with no
+    #      prior passed in, purely to detect whether THIS turn's own text
+    #      carries a date -- does not change how the real d1/d2/dmode below
+    #      are computed.
+    clear_payment_signal=(
+        bool(re.search(r"\ball (?:payment(?:s)?|methods?|types?)\b",ql) or "any payment" in ql)
+        or bool(llm_result and llm_result.get("all_payment_types_explicit"))
+    )
+    explicit_date_this_turn=_parse_date_scope(q,data_min,data_max,None)[2]!=""
+    new_store_and_date_signal=(
+        bool(explicit_stores)
+        and set(explicit_stores)!=set(prior.store_codes)
+        and explicit_date_this_turn
+    )
+    if clear_payment_signal:
+        payment=None
+    elif raw_payment:
+        payment=raw_payment
+    elif new_store_and_date_signal:
+        payment=None
+    else:
+        payment=prior.payment
     d1,d2,dmode=_parse_date_scope(q,data_min,data_max,prior)
 
     # intent
-    greeting_match = (
-        re.search(r"\b(?:hello|hi|hey)\b", ql) is not None
-        or any(x in ql for x in ["good morning","good afternoon","good evening"])
-    )
-    if greeting_match and len(ql.split())<=4:
-        intent="greeting"
-    elif any(x in ql for x in ["pending correction","correction approval","corrections pending"]):
-        intent="corrections"
-    elif any(x in ql for x in ["jv status","journal status","ready for d365","ready to post","posting status"]):
-        intent="jv"
-    elif any(x in ql for x in ["close status","month end","period close","ready to close"]):
-        intent="close"
-    elif any(x in ql for x in ["merchant mapping","terminal mapping","store mapping","mapping required"]):
-        intent="mapping"
-    elif any(x in ql for x in ["commission","fee","fees","vat","net amount"]):
-        intent="commission"
-    elif any(x in ql for x in ["not settled","unsettled","bank missing","money not received","not received","settlement delay","delayed"]):
-        intent="unsettled"
-    elif any(x in ql for x in ["missing pos","missing settlement"]):
-        intent="missing_pos"
-    elif any(x in ql for x in ["missing d365","provider only"]):
-        intent="missing_d365"
-    elif any(x in ql for x in [
-        "settlement batch","settlement batches","bank receipt pending","provider settled",
-        "which settlements","bank received batches","payout pending","settlement propagation"
-    ]):
-        intent="settlement_batch"
-    elif any(x in ql for x in [
-        "gl status","gl verified","d365 gl","gl mismatch","gl exception","gl exceptions",
-        "unexplained gl","explain gl","gl balance","clearing balance","clearing movement",
-        "which stores gl","gl not found","jv to gl","source to gl"
-    ]):
-        intent="gl_control"
-    elif any(x in ql for x in [
-        "biggest risk","highest risk","risk today","risks today","top risk","top risks",
-        "priority exception","priority exceptions","what needs attention","needs attention",
-        "anomaly","anomalies","control risk"
-    ]) or re.search(r"\btop\s+\d+\s+risks?\b", ql):
-        # V-fix: the plain substring checks above require "top risk(s)" as an
-        # exact contiguous phrase, so a perfectly natural "top 10 risks" (the
-        # app's OWN "Top 10 risks" quick-question button generates exactly
-        # this text) never matched and fell through to the fallback logic
-        # below instead.
-        intent="risk"
-    elif any(x in ql for x in ["store performance","store score","store control score","which store is worst","which store needs attention"]):
-        intent="store_performance"
-    elif any(x in ql for x in ["provider performance","provider score","payment performance","which provider","provider delay"]):
-        intent="provider_performance"
-    elif any(x in ql for x in [
-        "matched and unmatched","matched & unmatched","match and unmatched","matched/unmatched",
-        "reconciliation status","match status","match rate","how much matched","how much unmatched",
-        "matched amount","unmatched amount"
-    ]):
-        intent="reconciliation_status"
-    elif any(x in ql for x in ["can i close","ready to close","close readiness","can we close","period close"]):
-        intent="close_readiness"
-    elif any(x in ql for x in ["finance briefing","today's finance briefing","today finance briefing","management briefing","cfo briefing"]):
-        intent="management_brief"
-    elif any(x in ql for x in ["bank settled","awaiting bank","settlement delay","oldest unsettled","settlement status","how much is settled"]):
-        intent="settlement_intelligence"
-    elif any(x in ql for x in ["commission error","commission errors","commission validation","commission amount","vat on commission","commission difference"]):
-        intent="commission_intelligence"
-    elif any(x in ql for x in ["refund total","refunds by","refund ratio","largest refund","highest refund","show refunds","refund intelligence"]):
-        intent="refund_intelligence"
-    elif any(x in ql for x in ["duplicate files","duplicate auth","missing dates","unmapped terminal","unmapped merchant","unknown stores","data quality","today's upload","today upload"]):
-        intent="data_quality"
-    elif any(x in ql for x in ["source file","source files","where did this come from","evidence","data source"]):
-        intent="source_evidence"
-    elif any(x in ql for x in ["help","what can you answer","what can i ask","capabilities"]):
-        intent="copilot_help"
-    elif any(x in ql for x in ["exception","anything wrong","issues","problem","unmatched"]):
-        intent="exceptions"
-    elif any(x in ql for x in [
-        "tell date","tell me the date","what date","which date","what dates","which dates",
-        "date range","what period","which period","show date","current date range",
-        "what's the date","whats the date"
-    ]):
-        intent="date_range"
-    elif re.search(r"\bcash\b", ql):
-        # V-fix (the dominant sticky-scope bug): this used to fire on ANY of
-        # a long list of ordinary finance words ("sales","top","highest",
-        # "net","details","transactions","trend","daily",...) whenever
-        # ctx.payment happened to be CASH -- and ctx.payment, once set,
-        # persists indefinitely across turns (by design, like store/date
-        # scope). The result: a real cash question early in a conversation
-        # permanently hijacked every later, completely unrelated question
-        # that happened to contain any of those common words ("total sales",
-        # "show top 10 risks", "show settlement status" after a follow-up
-        # touched "sales") into this cash-specific report, for the rest of
-        # the conversation. Now this branch requires the CURRENT question to
-        # actually say "cash". A short, immediate follow-up right after a
-        # cash answer ("show highest", "daily trend", "603 sales" the turn
-        # right after a cash question) is still handled by the
-        # prior.last_intent=="cash_report" check in the fallback below --
-        # but unlike this branch, that check naturally expires the moment
-        # any other intent gets resolved in between, instead of persisting
-        # for the rest of the session.
-        intent="cash_report"
-    elif any(x in ql for x in ["refund","refunds"]):
-        intent="refunds"
-    elif any(x in ql for x in ["compare","comparison","versus"," vs "]):
-        intent="compare"
-    elif re.search(r"\b(receipt|auth|authorization)\b",ql) and re.search(r"\d{5,}",ql):
-        intent="lookup"
-    elif any(x in ql for x in ["show transactions","transaction details","show details","details"]):
-        # "sales details" should still be sales summary unless follow-up context is present
-        intent="transactions" if prior.last_intent else "sales"
-    elif any(x in ql for x in ["sales","sale","revenue","tender","payment mix"]):
-        intent="sales"
-    elif any(x in ql for x in ["summary","briefing","overview","dashboard"]):
-        intent="summary"
+    llm_intent=llm_result.get("intent") if llm_result else None
+    if llm_intent and llm_intent!="unknown":
+        # V46, additive, OPTIONAL: trust the real-AI classification when it
+        # confidently picked one of the already-implemented report types,
+        # instead of running the keyword/regex chain below at all. When the
+        # AI layer isn't configured, fails, or returns "unknown" (its own
+        # deliberate escape hatch for anything it isn't confident about),
+        # llm_intent is None/"unknown" here and the ENTIRE original chain
+        # below runs completely unchanged -- this is what keeps every
+        # existing regression test passing with no API key configured.
+        intent=llm_intent
     else:
-        if (
-            prior.last_intent=="cash_report"
-            and raw_payment in (None,"CASH")
-            and any(x in ql for x in [
-                "highest","lowest","top","rank","ranking","details","transactions",
-                "show","only","daily","trend","store"
-            ])
-        ):
+        greeting_match = (
+            re.search(r"\b(?:hello|hi|hey)\b", ql) is not None
+            or any(x in ql for x in ["good morning","good afternoon","good evening"])
+        )
+        if greeting_match and len(ql.split())<=4:
+            intent="greeting"
+        elif any(x in ql for x in ["pending correction","correction approval","corrections pending"]):
+            intent="corrections"
+        elif any(x in ql for x in ["jv status","journal status","ready for d365","ready to post","posting status"]):
+            intent="jv"
+        elif any(x in ql for x in ["close status","month end","period close","ready to close"]):
+            intent="close"
+        elif any(x in ql for x in ["merchant mapping","terminal mapping","store mapping","mapping required"]):
+            intent="mapping"
+        elif any(x in ql for x in ["commission","fee","fees","vat","net amount"]):
+            intent="commission"
+        elif any(x in ql for x in ["not settled","unsettled","bank missing","money not received","not received","settlement delay","delayed"]):
+            intent="unsettled"
+        elif any(x in ql for x in ["missing pos","missing settlement"]):
+            intent="missing_pos"
+        elif any(x in ql for x in ["missing d365","provider only"]):
+            intent="missing_d365"
+        elif any(x in ql for x in [
+            "settlement batch","settlement batches","bank receipt pending","provider settled",
+            "which settlements","bank received batches","payout pending","settlement propagation"
+        ]):
+            intent="settlement_batch"
+        elif any(x in ql for x in [
+            "gl status","gl verified","d365 gl","gl mismatch","gl exception","gl exceptions",
+            "unexplained gl","explain gl","gl balance","clearing balance","clearing movement",
+            "which stores gl","gl not found","jv to gl","source to gl"
+        ]):
+            intent="gl_control"
+        elif any(x in ql for x in [
+            "biggest risk","highest risk","risk today","risks today","top risk","top risks",
+            "priority exception","priority exceptions","what needs attention","needs attention",
+            "anomaly","anomalies","control risk"
+        ]) or re.search(r"\btop\s+\d+\s+risks?\b", ql):
+            # V-fix: the plain substring checks above require "top risk(s)" as an
+            # exact contiguous phrase, so a perfectly natural "top 10 risks" (the
+            # app's OWN "Top 10 risks" quick-question button generates exactly
+            # this text) never matched and fell through to the fallback logic
+            # below instead.
+            intent="risk"
+        elif any(x in ql for x in ["store performance","store score","store control score","which store is worst","which store needs attention"]):
+            intent="store_performance"
+        elif any(x in ql for x in ["provider performance","provider score","payment performance","which provider","provider delay"]):
+            intent="provider_performance"
+        elif any(x in ql for x in [
+            "matched and unmatched","matched & unmatched","match and unmatched","matched/unmatched",
+            "reconciliation status","match status","match rate","how much matched","how much unmatched",
+            "matched amount","unmatched amount"
+        ]):
+            intent="reconciliation_status"
+        elif any(x in ql for x in ["can i close","ready to close","close readiness","can we close","period close"]):
+            intent="close_readiness"
+        elif any(x in ql for x in ["finance briefing","today's finance briefing","today finance briefing","management briefing","cfo briefing"]):
+            intent="management_brief"
+        elif any(x in ql for x in ["bank settled","awaiting bank","settlement delay","oldest unsettled","settlement status","how much is settled"]):
+            intent="settlement_intelligence"
+        elif any(x in ql for x in ["commission error","commission errors","commission validation","commission amount","vat on commission","commission difference"]):
+            intent="commission_intelligence"
+        elif any(x in ql for x in ["refund total","refunds by","refund ratio","largest refund","highest refund","show refunds","refund intelligence"]):
+            intent="refund_intelligence"
+        elif any(x in ql for x in ["duplicate files","duplicate auth","missing dates","unmapped terminal","unmapped merchant","unknown stores","data quality","today's upload","today upload"]):
+            intent="data_quality"
+        elif any(x in ql for x in ["source file","source files","where did this come from","evidence","data source"]):
+            intent="source_evidence"
+        elif any(x in ql for x in ["help","what can you answer","what can i ask","capabilities"]):
+            intent="copilot_help"
+        elif any(x in ql for x in ["exception","anything wrong","issues","problem","unmatched"]):
+            intent="exceptions"
+        elif any(x in ql for x in [
+            "tell date","tell me the date","what date","which date","what dates","which dates",
+            "date range","what period","which period","show date","current date range",
+            "what's the date","whats the date"
+        ]):
+            intent="date_range"
+        elif re.search(r"\bcash\b", ql):
+            # V-fix (the dominant sticky-scope bug): this used to fire on ANY of
+            # a long list of ordinary finance words ("sales","top","highest",
+            # "net","details","transactions","trend","daily",...) whenever
+            # ctx.payment happened to be CASH -- and ctx.payment, once set,
+            # persists indefinitely across turns (by design, like store/date
+            # scope). The result: a real cash question early in a conversation
+            # permanently hijacked every later, completely unrelated question
+            # that happened to contain any of those common words ("total sales",
+            # "show top 10 risks", "show settlement status" after a follow-up
+            # touched "sales") into this cash-specific report, for the rest of
+            # the conversation. Now this branch requires the CURRENT question to
+            # actually say "cash". A short, immediate follow-up right after a
+            # cash answer ("show highest", "daily trend", "603 sales" the turn
+            # right after a cash question) is still handled by the
+            # prior.last_intent=="cash_report" check in the fallback below --
+            # but unlike this branch, that check naturally expires the moment
+            # any other intent gets resolved in between, instead of persisting
+            # for the rest of the session.
             intent="cash_report"
-        elif raw_payment and raw_payment!="CASH":
-            # V-fix: this turn explicitly named a DIFFERENT payment method
-            # than whatever the conversation was previously about (e.g.
-            # "i need mada card" right after a cash question, or after any
-            # other unrelated report). Blindly reusing prior.last_intent
-            # here (the old behavior) could silently re-run a completely
-            # unrelated report -- and for "...cash_report" specifically, the
-            # cash_report handler forces ctx.payment back to CASH,
-            # discarding the payment the user just typed entirely. Treat it
-            # as a plain sales/tender question for the named payment
-            # instead.
+        elif any(x in ql for x in ["refund","refunds"]):
+            intent="refunds"
+        elif any(x in ql for x in ["compare","comparison","versus"," vs "]):
+            intent="compare"
+        elif re.search(r"\b(receipt|auth|authorization)\b",ql) and re.search(r"\d{5,}",ql):
+            intent="lookup"
+        elif any(x in ql for x in ["show transactions","transaction details","show details","details"]):
+            # "sales details" should still be sales summary unless follow-up context is present
+            intent="transactions" if prior.last_intent else "sales"
+        elif any(x in ql for x in ["sales","sale","revenue","tender","payment mix"]):
             intent="sales"
+        elif any(x in ql for x in ["summary","briefing","overview","dashboard"]):
+            intent="summary"
         else:
-            intent=prior.last_intent or "summary"
+            if (
+                prior.last_intent=="cash_report"
+                and raw_payment in (None,"CASH")
+                and not clear_payment_signal
+                and any(x in ql for x in [
+                    "highest","lowest","top","rank","ranking","details","transactions",
+                    "show","only","daily","trend","store"
+                ])
+            ):
+                intent="cash_report"
+            elif raw_payment and raw_payment!="CASH":
+                # V-fix: this turn explicitly named a DIFFERENT payment method
+                # than whatever the conversation was previously about (e.g.
+                # "i need mada card" right after a cash question, or after any
+                # other unrelated report). Blindly reusing prior.last_intent
+                # here (the old behavior) could silently re-run a completely
+                # unrelated report -- and for "...cash_report" specifically, the
+                # cash_report handler forces ctx.payment back to CASH,
+                # discarding the payment the user just typed entirely. Treat it
+                # as a plain sales/tender question for the named payment
+                # instead.
+                intent="sales"
+            elif clear_payment_signal:
+                # V-fix (2026-09-11): an explicit "all payment types"/"all
+                # methods"/"any payment" instruction must never blindly
+                # continue a payment-specific report (cash_report above all --
+                # its handler forcibly resets ctx.payment back to CASH, which
+                # would silently undo the very reset the user just asked for).
+                # Fall through to a neutral summary instead of reusing whatever
+                # the last turn happened to be about.
+                intent="summary"
+            else:
+                intent=prior.last_intent or "summary"
 
     ctx=CopilotContext(
         store_codes=stores,

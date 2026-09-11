@@ -3,3 +3,9 @@ pandas>=2.0
 numpy>=1.24
 openpyxl>=3.1
 xlrd>=2.0
+
+# Optional -- only needed for the AI Finance Copilot's real-AI question
+# understanding layer (logic/ai_llm_router.py). If you don't set an
+# ANTHROPIC_API_KEY, this package is simply unused and the Copilot runs
+# exactly as it did before -- safe to leave installed either way.
+anthropic>=0.34.0
