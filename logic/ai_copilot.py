@@ -725,6 +725,25 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             # answering the configuration question actually asked.
             intent="gl_config"
         elif any(x in ql for x in [
+            "pos to gl","pos-to-gl","pos gl reconciliation","pos gl recon","pos vs gl",
+            "pos to d365 gl","store date bucket","bucket exceptions","bucket exception",
+            "bucket summary","chronic store","duplicate dates","upload incomplete",
+            "provider mapping required","top exceptions","card variance","gl bucket",
+        ]):
+            # NEW (2026-09-13): POS -> D365 GL Reconciliation (pages/35) had
+            # no Copilot coverage at all -- its result (bucket-level POS vs
+            # GL matching, exceptions, chronic stores, etc.) lives in a
+            # DIFFERENT session-state key (v53_pos_gl) than the classic
+            # Store-Tender `result` dict everything else here reads, so it
+            # needs its own intent plus the new pos_gl_data parameter (wired
+            # in from pages/29_AI_Finance_Copilot.py) rather than reading
+            # from `result`. Checked BEFORE gl_control's bare "gl" fallback
+            # just below since several of these phrases contain "gl"/"bucket"
+            # and would otherwise be swallowed by the general GL-control
+            # report instead of answering the POS-to-GL question actually
+            # asked.
+            intent="pos_gl_reconciliation"
+        elif any(x in ql for x in [
             "gl status","gl verified","d365 gl","gl mismatch","gl exception","gl exceptions",
             "unexplained gl","explain gl","gl balance","clearing balance","clearing movement",
             "which stores gl","gl not found","jv to gl","source to gl"
@@ -918,7 +937,16 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
         elif any(x in ql for x in ["show transactions","transaction details","show details","details"]):
             # "sales details" should still be sales summary unless follow-up context is present
             intent="transactions" if prior.last_intent else "sales"
-        elif any(x in ql for x in ["sales","sale","revenue","tender","payment mix"]) or _fuzzy_word_present(ql,"sales") or _fuzzy_word_present(ql,"sale"):
+        elif any(x in ql for x in [
+            "sales","sale","revenue","tender","payment mix",
+            "storewise","store wise","store-wise","store by store","split by store"
+        ]) or _fuzzy_word_present(ql,"sales") or _fuzzy_word_present(ql,"sale"):
+            # V-fix (2026-09-12): "storewise"/"store wise"/"store by store" is
+            # now a direct sales trigger, not just a sticky-scope follow-up --
+            # so asking it as the very FIRST question (no prior intent) still
+            # lands on "sales" instead of falling through to a generic
+            # "summary". The actual per-store breakdown text is produced by
+            # _sales_answer() itself (see the STOREWISE_PHRASES check there).
             intent="sales"
         elif any(x in ql for x in ["summary","briefing","overview","dashboard"]):
             intent="summary"
@@ -1050,7 +1078,13 @@ def _safe_col_or_zero(df,*names):
             return df[name]
     return pd.Series(0.0,index=df.index)
 
-def _sales_answer(result,ctx,detail=False,db_module=None):
+_STOREWISE_PHRASES=(
+    "storewise","store wise","store-wise","by store","per store",
+    "store breakdown","breakdown by store","store by store",
+    "each store","every store","split by store","stores wise","store level","store-level",
+)
+
+def _sales_answer(result,ctx,detail=False,db_module=None,question=""):
     tender=_filter_tender(result.get("tender",pd.DataFrame()),ctx)
     if tender.empty:
         return {"text":f"I couldn't find D365 Store Tender sales for {_scope_text(ctx)} in the active reconciliation.","table":pd.DataFrame()}
@@ -1080,6 +1114,38 @@ def _sales_answer(result,ctx,detail=False,db_module=None):
         if mix: lines.append("Payment breakdown: "+mix+".")
     else:
         lines.append(f"{ctx.payment} total is **{_fmt_sar(gross)}** across **{len(tender):,}** transaction line(s).")
+    # V-fix (2026-09-12): "storewise"/"store wise"/"by store" etc. used to be
+    # silently ignored -- the answer text was identical to a plain "sales
+    # details" question, because a per-store breakdown only ever existed as a
+    # hidden dataframe (the "table" return value below), never spelled out in
+    # the sentence itself. Now, whenever the question explicitly asks for a
+    # store-wise view AND more than one store is actually in scope (asking
+    # for it while already filtered to a single store has nothing to add),
+    # the per-store totals are written directly into the text as well.
+    ql_sw=str(question or "").lower()
+    if (
+        any(p in ql_sw for p in _STOREWISE_PHRASES)
+        and "Store Code" in tender.columns
+        and len(ctx.store_codes)!=1
+    ):
+        store_tot=(
+            tender.groupby(["Store Code","Store Name"],dropna=False)["D365 Amount"]
+            .sum().sort_values(ascending=False)
+        ) if "Store Name" in tender.columns else (
+            tender.groupby("Store Code",dropna=False)["D365 Amount"].sum().sort_values(ascending=False)
+        )
+        n_stores=len(store_tot)
+        top=store_tot.head(10)
+        if "Store Name" in tender.columns:
+            store_lines=[f"{(name or code)} (Store {code}): {_fmt_sar(v)}" for (code,name),v in top.items()]
+        else:
+            store_lines=[f"Store {code}: {_fmt_sar(v)}" for code,v in top.items()]
+        more=n_stores-len(top)
+        header=f"Store-wise breakdown (top {len(top)} of {n_stores} store(s)): " if more>0 else f"Store-wise breakdown ({n_stores} store(s)): "
+        txt=header+"; ".join(store_lines)
+        if more>0:
+            txt+=f"; plus {more} more store(s) — see the full table below."
+        lines.append(txt)
     if detail:
         cols=[c for c in ["Store Code","Store Name","Date","Receipt ID","Auth Code","D365 Payment","D365 Amount","Cash Classification","Cash Amount"] if c in tender.columns]
         sorts=[c for c in ["Date","Receipt ID"] if c in cols]
@@ -2201,7 +2267,98 @@ def _settlement_carry_forward_answer(result,ctx):
     return {"text":text,"table":cf.head(500)}
 
 
-def answer_question(question, result, db_module=None, prior_context=None, user_context=None):
+def _pos_gl_answer(ctx,pos_gl_data,question=""):
+    """
+    NEW (2026-09-13): answers questions about pages/35 POS -> D365 GL
+    Reconciliation -- a completely separate pipeline from the classic
+    Store-Tender-based `result` dict (core.reconcile / _sales_answer /
+    _fc_settlement etc.). Its result dict is whatever
+    logic.pos_gl_reconciliation.reconcile_pos_to_gl_by_bucket() (or the
+    legacy row-to-row reconcile_pos_to_gl()) produced, passed in here as
+    pos_gl_data by pages/29_AI_Finance_Copilot.py -- NOT read from `result`.
+    Never crashes when pos_gl_data is None/empty (page never run yet).
+    """
+    if not pos_gl_data:
+        return {"text":"POS-to-GL reconciliation data is unavailable -- run POS → D365 GL Reconciliation first, then ask again.","table":pd.DataFrame()}
+    summary_df=pos_gl_data.get("summary")
+    if summary_df is None or not isinstance(summary_df,pd.DataFrame) or summary_df.empty:
+        return {"text":"No POS-to-GL reconciliation result is currently loaded.","table":pd.DataFrame()}
+    s=summary_df.iloc[0]
+    is_bucket="bucket_summary" in pos_gl_data
+    ql=str(question or "").lower()
+    bucket_summary=pos_gl_data.get("bucket_summary",pd.DataFrame())
+    if bucket_summary is None: bucket_summary=pd.DataFrame()
+    scoped=bucket_summary
+    if ctx.store_codes and is_bucket and not bucket_summary.empty and "Store Code" in bucket_summary.columns:
+        codes={_norm_store(c) for c in ctx.store_codes}
+        scoped=bucket_summary[bucket_summary["Store Code"].map(_norm_store).isin(codes)]
+
+    if "chronic" in ql:
+        chronic=pos_gl_data.get("chronic_stores")
+        if chronic is None or chronic.empty:
+            return {"text":"No stores show a chronic POS-to-GL failure pattern in the current run.","table":pd.DataFrame()}
+        return {"text":f"**{len(chronic):,} store(s)** show a chronic POS-to-GL failure pattern -- failing on nearly every date, not an isolated exception.","table":chronic}
+
+    if any(x in ql for x in ["duplicate date","duplicate upload","same day twice"]):
+        dup=pos_gl_data.get("duplicate_dates")
+        if dup is None or dup.empty:
+            return {"text":"No dates show a suspected system-wide duplicate upload.","table":pd.DataFrame()}
+        return {"text":f"**{len(dup):,} date(s)** show a possible duplicate whole-day upload -- many stores excluding duplicate POS rows on the same date.","table":dup}
+
+    if any(x in ql for x in ["upload incomplete","provider mapping","coverage gap","missing pos coverage"]):
+        exc=pos_gl_data.get("exceptions",pd.DataFrame())
+        if exc is None or exc.empty or "Status" not in exc.columns:
+            return {"text":"No exception detail is available.","table":pd.DataFrame()}
+        rows=exc[exc["Status"].isin(["UPLOAD INCOMPLETE","PROVIDER MAPPING REQUIRED"])]
+        if ctx.store_codes and "Store Code" in rows.columns:
+            codes={_norm_store(c) for c in ctx.store_codes}
+            rows=rows[rows["Store Code"].map(_norm_store).isin(codes)]
+        if rows.empty:
+            return {"text":f"No Upload Incomplete / Provider Mapping Required rows for **{_scope_text(ctx)}**.","table":pd.DataFrame()}
+        return {"text":f"**{len(rows):,} row(s)** are flagged Upload Incomplete / Provider Mapping Required for **{_scope_text(ctx)}** -- GL clearing activity with no matching POS/provider file, a coverage gap rather than an accounting variance.","table":rows.head(500)}
+
+    if any(x in ql for x in ["top exception","biggest exception","worst exception","top 20"]):
+        top=pos_gl_data.get("top_exceptions",pd.DataFrame())
+        if top is None or top.empty:
+            return {"text":"No exceptions to rank -- every bucket matched.","table":pd.DataFrame()}
+        return {"text":f"Top {min(len(top),20):,} POS-to-GL exceptions by absolute SAR exposure:","table":top.head(20)}
+
+    if any(x in ql for x in ["swap","store code swap"]):
+        # Swap history lives only in the page's own session_state cache
+        # (v53_swap_history::<run_id>), not inside pos_gl_data itself -- answer
+        # honestly instead of guessing at data this function was never given.
+        return {"text":"Store Code swap history isn't available to the Copilot yet -- check the Swap History tab on the POS → GL Reconciliation page directly.","table":pd.DataFrame()}
+
+    overall=s.get("Overall Status","")
+    if ctx.store_codes and is_bucket and not scoped.empty:
+        store_pos=float(pd.to_numeric(scoped.get("POS Total",0),errors="coerce").sum())
+        store_gl=float(pd.to_numeric(scoped.get("GL Total",0),errors="coerce").sum())
+        store_diff=store_pos-store_gl
+        matched_n=int((scoped["Status"]=="GL MATCHED").sum()) if "Status" in scoped.columns else 0
+        exc_n=len(scoped)-matched_n
+        text=(f"POS-to-GL for **{_scope_text(ctx)}**: POS total **{_fmt_sar(store_pos)}** vs GL total **{_fmt_sar(store_gl)}** "
+              f"(difference **{_fmt_sar(store_diff)}**) across **{len(scoped):,} date bucket(s)** -- "
+              f"**{matched_n:,} matched**, **{exc_n:,} exception(s)**.")
+        table=scoped[scoped["Status"]!="GL MATCHED"].head(50) if exc_n and "Status" in scoped.columns else scoped.head(50)
+        return {"text":text,"table":table}
+    if ctx.store_codes and is_bucket and scoped.empty:
+        return {"text":f"No POS-to-GL activity is recorded for **{_scope_text(ctx)}** in the current run.","table":pd.DataFrame()}
+
+    if is_bucket:
+        pos_total=float(s.get("POS Total (SAR)",0.0)); gl_total=float(s.get("GL Total (SAR)",0.0))
+        net_diff=float(s.get("Net Difference (SAR)",0.0))
+        text=(f"POS-to-GL reconciliation overall status: **{overall}**. POS total **{_fmt_sar(pos_total)}** vs GL total **{_fmt_sar(gl_total)}** "
+              f"(net difference **{_fmt_sar(net_diff)}**) across **{int(s.get('Store-Date Buckets',0)):,} store/date bucket(s)** -- "
+              f"**{int(s.get('Matched Buckets',0)):,} matched**, **{int(s.get('Exception Buckets',0)):,} exception(s)**.")
+        top=pos_gl_data.get("top_exceptions",pd.DataFrame())
+        return {"text":text,"table":top.head(20) if isinstance(top,pd.DataFrame) and not top.empty else pd.DataFrame()}
+    else:
+        pos_rows=int(s.get("POS Rows",0)); gl_matched=int(s.get("GL Matched",0))
+        text=f"POS-to-GL reconciliation (row-to-row mode) overall status: **{overall}**. **{pos_rows:,} POS row(s)**, **{gl_matched:,} GL matched**."
+        exc=pos_gl_data.get("exceptions",pd.DataFrame())
+        return {"text":text,"table":exc.head(50) if isinstance(exc,pd.DataFrame) and not exc.empty else pd.DataFrame()}
+
+def answer_question(question, result, db_module=None, prior_context=None, user_context=None, pos_gl_data=None):
     if not result:
         return {
             "text":"I don't have an active reconciliation yet. Please run POS Reconciliation first; then I can answer questions about sales, cash, MADA/Visa/Mastercard, providers, exceptions, bank settlement, commission, corrections and JV status.",
@@ -2241,6 +2398,8 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
         payload=_reconciliation_run_history_answer(db_module)
     elif intent=="settlement_carry_forward":
         payload=_settlement_carry_forward_answer(result,ctx)
+    elif intent=="pos_gl_reconciliation":
+        payload=_pos_gl_answer(ctx,pos_gl_data,question)
     elif intent=="store_master":
         payload=_store_master_answer(ctx,db_module)
     elif intent=="terminal_master":
@@ -2272,7 +2431,7 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
         # on the rare case it IS still genuinely CASH-scoped, so there is no
         # loss of information -- just no forced reinterpretation as the
         # heavier cash-specific analytics report.
-        payload=_sales_answer(result,ctx,detail=False,db_module=db_module)
+        payload=_sales_answer(result,ctx,detail=False,db_module=db_module,question=question)
     elif intent=="date_range":
         payload=_date_range_answer(result,ctx)
     elif intent=="transactions":

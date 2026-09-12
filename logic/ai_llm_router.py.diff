@@ -1,19 +1,59 @@
---- /home/claude/repo_clone/logic/ai_llm_router.py	2026-09-11 20:01:21.596126768 +0000
-+++ /home/claude/deliver_copilot2/logic/ai_llm_router.py	2026-09-11 19:55:26.448105657 +0000
-@@ -81,7 +81,7 @@
+--- /tmp/diffbase_v56/repo_clone_orig/logic/ai_llm_router.py	2026-09-12 18:32:34.933486830 +0000
++++ deliver_copilot2/logic/ai_llm_router.py	2026-09-12 18:30:42.213315633 +0000
+@@ -74,12 +74,14 @@
+ # caller falls back to the deterministic keyword classifier instead of a
+ # forced, possibly-wrong guess.
+ VALID_INTENTS = [
+-    "greeting", "corrections", "jv", "close", "mapping", "commission",
+-    "unsettled", "missing_pos", "missing_d365", "settlement_batch",
+-    "gl_control", "risk", "store_performance", "provider_performance",
+-    "reconciliation_status", "close_readiness", "management_brief",
++    "greeting", "corrections", "jv", "jv_approval", "jv_posting", "adjustments",
++    "close", "mapping", "store_master", "terminal_master", "merchant_master",
++    "commission", "unsettled", "missing_pos", "missing_d365", "settlement_batch",
++    "settlement_carry_forward", "gl_config", "pos_gl_reconciliation", "gl_control", "risk", "store_performance",
++    "provider_performance", "reconciliation_status", "close_readiness", "management_brief",
      "settlement_intelligence", "commission_intelligence", "refund_intelligence",
-     "data_quality", "source_evidence", "copilot_help", "exceptions",
+-    "data_quality", "source_evidence", "copilot_help", "exceptions",
++    "data_quality", "source_evidence", "database_health", "reconciliation_run_history",
++    "copilot_help", "exceptions",
      "date_range", "cash_report", "refunds", "compare", "lookup",
--    "transactions", "sales", "summary", "unknown",
-+    "highest_transaction", "transactions", "sales", "summary", "unknown",
+     "highest_transaction", "transactions", "sales", "summary", "unknown",
  ]
- 
+@@ -87,15 +89,24 @@
  _INTENT_DESCRIPTIONS = {
-@@ -114,6 +114,7 @@
-     "refunds": "A simple refunds question (count/list), not the deeper refund_intelligence analytics.",
-     "compare": "Comparing two specific things against each other.",
-     "lookup": "Looking up one specific transaction by receipt/auth/authorization number.",
-+    "highest_transaction": "The single highest-value (or largest/biggest/maximum) transaction within scope -- one specific transaction, not an aggregate total or a per-store breakdown.",
-     "transactions": "Requesting transaction-level detail/drill-down, not a summary.",
-     "sales": "A general sales/revenue/tender question -- the right default for 'how much did we sell'.",
-     "summary": "A generic overview/briefing/dashboard request, or anything that doesn't clearly fit a category above.",
+     "greeting": "A simple hello/greeting, not a real question.",
+     "corrections": "Status of pending correction requests awaiting approval.",
+-    "jv": "JV/journal voucher readiness, status, or posting progress.",
++    "jv": "JV/journal voucher readiness, status, or posting progress (general, not a specific approval or D365-posting question).",
++    "jv_approval": "JV Approval Center -- who approved/rejected a batch, which batches are blocked from approval.",
++    "jv_posting": "D365 Posting Center/Verification -- which JV batches are posted to D365, voucher numbers, verified-balanced counts.",
++    "adjustments": "Late Transaction Adjustment JV -- post-close adjustment entries logged for a store/provider.",
+     "close": "Month-end / period close calendar status.",
+-    "mapping": "Store, terminal, or merchant mapping exceptions needing setup.",
++    "mapping": "Store, terminal, or merchant mapping EXCEPTIONS from the current reconciliation run (not the persisted master tables).",
++    "store_master": "The persisted Store Mapping Master admin table (Provider Store Name -> Store Code aliases), not live exceptions.",
++    "terminal_master": "The persisted POS Terminal Master admin table (Terminal ID -> Store Code).",
++    "merchant_master": "The persisted Merchant ID Master admin table (Merchant ID -> Store Code).",
+     "commission": "Commission, fees, VAT, or net-amount deduction questions.",
+     "unsettled": "Transactions not yet received/settled in the bank, or settlement delay.",
+     "missing_pos": "D365 transactions with no matching POS/provider settlement.",
+     "missing_d365": "POS/provider transactions with no matching D365 record.",
+     "settlement_batch": "Settlement batch status -- which batches are bank-received, pending, or provider-settled.",
+-    "gl_control": "GL posting status, GL mismatches/exceptions, unexplained GL, or clearing account movement.",
++    "settlement_carry_forward": "Which matched-but-unsettled transactions carry forward past a period-end into the next period.",
++    "gl_config": "The GL Configuration key->GL-account mapping used by JV creation (not GL reconciliation/exceptions).",
++    "pos_gl_reconciliation": "The separate POS Statement -> D365 GL bucket reconciliation (pages/35): matched/exception buckets, top exceptions, chronic stores, upload-incomplete/provider-mapping coverage gaps, duplicate-date uploads. Not the classic Store-Tender-based gl_control report.",
++    "gl_control": "GL posting status, GL mismatches/exceptions, unexplained GL, or clearing account movement (classic Store-Tender-based report, not the separate POS-to-GL bucket reconciliation).",
+     "risk": "Biggest/top risks, anomalies, or what needs attention today.",
+     "store_performance": "Comparing store performance or control scores.",
+     "provider_performance": "Comparing payment provider performance or settlement delay.",
+@@ -107,6 +118,8 @@
+     "refund_intelligence": "Refund totals, ratios, or largest refunds (analytical, not a plain refunds count).",
+     "data_quality": "Duplicate files, missing dates, unmapped terminals/merchants, or today's upload data quality.",
+     "source_evidence": "Which source file/row a number came from.",
++    "database_health": "Whether the app's database schema is healthy, its schema version, or migration history.",
++    "reconciliation_run_history": "Saved reconciliation run snapshots -- how many, who ran them, which is most recent.",
+     "copilot_help": "What this assistant can answer / its capabilities.",
+     "exceptions": "A general 'what's wrong / unmatched / issues' question.",
+     "date_range": "What date range or period is currently in scope for this conversation.",
