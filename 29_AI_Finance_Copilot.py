@@ -91,6 +91,12 @@ if prompt:
         db_module=db,
         prior_context=st.session_state.copilot_context,
         user_context=st.session_state.get("user"),
+        # NEW (2026-09-13): POS -> D365 GL Reconciliation (pages/35) stores its
+        # result under this separate session-state key, not the `ct_result`
+        # dict above -- pass it through so the Copilot can answer questions
+        # about it. None (unset) when that page hasn't been run yet;
+        # answer_question()/_pos_gl_answer() already handle that gracefully.
+        pos_gl_data=st.session_state.get("v53_pos_gl"),
     )
     st.session_state.copilot_context=payload["context"]
 
