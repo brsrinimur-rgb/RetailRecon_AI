@@ -617,8 +617,37 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
         # buried inside an unrelated word like "history" or "heyday".
         if greeting_match and len(ql.split())<=4:
             intent="greeting"
-        elif any(x in ql for x in ["pending correction","correction approval","corrections pending"]):
+        elif any(x in ql for x in ["pending correction","correction approval","corrections pending"]) or re.search(r"\bcorrections?\b",ql):
+            # BUG FIX (2026-09-12): same bug class as the bank/jv "details"
+            # fixes -- a bare "correction(s)" mention (e.g. "correction
+            # details") matched none of the specific phrases above, so it
+            # fell through to the generic details/sales catch-all instead.
             intent="corrections"
+        elif any(x in ql for x in [
+            "adjustment jv","late transaction adjustment","pending adjustment","adjustment details",
+            "late adjustment","post-close adjustment","post close adjustment"
+        ]):
+            # NEW (2026-09-12): Late Transaction Adjustment JV page was not
+            # covered at all before. Checked BEFORE the plain "jv" intent
+            # below since these phrases legitimately contain the word "jv"
+            # ("adjustment jv") -- more specific wins.
+            intent="adjustments"
+        elif any(x in ql for x in [
+            "jv approval","approval log","who approved","approved batches","rejected batches",
+            "blocked from approval","approval decision","which batches are approved"
+        ]):
+            # NEW (2026-09-12): JV Approval Center was not covered at all
+            # before -- only the plain "jv" intent's raw batch counts existed.
+            # Checked BEFORE the plain "jv" intent below for the same reason
+            # as adjustments above.
+            intent="jv_approval"
+        elif any(x in ql for x in [
+            "d365 posting","posting center","posting verification","voucher number",
+            "posted to d365","verified balanced","which batches are posted"
+        ]):
+            # NEW (2026-09-12): D365 Posting Center / Posting Verification was
+            # not covered at all before. Same "check before plain jv" reasoning.
+            intent="jv_posting"
         elif any(x in ql for x in ["jv status","journal status","ready for d365","ready to post","posting status"]) or (re.search(r"\bjv\b",ql) and "gl" not in ql):
             # BUG FIX (2026-09-11): same bug class as the "i need bank
             # details" fix just above -- a bare "jv" mention with no more
@@ -646,7 +675,29 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             # status"/"month end" (the only phrases any existing regression
             # test actually depends on for this intent) are unaffected.
             intent="close"
-        elif any(x in ql for x in ["merchant mapping","terminal mapping","store mapping","mapping required"]):
+        elif any(x in ql for x in ["store mapping master","mapping master","store master","which stores are mapped"]):
+            # NEW (2026-09-12): the Store Mapping Master admin table (the
+            # persisted Provider Store Name -> Store Code aliases) was not
+            # covered at all before -- only the unrelated "mapping" intent
+            # existed, which reports live per-transaction exceptions from the
+            # CURRENT reconciliation run, not this master data. Checked BEFORE
+            # the "mapping" intent below since "store mapping master"
+            # otherwise contains the bare word "mapping" and would be
+            # swallowed by it.
+            intent="store_master"
+        elif any(x in ql for x in ["terminal master","pos terminal master","list terminals","which terminals"]):
+            # NEW (2026-09-12): POS Terminal Master (Terminal ID -> Store
+            # Code) was not covered at all before.
+            intent="terminal_master"
+        elif any(x in ql for x in ["merchant master","merchant id master","which merchant"]):
+            # NEW (2026-09-12): Merchant ID Master (Merchant ID -> Store Code)
+            # was not covered at all before.
+            intent="merchant_master"
+        elif any(x in ql for x in ["merchant mapping","terminal mapping","store mapping","mapping required"]) or re.search(r"\bmapping\b",ql):
+            # BUG FIX (2026-09-12): same bug class as the bank/jv "details"
+            # fixes -- a bare "mapping" mention (e.g. "mapping details")
+            # matched none of the specific phrases above, so it fell through
+            # to the generic details/sales catch-all instead.
             intent="mapping"
         elif any(x in ql for x in ["commission","fee","fees","vat","net amount"]) or _fuzzy_word_present(ql,"commission"):
             intent="commission"
@@ -661,11 +712,31 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             "which settlements","bank received batches","payout pending","settlement propagation"
         ]):
             intent="settlement_batch"
+        elif any(x in ql for x in ["carry forward","carrying forward","settlement carry forward"]):
+            # NEW (2026-09-12): Settlement Carry Forward was not covered at
+            # all before.
+            intent="settlement_carry_forward"
+        elif any(x in ql for x in ["gl configuration","gl config","which gl account","gl account for"]):
+            # NEW (2026-09-12): GL Configuration (the key->GL-account editor
+            # behind JV creation) was not covered at all before. Checked
+            # BEFORE gl_control's bare "gl" fallback just below, since these
+            # phrases also contain "gl" and would otherwise be swallowed by
+            # the more general GL-control/reconciliation report instead of
+            # answering the configuration question actually asked.
+            intent="gl_config"
         elif any(x in ql for x in [
             "gl status","gl verified","d365 gl","gl mismatch","gl exception","gl exceptions",
             "unexplained gl","explain gl","gl balance","clearing balance","clearing movement",
             "which stores gl","gl not found","jv to gl","source to gl"
-        ]):
+        ]) or re.search(r"\bgl\b",ql):
+            # BUG FIX (2026-09-12): real user report -- "POS GL Reconciliation
+            # details" (and, by the same pattern, any other bare "GL" mention
+            # not already caught by a more specific phrase above) matched none
+            # of the exact phrases above, so it fell through the whole chain
+            # to the generic details/sales catch-all instead -- returning a
+            # completely unrelated global sales summary instead of any GL
+            # control information. Same bug class, same fix shape, as the
+            # bank/jv "details" fixes just above.
             intent="gl_control"
         elif any(x in ql for x in ["store performance","store score","store control score","which store is worst","which store needs attention"]):
             # BUG FIX (2026-09-11): this store_performance check used to sit
@@ -736,6 +807,14 @@ def interpret_query(question, result, prior: CopilotContext|None=None, db_module
             intent="data_quality"
         elif any(x in ql for x in ["source file","source files","where did this come from","evidence","data source"]):
             intent="source_evidence"
+        elif any(x in ql for x in ["database health","db health","schema health","is database healthy","schema version"]):
+            # NEW (2026-09-12): Database Health page was not covered at all
+            # before.
+            intent="database_health"
+        elif any(x in ql for x in ["run history","reconciliation history","saved runs","past runs","which runs","reconciliation run history"]):
+            # NEW (2026-09-12): Reconciliation Run History was not covered at
+            # all before.
+            intent="reconciliation_run_history"
         elif any(x in ql for x in ["help","what can you answer","what can i ask","capabilities"]):
             intent="copilot_help"
         elif any(x in ql for x in ["exception","anything wrong","issues","problem","unmatched"]):
@@ -1897,6 +1976,231 @@ def _settlement_batch_answer(result,ctx,question=""):
     }
 
 
+# ------------------------------------------------------------------------
+# V54 (2026-09-12): the user asked for the AI Copilot to be able to answer
+# questions about EVERY page in the application, not just the reconciliation
+# report pages it already covered (sales/cash/refunds/commission/settlement/
+# GL-control/JV/corrections/mapping-exceptions/close/risk/etc). The functions
+# below add the topics that were previously completely uncovered: the three
+# admin master-data tables (Store/Terminal/Merchant), GL Configuration, JV
+# Approval Center, D365 Posting Center/Verification, Late Transaction
+# Adjustment JV, Database Health, Reconciliation Run History, and Settlement
+# Carry Forward. Every one of these is purely additive (new intents, new
+# functions) -- nothing about any existing report changes.
+#
+# Deliberately NOT added as new intents, with reasons:
+#   - POS Auto Mapper: confirmed (by reading the page) to persist nothing at
+#     all -- its "confirm" button is cosmetic. There is no data to report on.
+#   - Bank Claim Follow Up: not a stored table -- it's the exact same
+#     "matched, not yet Bank Settled" slice the existing settlement_intelligence
+#     intent already reports on (aging framing only). Not duplicated as a
+#     separate intent to avoid two intents answering the identical question.
+#   - System Logic Health: an engineering/ops diagnostic (preserved-file
+#     integrity checks), not finance data -- out of scope for a finance
+#     Copilot; Database Health (the schema/data-facing one) is covered below.
+#   - AI Settlement Explainer (page 34) and POS GL Reconciliation (page 35):
+#     both keep their result under a DIFFERENT session-state key than the
+#     `result` dict this Copilot receives (`v53_pos_gl`, and the explainer's
+#     own per-batch narrative keys) -- reading them needs a small additional
+#     wiring change in the Streamlit page itself, not just ai_copilot.py, so
+#     they are intentionally left for a explicit follow-up rather than guessed
+#     at here.
+# ------------------------------------------------------------------------
+
+def _store_master_answer(ctx,db_module):
+    if db_module is None:
+        return {"text":"Store Mapping Master is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    df=db_module.load_store_mapping_master()
+    if df.empty:
+        return {"text":"The Store Mapping Master table is currently empty.","table":df}
+    x=df.copy()
+    if ctx.store_codes and "Store Code" in x.columns:
+        x=x[x["Store Code"].map(_norm_store).isin(ctx.store_codes)]
+        if x.empty:
+            return {"text":f"I couldn't find any Store Mapping Master entries for **{_scope_text(ctx)}**.","table":x}
+    active=x["Active"].astype(str).str.upper().isin(["YES","Y","TRUE","1"]) if "Active" in x.columns else pd.Series(True,index=x.index)
+    stores=x["Store Code"].nunique() if "Store Code" in x.columns else 0
+    text=(f"Store Mapping Master has **{len(x):,} alias row(s)** covering **{stores:,} distinct store code(s)**; "
+          f"**{int(active.sum()):,}** are marked Active.")
+    return {"text":text,"table":x.head(500)}
+
+def _terminal_master_answer(ctx,db_module):
+    if db_module is None:
+        return {"text":"POS Terminal Master is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    df=db_module.load_terminal_master()
+    if df.empty:
+        return {"text":"The POS Terminal Master table is currently empty.","table":df}
+    x=df.copy()
+    if ctx.store_codes and "Store Code" in x.columns:
+        x=x[x["Store Code"].map(_norm_store).isin(ctx.store_codes)]
+        if x.empty:
+            return {"text":f"I couldn't find any terminals mapped to **{_scope_text(ctx)}**.","table":x}
+    stores=x["Store Code"].nunique() if "Store Code" in x.columns else 0
+    text=f"POS Terminal Master has **{len(x):,} terminal(s)** mapped across **{stores:,} store(s)**."
+    return {"text":text,"table":x.head(500)}
+
+def _merchant_master_answer(ctx,db_module):
+    if db_module is None:
+        return {"text":"Merchant ID Master is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    df=db_module.load_merchant_master()
+    if df.empty:
+        return {"text":"The Merchant ID Master table is currently empty.","table":df}
+    x=df.copy()
+    if ctx.store_codes and "Store Code" in x.columns:
+        x=x[x["Store Code"].map(_norm_store).isin(ctx.store_codes)]
+        if x.empty:
+            return {"text":f"I couldn't find any merchant IDs mapped to **{_scope_text(ctx)}**.","table":x}
+    stores=x["Store Code"].nunique() if "Store Code" in x.columns else 0
+    text=f"Merchant ID Master has **{len(x):,} merchant ID(s)** mapped across **{stores:,} store(s)**."
+    return {"text":text,"table":x.head(500)}
+
+def _gl_config_answer(question,db_module):
+    if db_module is None:
+        return {"text":"GL Configuration is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    cfg=db_module.load_gl_config()
+    if not cfg:
+        return {"text":"No GL Configuration keys are currently stored.","table":pd.DataFrame()}
+    # Direct single-key lookup, e.g. "which gl account for tabby bank".
+    ql=str(question or "").lower()
+    hit_keys=[k for k in cfg if any(tok and tok in k.lower() for tok in re.findall(r"[a-z0-9_]{3,}",ql))]
+    baseline={}
+    try:
+        import core
+        baseline=dict(getattr(core,"D365_JV_DEFAULTS",{}) or {})
+    except Exception:
+        baseline={}
+    deviations=[{"Key":k,"Current Value":v,"Baseline Value":baseline.get(k,"")} for k,v in cfg.items() if k in baseline and str(v)!=str(baseline.get(k))]
+    if hit_keys:
+        rows=[{"Key":k,"GL Account":cfg[k]} for k in hit_keys]
+        table=pd.DataFrame(rows)
+        text=f"Found **{len(rows):,} GL Configuration key(s)** matching your question: "+", ".join(f"{r['Key']} = {r['GL Account']}" for r in rows[:5])+"."
+        return {"text":text,"table":table}
+    text=f"GL Configuration currently has **{len(cfg):,} key(s)**."
+    if deviations:
+        text+=f" **{len(deviations):,}** differ from the Finance-confirmed baseline."
+    else:
+        text+=" All keys match the Finance-confirmed baseline (no deviations)."
+    table=pd.DataFrame(deviations) if deviations else pd.DataFrame([{"Key":k,"GL Account":v} for k,v in cfg.items()])
+    return {"text":text,"table":table}
+
+def _jv_approval_answer(ctx,db_module,allowed_stores=None):
+    if db_module is None:
+        return {"text":"JV Approval information is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    jv=db_module.load_jv()
+    if allowed_stores:
+        jv=_restrict_df_to_stores(jv,allowed_stores)
+    if jv.empty:
+        return {"text":"No JV batches are currently stored.","table":jv}
+    if "Approval Status" in jv.columns:
+        counts=jv["Approval Status"].astype(str).str.upper().value_counts()
+    else:
+        counts=pd.Series(dtype=int)
+    blocked=pd.DataFrame()
+    if {"Balanced","Validation Passed"}.issubset(jv.columns):
+        blocked=jv[~(jv["Balanced"].fillna(False).astype(bool) & jv["Validation Passed"].fillna(False).astype(bool))]
+    log=db_module.load_approval_log() if hasattr(db_module,"load_approval_log") else pd.DataFrame()
+    parts=[f"JV Approval Center: **{len(jv):,} batch row(s)** in total."]
+    if not counts.empty:
+        parts.append("Status breakdown: "+", ".join(f"{k.title()}: {v:,}" for k,v in counts.items())+".")
+    if not blocked.empty:
+        parts.append(f"**{blocked['Journal Batch'].nunique() if 'Journal Batch' in blocked.columns else len(blocked):,}** batch(es) are currently blocked from approval (unbalanced or failed validation).")
+    if not log.empty:
+        last=log.iloc[0]
+        parts.append(f"Most recent decision: **{last.get('Decision','')}** by {last.get('User','')} on {last.get('Time','')}.")
+    return {"text":" ".join(parts),"table":(blocked if not blocked.empty else jv).head(500)}
+
+def _jv_posting_answer(ctx,db_module,allowed_stores=None):
+    if db_module is None:
+        return {"text":"D365 Posting information is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    jv=db_module.load_jv()
+    if allowed_stores:
+        jv=_restrict_df_to_stores(jv,allowed_stores)
+    if jv.empty:
+        return {"text":"No JV batches are currently stored.","table":jv}
+    posted=jv[jv.get("D365 Status",pd.Series("",index=jv.index)).astype(str).str.upper().eq("POSTED")] if "D365 Status" in jv.columns else pd.DataFrame()
+    posted_batches=posted["Journal Batch"].nunique() if "Journal Batch" in posted.columns and not posted.empty else len(posted)
+    verified_balanced=posted[posted.get("Balanced",pd.Series(False,index=posted.index)).fillna(False).astype(bool)]["Journal Batch"].nunique() if not posted.empty and "Balanced" in posted.columns and "Journal Batch" in posted.columns else 0
+    pending=jv[~jv.index.isin(posted.index)]
+    text=(f"D365 Posting: **{posted_batches:,} batch(es)** posted to D365 (**{verified_balanced:,}** verified balanced); "
+          f"**{pending['Journal Batch'].nunique() if 'Journal Batch' in pending.columns else len(pending):,}** batch(es) are still pending posting.")
+    return {"text":text,"table":posted.head(500) if not posted.empty else jv.head(500)}
+
+def _adjustments_answer(ctx,db_module):
+    if db_module is None:
+        return {"text":"Late Transaction Adjustment information is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    df=db_module.load_adjustments()
+    if df.empty:
+        return {"text":"No late-transaction adjustment JVs have been logged.","table":df}
+    x=df.copy()
+    if ctx.store_codes and "Store" in x.columns:
+        x=x[x["Store"].map(_norm_store).isin(ctx.store_codes)]
+    if ctx.payment and "Provider" in x.columns:
+        x=x[x["Provider"].astype(str).str.upper()==ctx.payment]
+    if x.empty:
+        return {"text":f"I couldn't find any adjustment JVs for **{_scope_text(ctx)}**.","table":x}
+    pending=x[x.get("Status",pd.Series("",index=x.index)).astype(str).str.upper().eq("PENDING APPROVAL")]
+    amt=float(pd.to_numeric(_safe_col_or_zero(pending,"Amount"),errors="coerce").abs().sum()) if not pending.empty else 0.0
+    period_note=""
+    try:
+        pc=db_module.load_accounting_period_control("ULC")
+        if pc and pc.get("Closed Through Date"):
+            period_note=f" The accounting period is currently closed through **{pc['Closed Through Date']}**."
+    except Exception:
+        pass
+    text=(f"For **{_scope_text(ctx)}**, **{len(x):,} adjustment JV(s)** logged; **{len(pending):,}** pending approval "
+          f"totaling **{_fmt_sar(amt)}**.{period_note}")
+    return {"text":text,"table":x.head(500)}
+
+def _database_health_answer(db_module):
+    if db_module is None:
+        return {"text":"Database Health is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    try:
+        h=db_module.get_database_health()
+    except Exception:
+        return {"text":"I couldn't read database health from the current connection.","table":pd.DataFrame()}
+    tables=h.get("Tables",pd.DataFrame())
+    status="healthy" if h.get("Healthy") else "NOT healthy"
+    text=(f"Database schema is **{status}** — schema version **{h.get('Schema Version','?')}** "
+          f"(required: **{h.get('Required Version','?')}**), last updated {h.get('Updated At','') or 'unknown'}.")
+    if isinstance(tables,pd.DataFrame) and not tables.empty and "Status" in tables.columns:
+        missing=tables[tables["Status"]!="HEALTHY"]
+        if not missing.empty:
+            text+=f" **{len(missing):,}** table(s) have missing columns: "+", ".join(missing["Table"].astype(str))+"."
+    return {"text":text,"table":tables if isinstance(tables,pd.DataFrame) else pd.DataFrame()}
+
+def _reconciliation_run_history_answer(db_module):
+    if db_module is None:
+        return {"text":"Reconciliation Run History is unavailable because the database module is not connected.","table":pd.DataFrame()}
+    try:
+        runs=db_module.list_reconciliation_runs(limit=100)
+    except Exception:
+        return {"text":"I couldn't read reconciliation run history from the current database.","table":pd.DataFrame()}
+    if runs.empty:
+        return {"text":"No reconciliation runs have been saved yet.","table":runs}
+    last=runs.iloc[0]
+    text=(f"**{len(runs):,} reconciliation run(s)** are saved. The most recent is **{last.get('Run ID','')}**, "
+          f"created by {last.get('User','')} on {last.get('Created At','')} (status: {last.get('Status','')}).")
+    return {"text":text,"table":runs.head(500)}
+
+def _settlement_carry_forward_answer(result,ctx):
+    matched=_filter_recon(result.get("matched",pd.DataFrame()),ctx)
+    if matched.empty:
+        return {"text":f"No matched transactions are available for **{_scope_text(ctx)}** to compute settlement carry-forward.","table":pd.DataFrame()}
+    try:
+        from logic.carry_forward_extension import build_settlement_carry_forward
+    except Exception:
+        return {"text":"Settlement Carry Forward logic is currently unavailable.","table":pd.DataFrame()}
+    cf=build_settlement_carry_forward(matched,None,None)
+    if cf is None or cf.empty:
+        return {"text":f"No transactions are carrying forward past period-end for **{_scope_text(ctx)}**.","table":pd.DataFrame()}
+    open_cf=cf[cf.get("Carry Forward Status",pd.Series("",index=cf.index)).eq("OPEN - CARRY FORWARD")] if "Carry Forward Status" in cf.columns else cf
+    amt=float(pd.to_numeric(_safe_col_or_zero(open_cf,"Outstanding Amount"),errors="coerce").sum()) if not open_cf.empty else 0.0
+    period=cf["Carry Forward Period"].iloc[0] if "Carry Forward Period" in cf.columns and not cf.empty else ""
+    text=(f"For **{_scope_text(ctx)}**, **{len(open_cf):,} transaction(s)** are carrying forward into **{period}**, "
+          f"totaling **{_fmt_sar(amt)}** still outstanding.")
+    return {"text":text,"table":cf.head(500)}
+
+
 def answer_question(question, result, db_module=None, prior_context=None, user_context=None):
     if not result:
         return {
@@ -1931,6 +2235,26 @@ def answer_question(question, result, db_module=None, prior_context=None, user_c
         payload=_fc_data_quality(result,ctx,db_module)
     elif intent=="source_evidence":
         payload=_fc_source_answer(result,ctx,db_module)
+    elif intent=="database_health":
+        payload=_database_health_answer(db_module)
+    elif intent=="reconciliation_run_history":
+        payload=_reconciliation_run_history_answer(db_module)
+    elif intent=="settlement_carry_forward":
+        payload=_settlement_carry_forward_answer(result,ctx)
+    elif intent=="store_master":
+        payload=_store_master_answer(ctx,db_module)
+    elif intent=="terminal_master":
+        payload=_terminal_master_answer(ctx,db_module)
+    elif intent=="merchant_master":
+        payload=_merchant_master_answer(ctx,db_module)
+    elif intent=="gl_config":
+        payload=_gl_config_answer(question,db_module)
+    elif intent=="jv_approval":
+        payload=_jv_approval_answer(ctx,db_module,allowed_stores)
+    elif intent=="jv_posting":
+        payload=_jv_posting_answer(ctx,db_module,allowed_stores)
+    elif intent=="adjustments":
+        payload=_adjustments_answer(ctx,db_module)
     elif intent=="copilot_help":
         payload=_fc_help()
     elif intent=="reconciliation_status":
