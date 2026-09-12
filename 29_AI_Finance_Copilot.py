@@ -85,19 +85,38 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    payload=answer_question(
-        prompt,
-        result,
-        db_module=db,
-        prior_context=st.session_state.copilot_context,
-        user_context=st.session_state.get("user"),
-        # NEW (2026-09-13): POS -> D365 GL Reconciliation (pages/35) stores its
-        # result under this separate session-state key, not the `ct_result`
-        # dict above -- pass it through so the Copilot can answer questions
-        # about it. None (unset) when that page hasn't been run yet;
-        # answer_question()/_pos_gl_answer() already handle that gracefully.
-        pos_gl_data=st.session_state.get("v53_pos_gl"),
-    )
+    try:
+        payload=answer_question(
+            prompt,
+            result,
+            db_module=db,
+            prior_context=st.session_state.copilot_context,
+            user_context=st.session_state.get("user"),
+            # NEW (2026-09-13): POS -> D365 GL Reconciliation (pages/35) stores its
+            # result under this separate session-state key, not the `ct_result`
+            # dict above -- pass it through so the Copilot can answer questions
+            # about it. None (unset) when that page hasn't been run yet;
+            # answer_question()/_pos_gl_answer() already handle that gracefully.
+            pos_gl_data=st.session_state.get("v53_pos_gl"),
+        )
+    except Exception as e:
+        # V-fix (2026-09-13): a real crash was reported here in production
+        # (Streamlit Cloud redacts the actual message, so it couldn't be
+        # diagnosed from the on-screen error alone, and it could not be
+        # reproduced against realistic/real reconciliation data in testing).
+        # Whatever the root cause, ONE bad question should never take down
+        # the whole page -- that forces a full reload and loses the entire
+        # conversation. Catch it, show the real (unredacted) error inline as
+        # a normal assistant message instead, and keep the chat usable for
+        # the next question. If this ever fires, copy the message it shows
+        # and report it -- that's the exact detail needed to fix the root
+        # cause, which a silently-redacted crash could never provide.
+        payload={
+            "text": f"⚠️ That question hit an internal error and could not be answered: `{type(e).__name__}: {e}`. Please try rephrasing, or report this exact message so it can be fixed.",
+            "table": pd.DataFrame(),
+            "context": st.session_state.copilot_context,
+            "intent": "error",
+        }
     st.session_state.copilot_context=payload["context"]
 
     with st.chat_message("assistant"):

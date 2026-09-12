@@ -49,7 +49,16 @@ _assert(r2["intent"]=="gl_control", f"'POS GL Recoolaiton details' now resolves 
 _assert(r2["text"]!=r1["text"], "the answer must actually change, not silently repeat the prior turn verbatim")
 
 r3 = ai.answer_question("pos gl reconciliation details", result, prior_context=None)
-_assert(r3["intent"]=="gl_control", f"correctly-spelled version also resolves to gl_control, got {r3['intent']}")
+# V-update (2026-09-13): at the time of this V53 fix, there was no dedicated
+# report for the separate POS->D365 GL bucket reconciliation (pages/35), so
+# the correctly-spelled phrase's best available destination was the general
+# gl_control report -- same as the typo'd version above. V56 added a real,
+# dedicated "pos_gl_reconciliation" intent/answer function backed by that
+# page's actual data, so the correctly-spelled phrase now (correctly) routes
+# there instead. The typo'd repro above is untouched and still proves the
+# original V53 fix (it doesn't match the new intent's exact phrases, so it
+# still falls back to gl_control, same as before).
+_assert(r3["intent"]=="pos_gl_reconciliation", f"correctly-spelled version now resolves to the dedicated pos_gl_reconciliation intent (V56), got {r3['intent']}")
 
 # --- 2. the other two audited gaps ---------------------------------------
 intent,_ = ai.interpret_query("correction details", result, None)
