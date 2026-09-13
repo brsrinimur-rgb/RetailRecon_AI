@@ -227,15 +227,23 @@ def _read_csv_with_sniffer(uploaded) -> pd.DataFrame:
 
 
 def _read_raw_provider(uploaded) -> pd.DataFrame:
+    """
+    Read original POS/provider files for follow-up enrichment only.
+
+    UNITED_LUXURY transaction reports are multi-sheet workbooks
+    (typically Details_mada and Details_CC). The previous implementation
+    read only the workbook's first/default sheet, which could miss the real
+    transaction rows and leave Card Number / Transaction Time blank.
+
+    This scans every Excel sheet, detects the transaction header separately,
+    and combines all usable sheets. It does not alter reconciliation logic.
+    """
     name = uploaded.name.lower()
     if name.endswith(".csv"):
         return _read_csv_with_sniffer(uploaded)
 
     uploaded.seek(0)
-    # For Excel, scan the first 20 rows to find a likely transaction header.
-    raw = pd.read_excel(uploaded, header=None)
-    if raw.empty:
-        return pd.DataFrame()
+    xls = pd.ExcelFile(uploaded)
 
     aliases = {
         "AUTH", "AUTHCODE", "AUTHORIZATIONCODE", "TRANSAPPROVALCD",
@@ -244,20 +252,49 @@ def _read_raw_provider(uploaded) -> pd.DataFrame:
         "TERMINALID", "TID"
     }
 
-    best_i = 0
-    best_score = -1
-    for i in range(min(25, len(raw))):
-        norm = {
-            re.sub(r"[^A-Z0-9]", "", str(v).upper())
-            for v in raw.iloc[i].tolist() if pd.notna(v)
-        }
-        score = len(norm.intersection(aliases))
-        if score > best_score:
-            best_score = score
-            best_i = i
+    frames = []
 
-    uploaded.seek(0)
-    return pd.read_excel(uploaded, header=best_i)
+    for sheet_name in xls.sheet_names:
+        try:
+            raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+        except Exception:
+            continue
+
+        if raw.empty:
+            continue
+
+        best_i = 0
+        best_score = -1
+
+        for i in range(min(25, len(raw))):
+            norm = {
+                re.sub(r"[^A-Z0-9]", "", str(v).upper())
+                for v in raw.iloc[i].tolist() if pd.notna(v)
+            }
+            score = len(norm.intersection(aliases))
+            if score > best_score:
+                best_score = score
+                best_i = i
+
+        # Avoid cover/summary sheets that do not contain transaction fields.
+        if best_score < 2:
+            continue
+
+        try:
+            part = pd.read_excel(xls, sheet_name=sheet_name, header=best_i)
+        except Exception:
+            continue
+
+        if part.empty:
+            continue
+
+        part["_RAW_SHEET"] = sheet_name
+        frames.append(part)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True, sort=False)
 
 
 def _enrich_card_and_time(queue: pd.DataFrame, raw_files) -> tuple[pd.DataFrame, int]:
