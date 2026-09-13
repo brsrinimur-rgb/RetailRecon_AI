@@ -634,17 +634,69 @@ if not missing_recipient.empty:
 st.subheader("4. Prepare Follow-Up Email")
 
 store_options = sorted(queue["Store Code"].astype(str).unique())
-selected_store = st.selectbox("Select Store", store_options)
+selected_store = st.selectbox(
+    "Select Store",
+    store_options,
+    key="missing_d365_selected_store_v4",
+)
 
 store_rows = queue[queue["Store Code"].astype(str).eq(str(selected_store))].copy()
 to_email = str(store_rows.iloc[0].get("To Email", "") or "")
 cc_email = str(store_rows.iloc[0].get("CC Email", "") or "")
 subject, body = _build_email(store_rows)
 
-st.text_input("To", value=to_email, key="missing_d365_to_v3")
-st.text_input("CC", value=cc_email, key="missing_d365_cc_v3")
-st.text_input("Subject", value=subject, key="missing_d365_subject_v3")
-st.text_area("Email Body", value=body, height=360, key="missing_d365_body_v3")
+# IMPORTANT:
+# Use store-specific widget keys. Streamlit preserves widget state by key;
+# the old fixed keys caused Store 601's subject/body to remain visible after
+# selecting Store 615. These keys force the prepared email to follow the
+# currently selected store while still allowing the user to edit the fields.
+store_key = re.sub(r"[^A-Za-z0-9_-]", "_", str(selected_store))
+
+email_to = st.text_input(
+    "To",
+    value=to_email,
+    key=f"missing_d365_to_{store_key}",
+)
+email_cc = st.text_input(
+    "CC",
+    value=cc_email,
+    key=f"missing_d365_cc_{store_key}",
+)
+email_subject = st.text_input(
+    "Subject",
+    value=subject,
+    key=f"missing_d365_subject_{store_key}",
+)
+email_body = st.text_area(
+    "Email Body",
+    value=body,
+    height=360,
+    key=f"missing_d365_body_{store_key}",
+)
+
+# Final safety validation before any future Send Email action is enabled.
+# The current page remains PREPARE-ONLY until an email provider/API is connected.
+card_missing = store_rows["Card Number"].fillna("").astype(str).str.strip().eq("").any()
+time_missing = store_rows["Transaction Time"].fillna("").astype(str).str.strip().eq("").any()
+recipient_missing = not email_to.strip()
+
+if recipient_missing:
+    st.warning("Send Email blocked: To Email is missing for the selected store.")
+elif card_missing or time_missing:
+    missing_fields = []
+    if card_missing:
+        missing_fields.append("Card Number")
+    if time_missing:
+        missing_fields.append("Transaction Time")
+    st.warning(
+        "Send Email blocked: " + " and ".join(missing_fields)
+        + " is missing for one or more selected-store transactions."
+    )
+else:
+    st.success(
+        "Email validation PASS: selected store, recipient, Card Number, "
+        "Transaction Time, Subject and Email Body are ready."
+    )
 
 st.download_button(
     "⬇️ DOWNLOAD MISSING D365 FOLLOW-UP CSV",
@@ -655,6 +707,7 @@ st.download_button(
 )
 
 st.caption(
-    "Email sending remains disabled until recipient mapping is validated. "
-    "This page prepares the correct follow-up data only."
+    "Email sending is not yet executed by this page. The selected-store email is now "
+    "validated and refreshes correctly. Connect an approved email provider/API before "
+    "enabling the final Send Email action."
 )
