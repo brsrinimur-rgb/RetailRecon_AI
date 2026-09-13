@@ -78,6 +78,8 @@ q = _load_missing_d365_from_report(report)
 
 _assert(len(q) == 1, f"only the 1 real 'Missing D365' row survives, got {len(q)}")
 _assert(q["Store Code"].iloc[0] == "615", "Store Code correctly cleaned (no spurious .0)")
+_assert(q["Terminal ID"].iloc[0] == "55610703",
+        f"Terminal ID also correctly cleaned (no spurious .0 -- confirmed live in production before this fix), got {q['Terminal ID'].iloc[0]!r}")
 
 dt = q["Transaction Date"].iloc[0]
 _assert(pd.Timestamp(dt).year == 2026, f"Transaction Date resolves to 2026, not a 1970 artifact, got {dt}")
