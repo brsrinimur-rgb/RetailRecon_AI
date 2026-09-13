@@ -82,6 +82,66 @@ def _num(v) -> float:
         return 0.0
 
 
+
+def _format_transaction_time(v) -> str:
+    """
+    Format POS transaction time for display only.
+
+    Handles:
+    - numeric HHMMSS values from Excel/POS, e.g. 222914.0 -> 22:29:14
+    - shorter numeric values with leading-zero padding, e.g. 91503 -> 09:15:03
+    - Excel time fractions, e.g. 0.5 -> 12:00:00
+    - datetime/time-like strings already containing colons
+
+    This function does not participate in reconciliation matching.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+
+    if hasattr(v, "strftime"):
+        try:
+            return v.strftime("%H:%M:%S")
+        except Exception:
+            pass
+
+    s = str(v).strip()
+    if not s or s.lower() in {"nan", "nat", "none"}:
+        return ""
+
+    if ":" in s:
+        m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", s)
+        if m:
+            hh = int(m.group(1))
+            mm = int(m.group(2))
+            ss = int(m.group(3) or 0)
+            if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+                return f"{hh:02d}:{mm:02d}:{ss:02d}"
+        return s
+
+    try:
+        fv = float(s)
+        if 0 <= fv < 1 and "." in s:
+            total_seconds = int(round(fv * 24 * 60 * 60)) % (24 * 60 * 60)
+            hh = total_seconds // 3600
+            mm = (total_seconds % 3600) // 60
+            ss = total_seconds % 60
+            return f"{hh:02d}:{mm:02d}:{ss:02d}"
+    except Exception:
+        pass
+
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".", 1)[0]
+
+    digits = re.sub(r"\D", "", s)
+    if 1 <= len(digits) <= 6:
+        digits = digits.zfill(6)
+        hh, mm, ss = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
+        if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+            return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+    return s
+
+
 def _mask_pan(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
@@ -157,7 +217,7 @@ def _load_missing_d365_from_report(uploaded) -> pd.DataFrame:
             exc["POS Date"].map(_report_date) if "POS Date" in exc.columns else ""
         ),
         "Transaction Time": (
-            exc["Transaction Time"].fillna("").astype(str).str.strip()
+            exc["Transaction Time"].map(_format_transaction_time)
             if "Transaction Time" in exc.columns else ""
         ),
         "Value of Sales": exc["POS Total"].map(_num),
@@ -376,7 +436,7 @@ def _enrich_card_and_time(queue: pd.DataFrame, raw_files) -> tuple[pd.DataFrame,
                 all_candidates.append({
                     "priority": int(row.get("_SOURCE_PRIORITY", 1)),
                     "card": _mask_pan(row.get(card_col)) if card_col else "",
-                    "time": "" if not time_col or pd.isna(row.get(time_col)) else str(row.get(time_col)).strip(),
+                    "time": _format_transaction_time(row.get(time_col)) if time_col else "",
                 })
 
         if not all_candidates:
@@ -437,7 +497,7 @@ def _build_email(group: pd.DataFrame) -> tuple[str, str]:
         dt = pd.to_datetime(r.get("Transaction Date"), errors="coerce")
         date_text = dt.strftime("%d-%b-%Y") if pd.notna(dt) else str(r.get("Transaction Date", "") or "")
         lines.append(
-            f"{r.get('Payment Type','')} | {date_text} {r.get('Transaction Time','')} | "
+            f"{r.get('Payment Type','')} | {date_text} {_format_transaction_time(r.get('Transaction Time',''))} | "
             f"SAR {float(r.get('Value of Sales',0) or 0):,.2f} | "
             f"Card {r.get('Card Number','')} | Auth {r.get('Authorization Code','')}"
         )
