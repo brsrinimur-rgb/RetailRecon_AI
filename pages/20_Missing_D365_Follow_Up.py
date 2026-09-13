@@ -4,6 +4,9 @@ from __future__ import annotations
 import csv
 import io
 import re
+import json
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Optional
 
@@ -514,6 +517,73 @@ def _build_email(group: pd.DataFrame) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
+
+def _split_emails(value: str) -> list[str]:
+    """Split semicolon/comma-separated recipient lists and remove blanks/duplicates."""
+    if not value:
+        return []
+    parts = re.split(r"[;,]", str(value))
+    out = []
+    seen = set()
+    for part in parts:
+        email = part.strip()
+        if not email:
+            continue
+        key = email.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(email)
+    return out
+
+
+def _valid_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(value).strip()))
+
+
+def _send_resend_email(
+    api_key: str,
+    from_name: str,
+    from_email: str,
+    to_emails: list[str],
+    cc_emails: list[str],
+    subject: str,
+    body: str,
+) -> dict:
+    """
+    Send one selected-store follow-up email through Resend.
+    Uses Python standard library only, so requirements.txt does not need a new package.
+    """
+    payload = {
+        "from": f"{from_name} <{from_email}>",
+        "to": to_emails,
+        "subject": subject,
+        "text": body,
+    }
+    if cc_emails:
+        payload["cc"] = cc_emails
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "RetailRecon-AI/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {"ok": True}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Resend rejected the email (HTTP {e.code}): {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not connect to Resend: {e.reason}") from e
+
+
 st.title("📨 Missing D365 Follow-Up")
 st.caption(
     "This page reads only final **Missing D365** exceptions from the RetailRecon report. "
@@ -706,8 +776,106 @@ st.download_button(
     use_container_width=True,
 )
 
+
+st.subheader("5. Send Follow-Up Email")
+
+# Secrets are kept outside GitHub/source code.
+try:
+    resend_api_key = str(st.secrets.get("RESEND_API_KEY", "")).strip()
+    resend_from_email = str(
+        st.secrets.get("RESEND_FROM_EMAIL", "reconciliation@mail.ahenqor.com")
+    ).strip()
+    resend_from_name = str(
+        st.secrets.get("RESEND_FROM_NAME", "RetailRecon AI")
+    ).strip()
+except Exception:
+    resend_api_key = ""
+    resend_from_email = "reconciliation@mail.ahenqor.com"
+    resend_from_name = "RetailRecon AI"
+
+to_list = _split_emails(email_to)
+cc_list = _split_emails(email_cc)
+
+invalid_to = [x for x in to_list if not _valid_email(x)]
+invalid_cc = [x for x in cc_list if not _valid_email(x)]
+
+send_block_reasons = []
+if not resend_api_key:
+    send_block_reasons.append("RESEND_API_KEY is not configured in Streamlit Secrets")
+if not resend_from_email or not _valid_email(resend_from_email):
+    send_block_reasons.append("RESEND_FROM_EMAIL is missing or invalid")
+if not to_list:
+    send_block_reasons.append("To Email is missing")
+if invalid_to:
+    send_block_reasons.append("Invalid To Email: " + ", ".join(invalid_to))
+if invalid_cc:
+    send_block_reasons.append("Invalid CC Email: " + ", ".join(invalid_cc))
+if card_missing:
+    send_block_reasons.append("Card Number is missing")
+if time_missing:
+    send_block_reasons.append("Transaction Time is missing")
+if not email_subject.strip():
+    send_block_reasons.append("Subject is missing")
+if not email_body.strip():
+    send_block_reasons.append("Email Body is missing")
+
+if send_block_reasons:
+    st.warning("Email sending is blocked until these checks are fixed:\n- " + "\n- ".join(send_block_reasons))
+else:
+    st.success(
+        f"Ready to send from {resend_from_name} <{resend_from_email}> "
+        f"to {', '.join(to_list)}."
+    )
+
+    confirm_send = st.checkbox(
+        f"I confirm the selected store is {selected_store} and the To/CC recipients are correct.",
+        key=f"missing_d365_send_confirm_{store_key}",
+    )
+
+    if st.button(
+        "📧 SEND EMAIL",
+        type="primary",
+        use_container_width=True,
+        disabled=not confirm_send,
+        key=f"missing_d365_send_button_{store_key}",
+    ):
+        try:
+            with st.spinner("Sending email through Resend..."):
+                result = _send_resend_email(
+                    api_key=resend_api_key,
+                    from_name=resend_from_name,
+                    from_email=resend_from_email,
+                    to_emails=to_list,
+                    cc_emails=cc_list,
+                    subject=email_subject.strip(),
+                    body=email_body,
+                )
+
+            resend_id = str(result.get("id", "") or "")
+            st.success(
+                "Email sent successfully."
+                + (f" Resend ID: {resend_id}" if resend_id else "")
+            )
+            st.session_state[f"missing_d365_last_send_{store_key}"] = {
+                "store": str(selected_store),
+                "to": to_list,
+                "cc": cc_list,
+                "subject": email_subject.strip(),
+                "resend_id": resend_id,
+                "status": "Sent",
+            }
+        except Exception as e:
+            st.error(f"Email was NOT sent. {e}")
+
+last_send = st.session_state.get(f"missing_d365_last_send_{store_key}")
+if last_send:
+    st.info(
+        f"Last send status for Store {last_send['store']}: "
+        f"{last_send['status']} | To: {', '.join(last_send['to'])}"
+        + (f" | Resend ID: {last_send['resend_id']}" if last_send.get("resend_id") else "")
+    )
+
 st.caption(
-    "Email sending is not yet executed by this page. The selected-store email is now "
-    "validated and refreshes correctly. Connect an approved email provider/API before "
-    "enabling the final Send Email action."
+    "Only the currently selected store is sent. Reconciliation, matching, Card Number "
+    "enrichment and Missing D365 logic are unchanged."
 )
