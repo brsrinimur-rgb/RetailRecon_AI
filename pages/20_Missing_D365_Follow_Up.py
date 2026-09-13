@@ -4,8 +4,10 @@ from __future__ import annotations
 import csv
 import io
 import re
-import smtplib
-from email.message import EmailMessage
+import json
+import hashlib
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Optional
 
@@ -516,101 +518,103 @@ def _build_email(group: pd.DataFrame) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
-def _parse_addrs(v) -> list[str]:
+
+def _clean_api_key(value: str) -> str:
     """
-    To/CC fields in this app use semicolon-separated addresses (sometimes
-    comma-separated too, e.g. copy-pasted from Outlook). Split and drop any
-    empty entries so a trailing ";" or blank CC never becomes a bogus
-    recipient.
+    Normalize a Resend API key loaded from Streamlit Secrets.
+
+    Handles accidental leading/trailing spaces, embedded line breaks,
+    and a second layer of quotes copied into the secret value.
+    The cleaned key is never displayed.
     """
-    if v is None:
+    if value is None:
+        return ""
+    key = str(value).strip()
+
+    # If a user accidentally saved literal wrapping quotes as part of the value.
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
+        key = key[1:-1].strip()
+
+    # API keys must not contain whitespace.
+    key = re.sub(r"\s+", "", key)
+    return key
+
+
+def _key_diagnostics(key: str) -> dict:
+    """Return safe diagnostics without exposing the secret."""
+    cleaned = _clean_api_key(key)
+    return {
+        "loaded": bool(cleaned),
+        "starts_re": cleaned.startswith("re_"),
+        "length": len(cleaned),
+        "fingerprint": hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:10] if cleaned else "",
+    }
+
+
+def _split_emails(value: str) -> list[str]:
+    """Split semicolon/comma-separated recipient lists and remove blanks/duplicates."""
+    if not value:
         return []
-    s = str(v).strip()
-    if not s:
-        return []
-    return [a.strip() for a in re.split(r"[;,]", s) if a.strip()]
-
-
-def _smtp_configured() -> bool:
-    try:
-        return bool(
-            st.secrets.get("smtp", {}).get("username")
-            and st.secrets.get("smtp", {}).get("app_password")
-        )
-    except Exception:
-        return False
-
-
-def _send_email_smtp(to_addr: str, cc_addr: str, subject: str, body: str) -> None:
-    """
-    Sends via Microsoft 365 SMTP (smtp.office365.com:587, STARTTLS) using a
-    mailbox address + app password, read only from Streamlit Secrets --
-    never hardcoded, never entered by anyone but the mailbox owner in the
-    app's own Secrets settings. Requires "Authenticated SMTP" to be enabled
-    for that mailbox in addition to the app password; if it is not, Office
-    365 rejects the login with an explicit "SmtpClientAuthentication is
-    disabled for the Mailbox" error, which is surfaced to the caller as-is
-    so it is clear what to ask IT to enable (a single per-mailbox setting,
-    not a tenant-wide change).
-    """
-    username = st.secrets["smtp"]["username"]
-    app_password = st.secrets["smtp"]["app_password"]
-
-    to_list = _parse_addrs(to_addr)
-    cc_list = _parse_addrs(cc_addr)
-    if not to_list:
-        raise ValueError("No valid 'To' address to send to.")
-
-    msg = EmailMessage()
-    msg["From"] = username
-    msg["To"] = ", ".join(to_list)
-    if cc_list:
-        msg["Cc"] = ", ".join(cc_list)
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    with smtplib.SMTP("smtp.office365.com", 587, timeout=30) as server:
-        server.starttls()
-        server.login(username, app_password)
-        server.send_message(msg, to_addrs=to_list + cc_list)
-
-
-def _bulk_send_all(queue: pd.DataFrame, send_fn=_send_email_smtp) -> pd.DataFrame:
-    """
-    Sends one follow-up email per distinct Store Code in `queue`, grouping
-    all of that store's Missing D365 rows into a single email (same
-    grouping _build_email() already uses for the single-store preview).
-
-    A store with no recipient email is recorded as Skipped, not treated as
-    a fatal error -- one missing address must never block every other
-    store's email from going out. A send that raises (bad credentials,
-    SMTP rejection, etc.) is recorded as Failed with the error message and
-    the loop continues to the next store rather than aborting the batch.
-
-    `send_fn` is swappable purely so tests can verify this loop's control
-    flow (which stores get skipped/sent/failed, and that one failure or
-    missing recipient never blocks the rest) without opening a real SMTP
-    connection; the live page always calls it with the real
-    _send_email_smtp.
-    """
-    results = []
-    for code in sorted(queue["Store Code"].astype(str).unique()):
-        rows = queue[queue["Store Code"].astype(str).eq(code)].copy()
-        to_e = str(rows.iloc[0].get("To Email", "") or "")
-        cc_e = str(rows.iloc[0].get("CC Email", "") or "")
-        subj, body_ = _build_email(rows)
-
-        if not _parse_addrs(to_e):
-            results.append({"Store Code": code, "Status": "Skipped", "Detail": "No recipient email"})
+    parts = re.split(r"[;,]", str(value))
+    out = []
+    seen = set()
+    for part in parts:
+        email = part.strip()
+        if not email:
             continue
+        key = email.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(email)
+    return out
 
-        try:
-            send_fn(to_e, cc_e, subj, body_)
-            results.append({"Store Code": code, "Status": "Sent", "Detail": f"To: {to_e}"})
-        except Exception as e:
-            results.append({"Store Code": code, "Status": "Failed", "Detail": str(e)})
 
-    return pd.DataFrame(results, columns=["Store Code", "Status", "Detail"])
+def _valid_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(value).strip()))
+
+
+def _send_resend_email(
+    api_key: str,
+    from_name: str,
+    from_email: str,
+    to_emails: list[str],
+    cc_emails: list[str],
+    subject: str,
+    body: str,
+) -> dict:
+    """
+    Send one selected-store follow-up email through Resend.
+    Uses Python standard library only, so requirements.txt does not need a new package.
+    """
+    payload = {
+        "from": f"{from_name} <{from_email}>",
+        "to": to_emails,
+        "subject": subject,
+        "text": body,
+    }
+    if cc_emails:
+        payload["cc"] = cc_emails
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_clean_api_key(api_key)}",
+            "Content-Type": "application/json",
+            "User-Agent": "RetailRecon-AI/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {"ok": True}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Resend rejected the email (HTTP {e.code}): {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not connect to Resend: {e.reason}") from e
 
 
 st.title("📨 Missing D365 Follow-Up")
@@ -733,17 +737,69 @@ if not missing_recipient.empty:
 st.subheader("4. Prepare Follow-Up Email")
 
 store_options = sorted(queue["Store Code"].astype(str).unique())
-selected_store = st.selectbox("Select Store", store_options)
+selected_store = st.selectbox(
+    "Select Store",
+    store_options,
+    key="missing_d365_selected_store_v4",
+)
 
 store_rows = queue[queue["Store Code"].astype(str).eq(str(selected_store))].copy()
 to_email = str(store_rows.iloc[0].get("To Email", "") or "")
 cc_email = str(store_rows.iloc[0].get("CC Email", "") or "")
 subject, body = _build_email(store_rows)
 
-st.text_input("To", value=to_email, key="missing_d365_to_v3")
-st.text_input("CC", value=cc_email, key="missing_d365_cc_v3")
-st.text_input("Subject", value=subject, key="missing_d365_subject_v3")
-st.text_area("Email Body", value=body, height=360, key="missing_d365_body_v3")
+# IMPORTANT:
+# Use store-specific widget keys. Streamlit preserves widget state by key;
+# the old fixed keys caused Store 601's subject/body to remain visible after
+# selecting Store 615. These keys force the prepared email to follow the
+# currently selected store while still allowing the user to edit the fields.
+store_key = re.sub(r"[^A-Za-z0-9_-]", "_", str(selected_store))
+
+email_to = st.text_input(
+    "To",
+    value=to_email,
+    key=f"missing_d365_to_{store_key}",
+)
+email_cc = st.text_input(
+    "CC",
+    value=cc_email,
+    key=f"missing_d365_cc_{store_key}",
+)
+email_subject = st.text_input(
+    "Subject",
+    value=subject,
+    key=f"missing_d365_subject_{store_key}",
+)
+email_body = st.text_area(
+    "Email Body",
+    value=body,
+    height=360,
+    key=f"missing_d365_body_{store_key}",
+)
+
+# Final safety validation before any future Send Email action is enabled.
+# The current page remains PREPARE-ONLY until an email provider/API is connected.
+card_missing = store_rows["Card Number"].fillna("").astype(str).str.strip().eq("").any()
+time_missing = store_rows["Transaction Time"].fillna("").astype(str).str.strip().eq("").any()
+recipient_missing = not email_to.strip()
+
+if recipient_missing:
+    st.warning("Send Email blocked: To Email is missing for the selected store.")
+elif card_missing or time_missing:
+    missing_fields = []
+    if card_missing:
+        missing_fields.append("Card Number")
+    if time_missing:
+        missing_fields.append("Transaction Time")
+    st.warning(
+        "Send Email blocked: " + " and ".join(missing_fields)
+        + " is missing for one or more selected-store transactions."
+    )
+else:
+    st.success(
+        "Email validation PASS: selected store, recipient, Card Number, "
+        "Transaction Time, Subject and Email Body are ready."
+    )
 
 st.download_button(
     "⬇️ DOWNLOAD MISSING D365 FOLLOW-UP CSV",
@@ -753,82 +809,348 @@ st.download_button(
     use_container_width=True,
 )
 
+
 st.subheader("5. Send Follow-Up Email")
 
-if not _smtp_configured():
-    st.info(
-        "Email sending is not yet set up. This app needs a Microsoft 365 mailbox "
-        "address and an app password added to this app's **Secrets** (Streamlit "
-        "Cloud → Manage app → Settings → Secrets) before it can send anything:\n\n"
-        "```\n[smtp]\nusername = \"your.mailbox@trafalgarluxurygroup.com\"\n"
-        "app_password = \"xxxx xxxx xxxx xxxx\"\n```\n\n"
-        "Generate the app password yourself at "
-        "account.microsoft.com/security → Advanced security options → App passwords. "
-        "No IT/admin action is needed for this step. Until Secrets are added, "
-        "this page only prepares the follow-up data above -- nothing is sent."
-    )
-else:
-    confirm = st.checkbox(
-        "I have reviewed the To / CC / Subject / Body above and confirm this is correct.",
-        key="missing_d365_send_confirm_v3",
-    )
-    if st.button("📧 SEND EMAIL NOW", type="primary", disabled=not confirm):
-        to_val = st.session_state.get("missing_d365_to_v3", "").strip()
-        cc_val = st.session_state.get("missing_d365_cc_v3", "").strip()
-        subject_val = st.session_state.get("missing_d365_subject_v3", "")
-        body_val = st.session_state.get("missing_d365_body_v3", "")
+# Secrets are kept outside GitHub/source code.
+try:
+    resend_api_key = _clean_api_key(st.secrets.get("RESEND_API_KEY", ""))
+    resend_from_email = str(
+        st.secrets.get("RESEND_FROM_EMAIL", "reconciliation@mail.ahenqor.com")
+    ).strip()
+    resend_from_name = str(
+        st.secrets.get("RESEND_FROM_NAME", "RetailRecon AI")
+    ).strip()
+except Exception:
+    resend_api_key = ""
+    resend_from_email = "reconciliation@mail.ahenqor.com"
+    resend_from_name = "RetailRecon AI"
 
-        if not _parse_addrs(to_val):
-            st.error(
-                "Cannot send: 'To' is empty for this store. Add a recipient on the "
-                "Store Email Master page first."
+diag = _key_diagnostics(resend_api_key)
+
+with st.expander("🔐 Resend connection diagnostic", expanded=True):
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("API key loaded", "YES" if diag["loaded"] else "NO")
+    d2.metric("Starts with re_", "YES" if diag["starts_re"] else "NO")
+    d3.metric("Key length", diag["length"])
+    d4.metric("Key fingerprint", diag["fingerprint"] or "—")
+    st.caption(
+        "The fingerprint is a one-way SHA-256 identifier, not the API key. "
+        "It is safe to share if troubleshooting is needed."
+    )
+
+to_list = _split_emails(email_to)
+cc_list = _split_emails(email_cc)
+
+invalid_to = [x for x in to_list if not _valid_email(x)]
+invalid_cc = [x for x in cc_list if not _valid_email(x)]
+
+send_block_reasons = []
+if not resend_api_key:
+    send_block_reasons.append("RESEND_API_KEY is not configured in Streamlit Secrets")
+if not resend_from_email or not _valid_email(resend_from_email):
+    send_block_reasons.append("RESEND_FROM_EMAIL is missing or invalid")
+if not to_list:
+    send_block_reasons.append("To Email is missing")
+if invalid_to:
+    send_block_reasons.append("Invalid To Email: " + ", ".join(invalid_to))
+if invalid_cc:
+    send_block_reasons.append("Invalid CC Email: " + ", ".join(invalid_cc))
+if card_missing:
+    send_block_reasons.append("Card Number is missing")
+if time_missing:
+    send_block_reasons.append("Transaction Time is missing")
+if not email_subject.strip():
+    send_block_reasons.append("Subject is missing")
+if not email_body.strip():
+    send_block_reasons.append("Email Body is missing")
+
+if send_block_reasons:
+    st.warning("Email sending is blocked until these checks are fixed:\n- " + "\n- ".join(send_block_reasons))
+else:
+    st.success(
+        f"Ready to send from {resend_from_name} <{resend_from_email}> "
+        f"to {', '.join(to_list)}."
+    )
+
+    confirm_send = st.checkbox(
+        f"I confirm the selected store is {selected_store} and the To/CC recipients are correct.",
+        key=f"missing_d365_send_confirm_{store_key}",
+    )
+
+    if st.button(
+        "📧 SEND EMAIL",
+        type="primary",
+        use_container_width=True,
+        disabled=not confirm_send,
+        key=f"missing_d365_send_button_{store_key}",
+    ):
+        try:
+            with st.spinner("Sending email through Resend..."):
+                result = _send_resend_email(
+                    api_key=resend_api_key,
+                    from_name=resend_from_name,
+                    from_email=resend_from_email,
+                    to_emails=to_list,
+                    cc_emails=cc_list,
+                    subject=email_subject.strip(),
+                    body=email_body,
+                )
+
+            resend_id = str(result.get("id", "") or "")
+            st.success(
+                "Email sent successfully."
+                + (f" Resend ID: {resend_id}" if resend_id else "")
             )
-        else:
-            try:
-                _send_email_smtp(to_val, cc_val, subject_val, body_val)
-                st.success(
-                    f"Email sent to {', '.join(_parse_addrs(to_val))}"
-                    + (f" (cc: {', '.join(_parse_addrs(cc_val))})" if _parse_addrs(cc_val) else "")
-                )
-            except Exception as e:
+            st.session_state[f"missing_d365_last_send_{store_key}"] = {
+                "store": str(selected_store),
+                "to": to_list,
+                "cc": cc_list,
+                "subject": email_subject.strip(),
+                "resend_id": resend_id,
+                "status": "Sent",
+            }
+        except Exception as e:
+            msg = str(e)
+            st.error(f"Email was NOT sent. {msg}")
+            if "HTTP 401" in msg or "API key is invalid" in msg:
                 st.error(
-                    f"Send failed: {e}\n\n"
-                    "If this mentions 'SmtpClientAuthentication is disabled for the "
-                    "Mailbox', ask IT to enable Authenticated SMTP for this one "
-                    "mailbox -- that is a small, per-mailbox setting, not a "
-                    "tenant-wide change."
+                    "Resend authentication failed. The app is reaching Resend, but the key "
+                    "loaded by Streamlit is not accepted. Check the diagnostic above. "
+                    "If API key loaded = YES and Starts with re_ = YES, revoke that key in "
+                    "Resend, create a brand-new Sending Access key, paste it into Streamlit "
+                    "Secrets, Save changes, then REBOOT the Streamlit app before retrying."
                 )
 
-st.subheader("6. Bulk Send: All Stores")
-st.caption(
-    "Sends one follow-up email per store, covering every Missing D365 transaction for "
-    "that store in the queue above -- so you do not have to select each store one by "
-    "one and click Send yourself. Each email uses the same auto-generated Subject/Body "
-    "as Section 4 for that store (not any manual edits you made there, which only "
-    "apply to the single store you were previewing). A store with no recipient email "
-    "is skipped, not blocked -- add it on the Store Email Master page and re-run this "
-    "afterward to pick it up."
-)
-
-if not _smtp_configured():
-    st.info("Configure email sending in Section 5 above before bulk sending is available.")
-else:
-    bulk_store_codes = sorted(queue["Store Code"].astype(str).unique())
-    bulk_confirm = st.checkbox(
-        f"I confirm I want to send a follow-up email to every one of the "
-        f"{len(bulk_store_codes)} store(s) above that has a recipient email.",
-        key="missing_d365_bulk_confirm_v3",
+last_send = st.session_state.get(f"missing_d365_last_send_{store_key}")
+if last_send:
+    st.info(
+        f"Last send status for Store {last_send['store']}: "
+        f"{last_send['status']} | To: {', '.join(last_send['to'])}"
+        + (f" | Resend ID: {last_send['resend_id']}" if last_send.get("resend_id") else "")
     )
-    if st.button("📧 SEND TO ALL STORES NOW", type="primary", disabled=not bulk_confirm):
-        results_df = _bulk_send_all(queue)
-        st.dataframe(results_df, use_container_width=True, hide_index=True)
-
-        sent_n = int((results_df["Status"] == "Sent").sum())
-        skip_n = int((results_df["Status"] == "Skipped").sum())
-        fail_n = int((results_df["Status"] == "Failed").sum())
-        st.success(f"Bulk send complete: {sent_n} sent, {skip_n} skipped (no recipient), {fail_n} failed.")
 
 st.caption(
-    "This page prepares the correct follow-up data for every case; sending is only "
-    "enabled once a mailbox is configured above."
+    "Only the currently selected store is sent. Reconciliation, matching, Card Number "
+    "enrichment and Missing D365 logic are unchanged."
 )
+
+st.subheader("6. Send All Validated Stores")
+
+st.caption(
+    "Bulk send creates ONE separate email per store. Each store receives only its own "
+    "Missing D365 transactions using To/CC from Store Email Master. Stores with missing "
+    "recipient, Card Number or Transaction Time are skipped automatically."
+)
+
+bulk_preview_rows = []
+
+for bulk_store in sorted(queue["Store Code"].astype(str).unique()):
+    bulk_rows = queue[queue["Store Code"].astype(str).eq(str(bulk_store))].copy()
+    if bulk_rows.empty:
+        continue
+
+    bulk_to = _split_emails(str(bulk_rows.iloc[0].get("To Email", "") or ""))
+    bulk_cc = _split_emails(str(bulk_rows.iloc[0].get("CC Email", "") or ""))
+
+    bulk_card_missing = bulk_rows["Card Number"].fillna("").astype(str).str.strip().eq("").any()
+    bulk_time_missing = bulk_rows["Transaction Time"].fillna("").astype(str).str.strip().eq("").any()
+    bulk_invalid_to = [x for x in bulk_to if not _valid_email(x)]
+    bulk_invalid_cc = [x for x in bulk_cc if not _valid_email(x)]
+
+    reasons = []
+    if not bulk_to:
+        reasons.append("Missing To Email")
+    if bulk_invalid_to:
+        reasons.append("Invalid To Email")
+    if bulk_invalid_cc:
+        reasons.append("Invalid CC Email")
+    if bulk_card_missing:
+        reasons.append("Missing Card Number")
+    if bulk_time_missing:
+        reasons.append("Missing Transaction Time")
+
+    bulk_preview_rows.append({
+        "Store Code": str(bulk_store),
+        "Store Name": str(bulk_rows.iloc[0].get("Store Name", "") or ""),
+        "Transactions": int(len(bulk_rows)),
+        "Amount SAR": float(bulk_rows["Value of Sales"].fillna(0).astype(float).sum()),
+        "To": "; ".join(bulk_to),
+        "CC": "; ".join(bulk_cc),
+        "Validation": "READY" if not reasons else "SKIP - " + "; ".join(reasons),
+    })
+
+bulk_preview = pd.DataFrame(bulk_preview_rows)
+
+if not bulk_preview.empty:
+    st.dataframe(bulk_preview, use_container_width=True, hide_index=True)
+
+    ready_store_count = int(bulk_preview["Validation"].eq("READY").sum())
+    skipped_store_count = int(len(bulk_preview) - ready_store_count)
+
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Stores Ready", ready_store_count)
+    b2.metric("Stores Skipped", skipped_store_count)
+    b3.metric(
+        "Ready Amount",
+        f"SAR {bulk_preview.loc[bulk_preview['Validation'].eq('READY'), 'Amount SAR'].sum():,.2f}",
+    )
+else:
+    ready_store_count = 0
+    skipped_store_count = 0
+    st.info("No stores are available for bulk follow-up.")
+
+bulk_global_block = []
+if not resend_api_key:
+    bulk_global_block.append("RESEND_API_KEY is not configured in Streamlit Secrets")
+if not resend_from_email or not _valid_email(resend_from_email):
+    bulk_global_block.append("RESEND_FROM_EMAIL is missing or invalid")
+if ready_store_count == 0:
+    bulk_global_block.append("No stores currently pass validation")
+
+if bulk_global_block:
+    st.warning(
+        "Bulk sending is blocked until these checks are fixed:\n- "
+        + "\n- ".join(bulk_global_block)
+    )
+    bulk_confirm = False
+else:
+    bulk_confirm = st.checkbox(
+        f"I confirm sending separate follow-up emails to all {ready_store_count} validated store(s).",
+        key="missing_d365_bulk_send_confirm_v1",
+    )
+
+bulk_send_clicked = st.button(
+    "📧 SEND ALL VALIDATED STORES",
+    type="primary",
+    use_container_width=True,
+    disabled=(bool(bulk_global_block) or not bulk_confirm),
+    key="missing_d365_bulk_send_button_v1",
+)
+
+if bulk_send_clicked:
+    bulk_results = []
+    stores_all = sorted(queue["Store Code"].astype(str).unique())
+    total_stores = max(len(stores_all), 1)
+    progress = st.progress(0)
+    status_box = st.empty()
+
+    for pos, bulk_store in enumerate(stores_all, start=1):
+        bulk_rows = queue[queue["Store Code"].astype(str).eq(str(bulk_store))].copy()
+        bulk_to = _split_emails(str(bulk_rows.iloc[0].get("To Email", "") or ""))
+        bulk_cc = _split_emails(str(bulk_rows.iloc[0].get("CC Email", "") or ""))
+
+        bulk_card_missing = bulk_rows["Card Number"].fillna("").astype(str).str.strip().eq("").any()
+        bulk_time_missing = bulk_rows["Transaction Time"].fillna("").astype(str).str.strip().eq("").any()
+        bulk_invalid_to = [x for x in bulk_to if not _valid_email(x)]
+        bulk_invalid_cc = [x for x in bulk_cc if not _valid_email(x)]
+
+        skip_reasons = []
+        if not bulk_to:
+            skip_reasons.append("Missing To Email")
+        if bulk_invalid_to:
+            skip_reasons.append("Invalid To Email")
+        if bulk_invalid_cc:
+            skip_reasons.append("Invalid CC Email")
+        if bulk_card_missing:
+            skip_reasons.append("Missing Card Number")
+        if bulk_time_missing:
+            skip_reasons.append("Missing Transaction Time")
+
+        amount = float(bulk_rows["Value of Sales"].fillna(0).astype(float).sum())
+
+        if skip_reasons:
+            bulk_results.append({
+                "Store Code": str(bulk_store),
+                "Store Name": str(bulk_rows.iloc[0].get("Store Name", "") or ""),
+                "Transactions": int(len(bulk_rows)),
+                "Amount SAR": amount,
+                "To": "; ".join(bulk_to),
+                "CC": "; ".join(bulk_cc),
+                "Status": "SKIPPED",
+                "Resend ID": "",
+                "Error": "; ".join(skip_reasons),
+            })
+            progress.progress(min(pos / total_stores, 1.0))
+            continue
+
+        bulk_subject, bulk_body = _build_email(bulk_rows)
+        status_box.info(f"Sending Store {bulk_store}...")
+
+        try:
+            result = _send_resend_email(
+                api_key=resend_api_key,
+                from_name=resend_from_name,
+                from_email=resend_from_email,
+                to_emails=bulk_to,
+                cc_emails=bulk_cc,
+                subject=bulk_subject.strip(),
+                body=bulk_body,
+            )
+            resend_id = str(result.get("id", "") or "")
+            bulk_results.append({
+                "Store Code": str(bulk_store),
+                "Store Name": str(bulk_rows.iloc[0].get("Store Name", "") or ""),
+                "Transactions": int(len(bulk_rows)),
+                "Amount SAR": amount,
+                "To": "; ".join(bulk_to),
+                "CC": "; ".join(bulk_cc),
+                "Status": "SENT",
+                "Resend ID": resend_id,
+                "Error": "",
+            })
+        except Exception as e:
+            bulk_results.append({
+                "Store Code": str(bulk_store),
+                "Store Name": str(bulk_rows.iloc[0].get("Store Name", "") or ""),
+                "Transactions": int(len(bulk_rows)),
+                "Amount SAR": amount,
+                "To": "; ".join(bulk_to),
+                "CC": "; ".join(bulk_cc),
+                "Status": "FAILED",
+                "Resend ID": "",
+                "Error": str(e),
+            })
+
+        progress.progress(min(pos / total_stores, 1.0))
+
+    status_box.empty()
+
+    bulk_result_df = pd.DataFrame(bulk_results)
+    st.session_state["missing_d365_bulk_last_results_v1"] = bulk_result_df
+
+    sent_count = int(bulk_result_df["Status"].eq("SENT").sum())
+    failed_count = int(bulk_result_df["Status"].eq("FAILED").sum())
+    skipped_count = int(bulk_result_df["Status"].eq("SKIPPED").sum())
+
+    if failed_count == 0:
+        st.success(
+            f"Bulk send complete: {sent_count} store email(s) sent, "
+            f"{skipped_count} store(s) skipped."
+        )
+    else:
+        st.warning(
+            f"Bulk send complete: {sent_count} sent, {failed_count} failed, "
+            f"{skipped_count} skipped. Review the result table below."
+        )
+
+bulk_last_results = st.session_state.get("missing_d365_bulk_last_results_v1")
+if isinstance(bulk_last_results, pd.DataFrame) and not bulk_last_results.empty:
+    st.subheader("Bulk Send Result")
+    st.dataframe(bulk_last_results, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "⬇️ DOWNLOAD BULK SEND RESULT CSV",
+        bulk_last_results.to_csv(index=False).encode("utf-8-sig"),
+        "Missing_D365_Bulk_Send_Result.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="missing_d365_bulk_result_download_v1",
+    )
+
+st.caption(
+    "Single-store send remains available above. Bulk send sends one separate email per validated "
+    "store and never combines stores into one message. Reconciliation, matching, Card Number "
+    "enrichment and Missing D365 logic are unchanged."
+)
+
