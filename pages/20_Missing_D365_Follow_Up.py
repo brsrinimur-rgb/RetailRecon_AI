@@ -34,6 +34,72 @@ def _num(v):
         return 0.0
 
 
+def _clean_id(v):
+    """Str-ify an ID-like value without leaving a spurious '.0' on it.
+
+    Excel/pandas reads a whole-numbers-only column (Store Code, Terminal
+    ID, ...) as float64, so a naive str(v) turns 615 into "615.0". Left
+    alone, that breaks the Store Code merge against the Store Email
+    Master below (whose Store Code column is plain string "615") -- every
+    row would silently fail to match and come out with no email address,
+    even after the header-row bug is fixed.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    s = str(v).strip()
+    if s.endswith(".0") and s[:-2].lstrip("-").isdigit():
+        return s[:-2]
+    return s
+
+
+def _read_report_sheet_with_real_header(file, sheet, required_col="Store Code", max_scan_rows=10):
+    """
+    RetailRecon's exported reports (see report_export.py's `startrow=`
+    on each sheet's to_excel call) write a title row and a
+    "Generated ... | N row(s)" row before the real header -- not row 0.
+    Reading naively with pd.read_excel(file, sheet_name=sheet) (default
+    header=0) silently produces a dataframe whose real column names never
+    appear (they show up as "Unnamed: N" instead, with the actual header
+    text buried as a data value a couple of rows down). That doesn't
+    raise -- every column lookup below just returns blank/zero for every
+    row instead, which is exactly the all-blank CSV this page was
+    producing.
+
+    This scans the first few rows for the real header (identified by
+    `required_col`) instead of assuming a fixed row number, so it keeps
+    working even if report_export.py's row layout changes.
+    """
+    raw = pd.read_excel(file, sheet_name=sheet, header=None)
+    header_row = None
+    for i in range(min(max_scan_rows, len(raw))):
+        if required_col in raw.iloc[i].astype(str).str.strip().tolist():
+            header_row = i
+            break
+    if header_row is None:
+        return pd.DataFrame()
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = raw.iloc[header_row].tolist()
+    return df.reset_index(drop=True)
+
+
+def _report_date(v):
+    """POS Date in the exported Exceptions sheet comes through as a raw
+    Excel serial number (e.g. 46266.0), not a real date. Handing that
+    straight to pd.to_datetime() downstream (build_email() below) is
+    silently misread as a Unix timestamp in nanoseconds -- it produces a
+    garbage 1970-something date, not the real 2026 date, with no error to
+    flag it. Interpret it against Excel's actual epoch instead.
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)) or v == "":
+        return None
+    try:
+        return pd.to_datetime(float(v), unit="D", origin="1899-12-30")
+    except (TypeError, ValueError):
+        return pd.to_datetime(v, errors="coerce")
+
+
 def load_master():
     if not MASTER_PATH.exists():
         return pd.DataFrame(columns=["Store Code", "Store Name", "To Email", "CC Email"])
@@ -101,8 +167,11 @@ def load_queue_from_report(file):
     try:
         xl = pd.ExcelFile(file)
         sheet = "Exceptions" if "Exceptions" in xl.sheet_names else xl.sheet_names[0]
-        df = pd.read_excel(file, sheet_name=sheet)
+        df = _read_report_sheet_with_real_header(file, sheet)
     except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
         return pd.DataFrame()
 
     # Direct exported-report fallback.
@@ -114,15 +183,15 @@ def load_queue_from_report(file):
     rows = []
     for _, r in df.iterrows():
         rows.append({
-            "Store Code": str(r.get("Store Code", "") or "").strip(),
+            "Store Code": _clean_id(r.get("Store Code", "")),
             "Store Name": str(r.get("Store Name", "") or "").strip(),
             "Payment Type": str(r.get("POS Tender", "") or "").strip(),
-            "Transaction Date": r.get("POS Date", ""),
+            "Transaction Date": _report_date(r.get("POS Date", "")),
             "Transaction Time": str(r.get("Transaction Time", "") or "").strip(),
             "Value of Sales": _num(r.get("POS Total", 0)),
             "Card Number": _mask_pan(r.get("Card Number", "")),
             "Authorization Code": str(r.get("Auth Code", "") or "").strip(),
-            "Terminal ID": str(r.get("Terminal ID", "") or "").strip(),
+            "Terminal ID": _clean_id(r.get("Terminal ID", "")),
             "Source": str(r.get("Source", "") or "").strip(),
             "Follow-Up Status": "Open - D365 Entry Not Posted",
         })
