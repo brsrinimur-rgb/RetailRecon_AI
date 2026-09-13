@@ -5,6 +5,7 @@ import csv
 import io
 import re
 import json
+import hashlib
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -518,6 +519,38 @@ def _build_email(group: pd.DataFrame) -> tuple[str, str]:
 
 
 
+def _clean_api_key(value: str) -> str:
+    """
+    Normalize a Resend API key loaded from Streamlit Secrets.
+
+    Handles accidental leading/trailing spaces, embedded line breaks,
+    and a second layer of quotes copied into the secret value.
+    The cleaned key is never displayed.
+    """
+    if value is None:
+        return ""
+    key = str(value).strip()
+
+    # If a user accidentally saved literal wrapping quotes as part of the value.
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
+        key = key[1:-1].strip()
+
+    # API keys must not contain whitespace.
+    key = re.sub(r"\s+", "", key)
+    return key
+
+
+def _key_diagnostics(key: str) -> dict:
+    """Return safe diagnostics without exposing the secret."""
+    cleaned = _clean_api_key(key)
+    return {
+        "loaded": bool(cleaned),
+        "starts_re": cleaned.startswith("re_"),
+        "length": len(cleaned),
+        "fingerprint": hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:10] if cleaned else "",
+    }
+
+
 def _split_emails(value: str) -> list[str]:
     """Split semicolon/comma-separated recipient lists and remove blanks/duplicates."""
     if not value:
@@ -566,7 +599,7 @@ def _send_resend_email(
         "https://api.resend.com/emails",
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {_clean_api_key(api_key)}",
             "Content-Type": "application/json",
             "User-Agent": "RetailRecon-AI/1.0",
         },
@@ -781,7 +814,7 @@ st.subheader("5. Send Follow-Up Email")
 
 # Secrets are kept outside GitHub/source code.
 try:
-    resend_api_key = str(st.secrets.get("RESEND_API_KEY", "")).strip()
+    resend_api_key = _clean_api_key(st.secrets.get("RESEND_API_KEY", ""))
     resend_from_email = str(
         st.secrets.get("RESEND_FROM_EMAIL", "reconciliation@mail.ahenqor.com")
     ).strip()
@@ -792,6 +825,19 @@ except Exception:
     resend_api_key = ""
     resend_from_email = "reconciliation@mail.ahenqor.com"
     resend_from_name = "RetailRecon AI"
+
+diag = _key_diagnostics(resend_api_key)
+
+with st.expander("🔐 Resend connection diagnostic", expanded=True):
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("API key loaded", "YES" if diag["loaded"] else "NO")
+    d2.metric("Starts with re_", "YES" if diag["starts_re"] else "NO")
+    d3.metric("Key length", diag["length"])
+    d4.metric("Key fingerprint", diag["fingerprint"] or "—")
+    st.caption(
+        "The fingerprint is a one-way SHA-256 identifier, not the API key. "
+        "It is safe to share if troubleshooting is needed."
+    )
 
 to_list = _split_emails(email_to)
 cc_list = _split_emails(email_cc)
@@ -865,7 +911,16 @@ else:
                 "status": "Sent",
             }
         except Exception as e:
-            st.error(f"Email was NOT sent. {e}")
+            msg = str(e)
+            st.error(f"Email was NOT sent. {msg}")
+            if "HTTP 401" in msg or "API key is invalid" in msg:
+                st.error(
+                    "Resend authentication failed. The app is reaching Resend, but the key "
+                    "loaded by Streamlit is not accepted. Check the diagnostic above. "
+                    "If API key loaded = YES and Starts with re_ = YES, revoke that key in "
+                    "Resend, create a brand-new Sending Access key, paste it into Streamlit "
+                    "Secrets, Save changes, then REBOOT the Streamlit app before retrying."
+                )
 
 last_send = st.session_state.get(f"missing_d365_last_send_{store_key}")
 if last_send:
