@@ -167,7 +167,7 @@ def _load_missing_d365_from_report(uploaded) -> pd.DataFrame:
         ),
         "Authorization Code": exc["Auth Code"].fillna("").astype(str).str.strip(),
         "Terminal ID": (
-            exc["Terminal ID"].fillna("").astype(str).str.strip()
+            exc["Terminal ID"].map(_clean_code)
             if "Terminal ID" in exc.columns else ""
         ),
         "Source": (
