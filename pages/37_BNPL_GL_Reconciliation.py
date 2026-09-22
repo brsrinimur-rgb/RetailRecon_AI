@@ -232,6 +232,105 @@ def parse_tamara(uploaded) -> pd.DataFrame:
             })
     return pd.DataFrame(rows)
 
+
+def parse_tap(uploaded) -> pd.DataFrame:
+    """
+    Parse TAP charge/settlement export.
+
+    Confirmed fields in the uploaded TAP reports:
+    settlement_id, charge_id, amount, status, authorization_id,
+    charge_date, settlement_date, payout_date, reference_transaction,
+    reference_order, receipt, payment_method, payment_scheme, merchant_id,
+    post_amount, fee, fee_vat and net_amount.
+
+    TAP is a payment gateway rather than BNPL, but it is included on this
+    control page so the same POS/D365 -> Provider -> Bank -> GL framework
+    can be used without changing the existing RetailRecon core engine.
+    """
+    keyword_sets = [{
+        "SETTLEMENTID", "CHARGEID", "AMOUNT", "STATUS", "AUTHORIZATIONID",
+        "CHARGEDATE", "SETTLEMENTDATE", "REFERENCETRANSACTION",
+        "REFERENCEORDER", "MERCHANTID", "FEE", "FEEVAT", "NETAMOUNT"
+    }]
+    frames = read_with_detected_header(uploaded, keyword_sets)
+    rows = []
+
+    for sn, df in frames:
+        settlement_id = find_col(df, ["settlement_id", "Settlement ID"])
+        charge_id = find_col(df, ["charge_id", "Charge ID"])
+        amount = find_col(df, ["amount", "Amount"])
+        status = find_col(df, ["status", "Status"])
+        auth = find_col(df, ["authorization_id", "Authorization ID", "Auth Code"])
+        charge_date = find_col(df, ["charge_date", "Charge Date"])
+        settlement_date = find_col(df, ["settlement_date", "Settlement Date"])
+        payout_date = find_col(df, ["payout_date", "Payout Date"])
+        ref_txn = find_col(df, ["reference_transaction", "Reference Transaction"])
+        ref_order = find_col(df, ["reference_order", "Reference Order"])
+        receipt = find_col(df, ["receipt", "Receipt"])
+        merchant_id = find_col(df, ["merchant_id", "Merchant ID"])
+        payment_method = find_col(df, ["payment_method", "Payment Method"])
+        payment_scheme = find_col(df, ["payment_scheme", "Payment Scheme"])
+        post_amount = find_col(df, ["post_amount", "Post Amount"])
+        fee = find_col(df, ["fee", "Fee"])
+        fee_vat = find_col(df, ["fee_vat", "Fee VAT"])
+        net_amount = find_col(df, ["net_amount", "Net Amount"])
+
+        if not amount:
+            continue
+
+        for _, r in df.iterrows():
+            stat = clean_text(r.get(status)).upper() if status else ""
+            # Only captured/successful charge rows are treated as financial transactions.
+            if stat and stat not in {"CAPTURED", "SUCCESS", "SUCCEEDED", "PAID"}:
+                continue
+
+            # Priority for transaction identity:
+            # reference_order -> reference_transaction -> authorization_id -> charge_id.
+            ref = ""
+            for c in [ref_order, ref_txn, auth, charge_id]:
+                if c:
+                    candidate = clean_text(r.get(c))
+                    if candidate:
+                        ref = candidate
+                        break
+
+            gross = num(r.get(post_amount)) if post_amount and abs(num(r.get(post_amount))) > 0 else num(r.get(amount))
+            fee_value = num(r.get(fee)) if fee else 0.0
+            vat_value = num(r.get(fee_vat)) if fee_vat else 0.0
+            net_value = num(r.get(net_amount)) if net_amount else gross - fee_value - vat_value
+
+            rows.append({
+                "Provider": "TAP",
+                "Provider Reference": ref,
+                "Reference Key": norm_ref(ref),
+                "Transaction Date": parse_date(r.get(charge_date)) if charge_date else pd.NaT,
+                "Store Code": "",
+                "Store Name": "",
+                "Merchant Code": clean_code(r.get(merchant_id)) if merchant_id else "",
+                "Event": "CAPTURED",
+                "Gross Amount": gross,
+                "Provider Fee": fee_value,
+                "Provider VAT": vat_value,
+                "Total Deduction": fee_value + vat_value,
+                "Net Settlement": net_value,
+                "Settlement Date": (
+                    parse_date(r.get(payout_date)) if payout_date and pd.notna(parse_date(r.get(payout_date)))
+                    else parse_date(r.get(settlement_date)) if settlement_date else pd.NaT
+                ),
+                "Settlement ID": clean_text(r.get(settlement_id)) if settlement_id else "",
+                "Charge ID": clean_text(r.get(charge_id)) if charge_id else "",
+                "Authorization ID": clean_text(r.get(auth)) if auth else "",
+                "Reference Transaction": clean_text(r.get(ref_txn)) if ref_txn else "",
+                "Reference Order": clean_text(r.get(ref_order)) if ref_order else "",
+                "Receipt": clean_text(r.get(receipt)) if receipt else "",
+                "Payment Method": clean_text(r.get(payment_method)) if payment_method else "",
+                "Payment Scheme": clean_text(r.get(payment_scheme)) if payment_scheme else "",
+                "Source": uploaded.name,
+            })
+
+    return pd.DataFrame(rows)
+
+
 # ---------------- POS / D365 parser ----------------
 
 def parse_pos_d365(uploaded) -> pd.DataFrame:
@@ -255,6 +354,7 @@ def parse_pos_d365(uploaded) -> pd.DataFrame:
             for provider, aliases in {
                 "TABBY": ["Tabby payment", "TABBY", "Tabby"],
                 "TAMARA": ["Tamara", "TAMARA"],
+                "TAP": ["Tap Payment", "TAP", "TAPGateway", "Tap Gateway"],
             }.items():
                 c = find_col(df, aliases)
                 if not c:
@@ -279,9 +379,9 @@ def parse_pos_d365(uploaded) -> pd.DataFrame:
 
         for _, r in df.iterrows():
             p = clean_text(r.get(tender)).upper() if tender else ""
-            if "TABBY" not in p and "TAMARA" not in p:
+            if "TABBY" not in p and "TAMARA" not in p and "TAP" not in p:
                 continue
-            provider = "TABBY" if "TABBY" in p else "TAMARA"
+            provider = "TABBY" if "TABBY" in p else ("TAMARA" if "TAMARA" in p else "TAP")
             ref = clean_text(r.get(auth)) if auth else clean_text(r.get(receipt)) if receipt else ""
             rows.append({
                 "POS/D365 Date": parse_date(r.get(dt)) if dt else pd.NaT,
@@ -445,14 +545,20 @@ def settlement_groups(provider: pd.DataFrame) -> pd.DataFrame:
     x["Settlement Date Key"] = x["Settlement Date"].dt.date
     # Tabby gives a transfer date. Tamara statement rows use event date, so aggregate by source
     # to avoid inventing a bank settlement date.
-    x["Settlement Group"] = x.apply(
-        lambda r: (
-            f"{r['Provider']}|{r['Settlement Date Key']}|{r['Source']}"
-            if r["Provider"] == "TABBY"
-            else f"{r['Provider']}|{r['Source']}"
-        ),
-        axis=1,
-    )
+    if "Settlement ID" not in x.columns:
+        x["Settlement ID"] = ""
+
+    def _settlement_group_key(r):
+        if r["Provider"] == "TAP":
+            sid = clean_text(r.get("Settlement ID"))
+            if sid:
+                return f"TAP|{sid}"
+            return f"TAP|{r['Settlement Date Key']}|{r['Source']}"
+        if r["Provider"] == "TABBY":
+            return f"TABBY|{r['Settlement Date Key']}|{r['Source']}"
+        return f"{r['Provider']}|{r['Source']}"
+
+    x["Settlement Group"] = x.apply(_settlement_group_key, axis=1)
     g = x.groupby(["Settlement Group", "Provider", "Source"], dropna=False).agg(
         Gross_Amount=("Gross Amount", "sum"),
         Provider_Fee=("Provider Fee", "sum"),
@@ -507,7 +613,7 @@ def reconcile_bank(groups: pd.DataFrame, bank: pd.DataFrame) -> pd.DataFrame:
 
 def gl_summary(gl: pd.DataFrame, provider: pd.DataFrame, bank_rec: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for provider_name in ["TABBY", "TAMARA"]:
+    for provider_name in ["TABBY", "TAMARA", "TAP"]:
         p = provider[provider["Provider"].eq(provider_name)] if not provider.empty else pd.DataFrame()
         expected_gross = float(p["Gross Amount"].sum()) if not p.empty else 0.0
         expected_fee = float(p["Provider Fee"].sum()) if not p.empty else 0.0
@@ -542,14 +648,14 @@ def gl_summary(gl: pd.DataFrame, provider: pd.DataFrame, bank_rec: pd.DataFrame)
 
 # ---------------- UI ----------------
 
-st.title("🧾 BNPL & GL Reconciliation")
+st.title("🧾 BNPL / TAP & GL Reconciliation")
 st.caption(
-    "Additive RetailRecon control page for TABBY / TAMARA. "
+    "Additive RetailRecon control page for TABBY / TAMARA / TAP. "
     "This page does not change core.py or the existing POS reconciliation engine."
 )
 
 st.info(
-    "Flow: POS/D365 ↔ BNPL Provider ↔ Bank Settlement ↔ GL. "
+    "Flow: POS/D365 ↔ TABBY/TAMARA/TAP ↔ Bank Settlement ↔ GL. "
     "Matching is conservative: exact normalized reference + exact amount first; "
     "fallback is used only when Store/Date/Amount produces one unique candidate."
 )
@@ -576,6 +682,12 @@ with c1:
         accept_multiple_files=True,
         key="bnpl_tamara_files",
     )
+    tap_files = st.file_uploader(
+        "TAP charge / settlement reports",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        key="bnpl_tap_files",
+    )
 with c2:
     bank_files = st.file_uploader(
         "Bank statements (optional)",
@@ -590,8 +702,8 @@ with c2:
         key="bnpl_gl_files",
     )
 
-if not tabby_files and not tamara_files:
-    st.warning("Upload at least one TABBY or TAMARA provider statement.")
+if not tabby_files and not tamara_files and not tap_files:
+    st.warning("Upload at least one TABBY, TAMARA or TAP provider statement.")
     st.stop()
 
 provider_frames = []
@@ -611,10 +723,18 @@ for f in tamara_files or []:
     except Exception as e:
         st.error(f"TAMARA parser error - {f.name}: {e}")
 
+for f in tap_files or []:
+    try:
+        x = parse_tap(f)
+        if not x.empty:
+            provider_frames.append(x)
+    except Exception as e:
+        st.error(f"TAP parser error - {f.name}: {e}")
+
 provider = pd.concat(provider_frames, ignore_index=True) if provider_frames else pd.DataFrame()
 
 if provider.empty:
-    st.error("No TABBY/TAMARA transaction rows were detected in the uploaded provider files.")
+    st.error("No TABBY/TAMARA/TAP transaction rows were detected in the uploaded provider files.")
     st.stop()
 
 pos_frames = []
@@ -727,6 +847,9 @@ mapping = pd.DataFrame([
     {"Provider": "TAMARA", "Control Type": "BNPL Clearing", "GL Account": "", "Expected Basis": "Gross captured/refunded less settlements"},
     {"Provider": "TAMARA", "Control Type": "Commission / Fee", "GL Account": "", "Expected Basis": "Tamara Total Fees"},
     {"Provider": "TAMARA", "Control Type": "VAT on Fee", "GL Account": "", "Expected Basis": "VAT Collected by Tamara"},
+    {"Provider": "TAP", "Control Type": "Provider Clearing", "GL Account": "", "Expected Basis": "Gross captured less settlements"},
+    {"Provider": "TAP", "Control Type": "Commission / Fee", "GL Account": "", "Expected Basis": "TAP fee"},
+    {"Provider": "TAP", "Control Type": "VAT on Fee", "GL Account": "", "Expected Basis": "TAP fee_vat"},
 ])
 edited_mapping = st.data_editor(
     mapping,
@@ -766,9 +889,9 @@ with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         bank_ex.to_excel(writer, sheet_name="Bank Exceptions", index=False)
 
 st.download_button(
-    "⬇️ DOWNLOAD BNPL & GL RECONCILIATION",
+    "⬇️ DOWNLOAD BNPL / TAP & GL RECONCILIATION",
     data=buffer.getvalue(),
-    file_name="RetailReconAI_BNPL_GL_Reconciliation.xlsx",
+    file_name="RetailReconAI_BNPL_TAP_GL_Reconciliation.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     use_container_width=True,
 )
