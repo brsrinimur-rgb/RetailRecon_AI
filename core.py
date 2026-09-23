@@ -1162,6 +1162,14 @@ def _norm_payment(v):
     if "VISA" in p:return "VISA"
     if "MADA" in p or "KNET" in p:return "MADA"
     if "AMEX" in p or "AMERICAN EXPRESS" in p:return "AMEX"
+    # V72: GCC NET is an already-recognized payment type elsewhere in this file
+    # (_commission_master_maps()'s defaults, jv_group()) but was never
+    # normalized here -- meaning a raw "GCCNET" (no space) or lowercase
+    # variant from a POS export would silently fail to match the "GCC NET"
+    # (with space) string used everywhere else, e.g. build_card_settlement_batches()'s
+    # Payment Type filter. Normalizing it here closes that gap the same way
+    # every other scheme is normalized.
+    if p in {"GC","GCC","GCCNET","GCC NET"}:return "GCC NET"
     return p
 
 def _collapse_exact_pos_duplicates(pos):
@@ -2190,7 +2198,12 @@ def build_card_settlement_batches(matched):
     """
     if matched is None or matched.empty:return pd.DataFrame()
     x=matched.copy()
-    x=x[x["Payment Type"].apply(_norm_payment).isin(["MADA","VISA","MASTERCARD","AMEX"])].copy()
+    # V72: GCC NET added -- it was already a recognized payment type elsewhere
+    # (commission rates, JV grouping) but was silently excluded here, meaning
+    # GCC NET POS transactions never became a settlement batch at all, so
+    # there was nothing for the bank-matching side to even attempt to match
+    # against, regardless of narration parsing.
+    x=x[x["Payment Type"].apply(_norm_payment).isin(["MADA","VISA","MASTERCARD","AMEX","GCC NET"])].copy()
     if x.empty:return pd.DataFrame()
     x["Payment Type"]=x["Payment Type"].apply(_norm_payment)
     x["Settlement Date"]=pd.to_datetime(x.get("POS Date",x.get("Date")),errors="coerce").dt.normalize()
