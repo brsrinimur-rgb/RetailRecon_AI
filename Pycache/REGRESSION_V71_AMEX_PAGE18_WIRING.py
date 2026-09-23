@@ -95,7 +95,12 @@ _EXPECTED_SOURCE_SHA256 = {
     "reconcile_card_batches_advanced": "1d4fc9882b1888c43d446108a8cf57c2380de130c42254576a7011768fe03812",
     "reconcile_amex_batches_via_statement": "de9406506ac56bf32b704b526101ca62314a6673eb54f7b3823474eb6543a8f1",
     "reconcile_amex_wires_to_bank": "13ea0cd98ef12025035aa2748afbed607d230e4870e8934f3f630551d7c5dec5",
-    "parse_anb_narration": "cec2c31c44e69ddfbd1830868786927c7ce86dfc4f4682cedd0059af419582bc",
+    # V72 (2026-09-23) legitimately modified parse_anb_narration() to add GCC
+    # NET (GC_) scheme recognition, per the tripwire's own documented policy:
+    # hash updated AND the full behavioral suite below was rerun to reconfirm
+    # nothing else changed. Old (pre-V72) hash, kept for the record:
+    # "cec2c31c44e69ddfbd1830868786927c7ce86dfc4f4682cedd0059af419582bc"
+    "parse_anb_narration": "9a4c0c5613fdc39eaa55aa20a7ecf5536b345be23000904da10dba2301d103ae",
 }
 for _fn_name, _expected_hash in _EXPECTED_SOURCE_SHA256.items():
     _fn = getattr(bank_ext, _fn_name)
@@ -202,10 +207,29 @@ print("[PASS] Full result DataFrame (every column reconcile_card_batches_advance
       "identical in VALUE BEFORE vs AFTER the AMEX split, via pd.testing.assert_frame_equal() -- "
       "genuinely every column, not a 5-column sample")
 
+# Full-DataFrame equality on the unmatched bank rows too, not just a count
+# match -- a count match alone would not catch the case where the SAME
+# number of rows stayed unmatched but a DIFFERENT bank row got left behind
+# (e.g. the MADA credit going unmatched instead of the VISA one). Both
+# unmatched frames come from the same "bank" fixture and share its columns
+# (reconcile_card_batches_advanced() only ever drops the internal
+# "_BankRowKey" helper column before returning), so a stable sort on the
+# bank row's own identity makes this a genuine row-for-row proof rather
+# than a coincidence of counts.
+_unm_sort_cols = [c for c in ["Bank Source File", "Bank Source Row"] if c in before_unmatched.columns]
+before_unmatched_sorted = (
+    before_unmatched.sort_values(_unm_sort_cols) if _unm_sort_cols else before_unmatched
+).reset_index(drop=True)
+after_unmatched_sorted = (
+    after_unmatched.sort_values(_unm_sort_cols) if _unm_sort_cols else after_unmatched
+).reset_index(drop=True)
+pd.testing.assert_frame_equal(before_unmatched_sorted, after_unmatched_sorted, check_dtype=False)
 _assert(
     len(before_unmatched) == len(after_unmatched),
     f"Unmatched ANB bank credit count unchanged BEFORE ({len(before_unmatched)}) vs AFTER ({len(after_unmatched)})"
 )
+print("[PASS] Unmatched ANB bank credits are the exact SAME rows (full-DataFrame equality, not just "
+      "a matching count) BEFORE vs AFTER the AMEX split")
 _assert(
     "AMEX" not in set(after_result.get("Provider", pd.Series(dtype=str))),
     "AFTER run (Page 18's new behavior) never even attempts the AMEX batch through the ANB card matcher"
@@ -311,11 +335,14 @@ _assert(confirmed_row["AMEX Wire Bank Status"] == "AMEX WIRE BANK CONFIRMED",
         "The AMEX wire row that ties is correctly tagged AMEX WIRE BANK CONFIRMED")
 _assert(other_row["AMEX Wire Bank Status"] == "", "The unrelated fee-line row is left untagged")
 
-# Empty-input safety.
-_assert(bank_ext.annotate_amex_wire_confirmations(pd.DataFrame(), amex_payments, bank_for_wire_check).empty is True
-        or bank_ext.annotate_amex_wire_confirmations(pd.DataFrame(), amex_payments, bank_for_wire_check) is None
-        or len(bank_ext.annotate_amex_wire_confirmations(pd.DataFrame(), amex_payments, bank_for_wire_check)) == 0,
-        "annotate_amex_wire_confirmations() degrades safely on empty bank_unmatched")
+# Empty-input safety. Call once, store the result, assert on it -- calling
+# the function 3 times in one "A or B or C" condition (as this used to) ran
+# it redundantly and made it unclear which branch actually passed.
+empty_unmatched_result = bank_ext.annotate_amex_wire_confirmations(pd.DataFrame(), amex_payments, bank_for_wire_check)
+_assert(
+    empty_unmatched_result is None or len(empty_unmatched_result) == 0,
+    "annotate_amex_wire_confirmations() degrades safely on empty bank_unmatched"
+)
 no_wire_case = bank_ext.annotate_amex_wire_confirmations(bank_unmatched, pd.DataFrame(), bank_for_wire_check)
 _assert((no_wire_case["AMEX Wire Bank Status"] == "").all(),
         "No AMEX statement uploaded -> all tags stay blank, no crash")
