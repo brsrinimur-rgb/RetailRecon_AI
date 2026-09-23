@@ -811,3 +811,112 @@ def reconcile_amex_wires_to_bank(amex_payments, bank, tolerance=1.0, settlement_
         rows.append(rec)
 
     return pd.DataFrame(rows)
+
+# =============================================================================
+# V71 -- additive wiring of the AMEX functions above into Page 18's flow.
+#
+# These two wrappers are the ONLY new code added by V71. They do not modify
+# reconcile_card_batches_advanced(), reconcile_amex_batches_via_statement(),
+# or reconcile_amex_wires_to_bank() in any way -- they only call them and map
+# their outputs onto the vocabulary the rest of the app (and the frozen
+# Page 38 Control Tower) already understands. See V71 delivery doc for the
+# before/after regression proving the existing ANB POS matching (MADA/VISA/
+# MASTERCARD) is byte-for-byte unaffected.
+# =============================================================================
+
+_AMEX_STATUS_MAP={
+    "AMEX RECEIPT PENDING":"BANK RECEIPT PENDING",
+    "AMEX SUBMISSION MATCHED - AWAITING BANK CONFIRMATION":"BANK RECEIPT PENDING",
+    "AMEX REVIEW REQUIRED":"BANK REVIEW REQUIRED",
+}
+_AMEX_RULE_MAP={
+    "AMEX SUBMISSION MATCHED - AWAITING BANK CONFIRMATION":
+        "AMEX Statement Submission Match (Level 1) - Awaiting Bank-Level Confirmation",
+}
+
+def finalize_amex_batches(amex_batches, amex_submissions, tolerance=1.0):
+    """
+    V71: runs reconcile_amex_batches_via_statement() and maps its AMEX-only
+    status vocabulary onto the same Settlement Status vocabulary every other
+    provider in this app already uses (BANK RECEIVED / BANK RECEIPT PENDING /
+    BANK REVIEW REQUIRED), so the result can be concatenated straight into
+    Page 18's batch_result and read by Page 38 without either needing to
+    know a new status string exists.
+
+    Confirmed finance rule preserved exactly: "received" means landed in our
+    own bank account, never a provider's own confirmation alone. An AMEX
+    batch resolved only against AMEX's own statement is therefore NEVER
+    promoted to BANK RECEIVED by this function -- it lands on BANK RECEIPT
+    PENDING (now carrying a real, evidence-backed reason instead of a blank
+    one) or BANK REVIEW REQUIRED (Paid=N, or the statement sum doesn't tie),
+    exactly mirroring how every other exception in this app is already
+    represented. Bank-level fields (Actual Bank Amount, Bank Date, Bank
+    Difference, Bank Reference, Bank Source File/Sheet/Row) are left blank/
+    NaN on every row this function produces -- correct, since none of these
+    rows have been tied to a real bank credit.
+    """
+    if amex_batches is None or amex_batches.empty:
+        return pd.DataFrame()
+    res=reconcile_amex_batches_via_statement(amex_batches,amex_submissions,tolerance)
+    if res is None or res.empty:
+        return pd.DataFrame()
+
+    out=res.copy()
+    stmt_status=out.get("AMEX Statement Status","").astype(str)
+    out["Settlement Status"]=stmt_status.map(_AMEX_STATUS_MAP).fillna("BANK RECEIPT PENDING")
+    out["Bank Match Rule"]=stmt_status.map(_AMEX_RULE_MAP).fillna("")
+    out["Settlement Review Reason"]=out.get("AMEX Statement Reason","").fillna("").astype(str)
+    out["Actual Bank Amount"]=np.nan
+    out["Bank Difference"]=np.nan
+    out["Bank Date"]=pd.NaT
+    out["Bank Reference"]=""
+    out["Bank Source File"]=""
+    out["Bank Source Sheet"]=""
+    out["Bank Source Row"]=np.nan
+    return out
+
+def annotate_amex_wire_confirmations(bank_unmatched, amex_payments, bank, tolerance=1.0, settlement_lag_days=0):
+    """
+    V71: tags AMEX-tagged unmatched bank credits that
+    reconcile_amex_wires_to_bank() independently confirms against AMEX's own
+    declared wires (proven 11/13 against a real July 2026 ANB excerpt).
+
+    Purely informational -- adds two new columns ("AMEX Wire Bank Status",
+    "AMEX Wire Bank Reason") and never removes a row from bank_unmatched or
+    promotes any settlement batch. The row must stay in bank_unmatched
+    because the specific submission/batch -> wire allocation is not built
+    (see reconcile_amex_batches_via_statement()'s docstring) -- this only
+    proves the wire itself is real bank-confirmed money, not which batch(es)
+    it belongs to. Row count and every existing column are unchanged.
+    """
+    if bank_unmatched is None or bank_unmatched.empty:
+        return bank_unmatched
+
+    out=bank_unmatched.copy()
+    out["AMEX Wire Bank Status"]=""
+    out["AMEX Wire Bank Reason"]=""
+
+    if amex_payments is None or amex_payments.empty:
+        return out
+    if not all(c in out.columns for c in ["Bank Source File","Bank Source Row"]):
+        return out
+
+    wire_res=reconcile_amex_wires_to_bank(amex_payments,bank,tolerance,settlement_lag_days)
+    if wire_res is None or wire_res.empty:
+        return out
+    confirmed=wire_res[wire_res.get("AMEX Wire Bank Status","")=="AMEX WIRE BANK CONFIRMED"]
+    if confirmed.empty:
+        return out
+
+    out_file=out["Bank Source File"].astype(str)
+    out_row=pd.to_numeric(out["Bank Source Row"],errors="coerce")
+    for _,w in confirmed.iterrows():
+        w_file=str(w.get("Bank Source File",""))
+        w_row=pd.to_numeric(pd.Series([w.get("Bank Source Row",np.nan)]),errors="coerce").iloc[0]
+        if not w_file or pd.isna(w_row):
+            continue
+        mask=out_file.eq(w_file) & out_row.eq(w_row)
+        if mask.any():
+            out.loc[mask,"AMEX Wire Bank Status"]="AMEX WIRE BANK CONFIRMED"
+            out.loc[mask,"AMEX Wire Bank Reason"]=w.get("AMEX Wire Bank Reason","")
+    return out
